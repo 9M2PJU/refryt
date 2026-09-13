@@ -812,6 +812,11 @@ pub struct App {
     pub(crate) album_error: Option<String>,
     album_for: Option<String>,
 
+    /// The app's own icon, as a texture for the Settings page's branding. Loaded once, lazily
+    /// (`ui::settings::page` fills this in on first use rather than at startup, since nothing
+    /// else needs it), and kept for the rest of the session.
+    pub(crate) logo: Option<egui::TextureHandle>,
+
     /// What the Settings page shows about authentication.
     pub(crate) auth: crate::auth::AuthState,
     /// Why the last sign-in attempt failed. Kept apart from `auth`, so a refused attempt does not
@@ -1094,6 +1099,7 @@ impl App {
             album_loading: false,
             album_error: None,
             album_for: None,
+            logo: None,
             auth,
             sign_in_error: None,
             library: crate::model::Library::default(),

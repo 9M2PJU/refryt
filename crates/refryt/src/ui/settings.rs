@@ -45,6 +45,36 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             }
             _ => sign_in(app, ui),
         }
+        ui.add_space(28.0);
+        branding(app, ui);
+    });
+}
+
+/// An open-source app's own about-ish footer: icon, name, version, licence. Last thing on the
+/// page rather than the header — the sidebar item that got you here is already labelled
+/// "Settings", so the top of the page saying it again is the redundant one.
+fn branding(app: &mut App, ui: &mut egui::Ui) {
+    if app.logo.is_none() {
+        app.logo = crate::logo_texture(ui.ctx());
+    }
+    ui.horizontal(|ui| {
+        if let Some(logo) = &app.logo {
+            ui.add(egui::Image::new((logo.id(), egui::Vec2::splat(32.0))));
+            ui.add_space(8.0);
+        }
+        ui.vertical(|ui| {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("refryt")
+                    .font(theme::semibold(14.0))
+                    .color(app.palette.text),
+            );
+            ui.label(
+                RichText::new(format!("v{} · GPL-3.0-or-later", env!("CARGO_PKG_VERSION")))
+                    .font(theme::regular(11.0))
+                    .color(app.palette.dim),
+            );
+        });
     });
 }
 
@@ -472,6 +502,17 @@ fn browser_import(app: &mut App, ui: &mut egui::Ui) {
         )
         .font(theme::regular(12.0))
         .color(app.palette.dim),
+    );
+    // Windows locks a running Chromium browser's cookie database far more strictly than
+    // Linux does; yt-dlp's own docs call closing the browser first the fix for exactly this,
+    // and it is the single most common reason this import fails there. Worth saying up front
+    // rather than only after a failed attempt, since the error it produces (a locked-file
+    // message from deep inside yt-dlp) does not make the fix obvious on its own.
+    #[cfg(windows)]
+    ui.label(
+        RichText::new("On Windows, close the browser first if the import below fails.")
+            .font(theme::regular(12.0))
+            .color(app.palette.dim),
     );
     ui.add_space(8.0);
 

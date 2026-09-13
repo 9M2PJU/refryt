@@ -84,28 +84,49 @@ pub fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
     let (program, args): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
 
-    match std::process::Command::new(program)
-        .args(args)
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
         .arg(url)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    // `cmd` is a console-subsystem binary; without this, spawning it from this GUI-subsystem
+    // app flashes a new console window open for the length of the call.
+    #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0800_0000);
+    }
+    match cmd.spawn() {
         Ok(_) => {}
         Err(e) => tracing::warn!(%url, error = %e, "could not open a link"),
     }
 }
 
+/// The app's own artwork: the window/taskbar/launcher icon, and (as an egui texture instead of
+/// an OS-level `IconData`) the branding shown in Settings. One embed, two decodes, so a change to
+/// the master PNG only has one place to update.
+const LOGO_PNG: &[u8] = include_bytes!("../../../assets/icons/app/refryt-256.png");
+
 /// The window / taskbar / launcher icon, decoded from the same preprocessed artwork that
 /// `just install` places into hicolor. `None` when the bytes cannot be decoded — the app still
 /// runs, just without an icon.
 pub fn window_icon() -> Option<Arc<egui::IconData>> {
-    let bytes = include_bytes!("../../../assets/icons/app/refryt-256.png");
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let img = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
     let (width, height) = img.dimensions();
     Some(Arc::new(egui::IconData {
         rgba: img.into_raw(),
         width,
         height,
     }))
+}
+
+/// The same artwork as a texture, for the app's own UI (currently just the Settings page)
+/// rather than the OS chrome `window_icon` is for. Loaded once and cached by the caller — a
+/// fresh `egui::Context::load_texture` call is cheap to repeat, but there is no reason to.
+pub fn logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    let image =
+        egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], img.as_raw());
+    Some(ctx.load_texture("refryt-logo", image, egui::TextureOptions::LINEAR))
 }

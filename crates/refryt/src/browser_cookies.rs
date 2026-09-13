@@ -136,16 +136,18 @@ pub async fn import(browser: &str) -> Result<String> {
     // Best effort cleanup even on the error paths below.
     let _guard = Cleanup(path.clone());
 
-    let output = Command::new("yt-dlp")
-        .arg("--cookies-from-browser")
+    let mut cmd = Command::new(crate::backend::yt_dlp_program());
+    cmd.arg("--cookies-from-browser")
         .arg(browser)
         .arg("--cookies")
-        .arg(&path)
-        .output()
-        .await
-        .context(
-            "could not run yt-dlp; it is required for playback too, so install it and try again",
-        )?;
+        .arg(&path);
+    // See `ytdlp::no_console`'s doc comment: without this, this GUI-subsystem app spawning a
+    // console-subsystem binary makes Windows flash a new console window for it.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let output = cmd.output().await.context(
+        "could not run yt-dlp; it is required for playback too, so install it and try again",
+    )?;
 
     let jar = match std::fs::read_to_string(&path) {
         Ok(jar) => jar,

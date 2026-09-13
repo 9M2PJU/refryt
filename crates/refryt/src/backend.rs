@@ -455,17 +455,29 @@ fn lrc_time_ms(stamp: &str) -> Option<u64> {
 
 /// The `yt-dlp` binary to run.
 ///
-/// `scripts/build-appimage.sh` downloads a fresh standalone build into `usr/bin/yt-dlp` at every
-/// release build — yt-dlp is not optional (it is the only resolver that actually produces a
-/// playable URL; see `YtDlpResolver`'s own doc comment), so the AppImage carries its own copy
-/// rather than assuming one is already on the target machine's `PATH`. `$APPDIR` is the standard
-/// AppImage runtime variable an AppRun sets to the mounted image's root while it is running, so
-/// its presence is also what tells us we *are* one. A plain `cargo run` sets no such thing, so
-/// local development falls back to whatever `yt-dlp` a real `PATH` lookup finds.
-fn yt_dlp_program() -> String {
-    match std::env::var("APPDIR") {
-        Ok(appdir) => format!("{appdir}/usr/bin/yt-dlp"),
-        Err(_) => "yt-dlp".to_owned(),
+/// yt-dlp is not optional (it is the only resolver that actually produces a playable URL; see
+/// `YtDlpResolver`'s own doc comment) and every packaged build carries its own copy rather than
+/// assuming the target machine already has one on `PATH`: `scripts/build-appimage.sh` downloads
+/// a fresh standalone build into `usr/bin/yt-dlp`, and `scripts/build-windows.sh` places
+/// `yt-dlp.exe` right next to `refryt.exe`. `$APPDIR` (the standard AppImage runtime variable an
+/// AppRun sets to the mounted image's root) is checked first since that copy is not sitting
+/// next to this binary; everywhere else, a copy beside the running executable itself is
+/// preferred over a bare `PATH` lookup — deterministic rather than depending on how a given OS
+/// orders its search, and what lets `browser_cookies::import` (which needs the very same binary)
+/// share this instead of guessing again. A plain `cargo run` has no bundled copy next to the dev
+/// binary either, so local development falls back to whatever `yt-dlp` a real `PATH` lookup
+/// finds.
+pub(crate) fn yt_dlp_program() -> String {
+    if let Ok(appdir) = std::env::var("APPDIR") {
+        return format!("{appdir}/usr/bin/yt-dlp");
+    }
+    let exe_name = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(exe_name)));
+    match bundled {
+        Some(path) if path.is_file() => path.to_string_lossy().into_owned(),
+        _ => "yt-dlp".to_owned(),
     }
 }
 

@@ -71,6 +71,14 @@ wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 # so this is another edge onto an already-compiled crate rather than a second copy of it.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+# `glow` (OpenGL/WGL) never gets a real per-pixel-alpha swapchain on Windows, so a transparent,
+# undecorated window renders opaque and DWM has nothing to blur behind — the backdrop call in
+# `blur.rs` was silently accepted and doing nothing. `egui`/eframe's own recommendation for this
+# exact platform gap is `wgpu`, whose Windows backend goes through a DXGI composition swapchain
+# that DWM actually blends — this is additive (Linux keeps `glow`, chosen there for its much
+# smaller dependency tree), and eframe's `Renderer::default()` picks `wgpu` automatically the
+# moment both backends are compiled in, so no code change is needed to select it.
+eframe = { workspace = true, features = ["wgpu"] }
 
 # Embeds refryt.ico as the .exe's own icon resource (build.rs) — unconditional, not under a
 # `cfg(target_os = "windows")` table: build scripts always compile for the *host*, so a

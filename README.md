@@ -9,12 +9,10 @@
 ## What this is
 
 YouTube Music's web app is fine, but it's a browser tab pretending to be an app: slow to open,
-heavy at idle, and it comes with everything else a browser drags along. refryt is a real
-desktop app instead — Rust and [egui](https://github.com/emilk/egui), one binary, playback
-through [`mpv`](https://mpv.io/), streams resolved by [`yt-dlp`](https://github.com/yt-dlp/yt-dlp).
-It talks to YouTube Music the same way the web app does — there's no official API for this, so
-it's reverse-engineered and can break when YouTube changes something. It usually doesn't take
-long to fix when it does.
+heavy at idle, and it comes with everything else a browser drags along. refryt is a real desktop
+app instead — one binary, no Electron. It talks to YouTube Music the same way the web app does —
+there's no official API for this, so it's reverse-engineered and can break when YouTube changes
+something. It usually doesn't take long to fix when it does.
 
 This is **not affiliated with YouTube or Google** in any way. Sign-in works by importing your
 existing browser session's cookies, locally, on your own machine — no credentials ever pass
@@ -37,6 +35,16 @@ through anything but your own browser and YouTube itself.
 - **Sign-in that's just importing a browser session** — Chrome, Firefox, Brave, Vivaldi, Edge,
   whatever you're already signed into. No pasting cookies, no device codes.
 
+## Tech stack
+
+- **Rust**, one binary — [`egui`/`eframe`](https://github.com/emilk/egui) for the UI
+- **[`mpv`](https://mpv.io/)** (via `libmpv2`) for playback
+- **[`yt-dlp`](https://github.com/yt-dlp/yt-dlp)** for stream resolution
+- **[`ytmapi-rs`](https://github.com/nick42d/youtui)** for YouTube Music's InnerTube protocol
+- **`tokio`** + **`reqwest`**/`rustls` for async networking
+- **`glow`** (OpenGL) on Linux, **`wgpu`** (DirectComposition) on Windows, for rendering
+- **`lofty`** + **`walkdir`** + **`rfd`** for local files and folders
+
 ## Installing
 
 **Linux** — grab the AppImage from
@@ -51,7 +59,7 @@ through anything but your own browser and YouTube itself.
 (`./scripts/build-windows.sh`), but neither has had real testing on actual Windows yet. See
 [`docs/BUILDING.md`](docs/BUILDING.md) if you want to try one or help shake it out.
 
-## Building from source, and everything else
+## Building from source
 
 See [`docs/BUILDING.md`](docs/BUILDING.md) for the full setup, the dev-loop commands (there's a
 `Justfile` for all of it), and how the Windows cross-build works.

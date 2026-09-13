@@ -17,6 +17,19 @@ use crate::{AudioStream, Codec, StreamResolver, VideoId, parse_expiry};
 /// Prefer Opus, falling back to whatever the best audio-only stream is.
 const DEFAULT_FORMAT: &str = "bestaudio[acodec=opus]/bestaudio";
 
+/// `CREATE_NO_WINDOW`: without it, every spawn of a console-subsystem binary (yt-dlp is one)
+/// from this GUI-subsystem app makes Windows allocate it a brand new console, which flashes on
+/// screen for the length of the call — once per track resolved. Linux/macOS have no such
+/// concept, so this is a no-op there.
+#[cfg(windows)]
+fn no_console(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    cmd.creation_flags(0x0800_0000)
+}
+#[cfg(not(windows))]
+fn no_console(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    cmd
+}
+
 pub struct YtDlpResolver {
     program: String,
     /// Extra arguments, e.g. a PO token provider or a cookies file.
@@ -58,10 +71,11 @@ impl YtDlpResolver {
     /// Whether the configured yt-dlp is actually present, so the UI can warn early rather
     /// than at the moment playback is wanted.
     pub async fn is_available(&self) -> bool {
-        tokio::process::Command::new(&self.program)
-            .arg("--version")
+        let mut cmd = tokio::process::Command::new(&self.program);
+        cmd.arg("--version")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        no_console(&mut cmd)
             .status()
             .await
             .map(|s| s.success())
@@ -114,6 +128,7 @@ impl StreamResolver for YtDlpResolver {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        no_console(&mut cmd);
 
         let output = tokio::time::timeout(self.timeout, cmd.output())
             .await
