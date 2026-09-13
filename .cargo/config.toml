@@ -1,0 +1,6 @@
+# Windows cross-compile — the mingw-w64 toolchain installed on this machine, linking against
+# the mpv Windows dev package's import library (.windows-tools/mpv-dev, fetched by
+# scripts/build-windows.sh from mpv-player-windows' own SourceForge releases).
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-L", ".windows-tools/mpv-dev"]

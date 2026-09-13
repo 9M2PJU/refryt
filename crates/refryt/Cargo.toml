@@ -1,0 +1,81 @@
+[package]
+name = "refryt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A fast, native YouTube Music client"
+# Two binaries live here (`refryt` and the `api-check` diagnostic), so say which one `cargo run` means.
+default-run = "refryt"
+
+[dependencies]
+anyhow.workspace = true
+bytes = "1"
+directories.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+image.workspace = true
+memmap2 = "0.9"
+skrifa = "0.44"
+# No `charset`: YouTube's InnerTube responses are UTF-8 JSON and the code never calls
+# `text_with_charset`, so `encoding_rs` (1.6 MB) + `mime` are dead weight.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "cookies", "http2"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ytmapi-rs.workspace = true
+refryt-resolve.workspace = true
+libmpv2.workspace = true
+# `blur.rs`'s three backends (KDE, Windows, and the do-nothing stub for everything else) all
+# read the raw window/display handles eframe exposes, so this is unconditional rather than
+# behind any one target's `cfg`.
+raw-window-handle = "0.6"
+# The system tray icon (`tray.rs`). Genuinely cross-platform — its own internal `cfg`s pick
+# libappindicator on Linux, the Shell_NotifyIcon API on Windows, NSStatusItem on macOS — so this
+# sits here unconditionally; only building the GTK loop it needs on Linux is target-gated below.
+tray-icon = "0.25.0"
+# Local music (`local.rs`): `rfd` is the native folder-picker dialog behind Settings' "Add
+# folder" button, `walkdir` recursively finds audio files under it, and `lofty` reads their
+# title/artist/album/duration tags.
+rfd = "0.17.2"
+lofty = "0.25.1"
+walkdir = "2.5.0"
+
+# Real acrylic on KDE Wayland: asking KWin to blur what shows through. Two protocols for one
+# job, both already resolved to versions already in the tree — winit pulls the same
+# `wayland-client` and `wayland-protocols-plasma`, and already turns on
+# `wayland-backend/client_system`, which is what the foreign-display path in `blur.rs` needs —
+# so these add edges between crates already compiled, not new ones. `wayland-protocols`'
+# `staging` feature is the standard `ext-background-effect-v1`: what KWin 6.7 offers after it
+# dropped `org_kde_kwin_blur` outright (see `blur.rs`), and what niri and Mutter 51 speak. The
+# plasma crate's `org_kde_kwin_blur` is the fallback for Plasma 6.6 and earlier.
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pinned to the exact version `gtk` itself already pulls in, so this is an edge onto a crate
+# already compiled rather than a second copy — `MainContext::channel` is `tray.rs`'s way to
+# toggle the tray icon's visibility from another thread without rebuilding it (GTK objects
+# can't cross threads, so the icon lives on `gtk`'s own thread and this is how it's told).
+glib = "0.18.5"
+# Winit doesn't run GTK's own event loop, and `tray-icon`'s Linux backend (libappindicator) needs
+# one — see `tray.rs`'s own doc comment for why that means a dedicated thread.
+gtk = "0.18.2"
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+
+# Real acrylic on Windows: `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE)`, documented since
+# Windows 11 22H2 and one call — no protocol to bind, no region to compute, DWM blurs the whole
+# client area itself. Pinned to 0.52, the version winit itself already resolves to on Windows,
+# so this is another edge onto an already-compiled crate rather than a second copy of it.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+
+# Embeds refryt.ico as the .exe's own icon resource (build.rs) — unconditional, not under a
+# `cfg(target_os = "windows")` table: build scripts always compile for the *host*, so a
+# target-cfg'd build-dependency is checked against the host, not `--target`, and would vanish
+# outright when cross-compiling for Windows from Linux. `build.rs` itself is what skips the
+# actual work on every other target, via `CARGO_CFG_TARGET_OS`.
+[build-dependencies]
+embed-resource = "3.0.11"

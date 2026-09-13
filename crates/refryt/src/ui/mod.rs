@@ -1,0 +1,2250 @@
+//! Page and panel renderers. Each takes the whole `App` and borrows its fields disjointly, so a
+//! page can iterate one list while fetching art textures for the rows it is drawing.
+
+pub mod album;
+pub mod artist;
+pub mod charts;
+pub mod explore;
+pub mod history;
+pub mod home;
+pub mod library;
+pub mod lyrics;
+pub mod mood;
+pub mod moods;
+pub mod player_bar;
+pub mod playlist;
+pub mod releases;
+pub mod search;
+pub mod settings;
+pub mod sidebar;
+pub mod topbar;
+pub mod upnext;
+
+use std::sync::Arc;
+
+use crate::app::Route;
+use crate::backend::Backend;
+use crate::images::Images;
+use crate::model::LikeStatus;
+use crate::model::{Entry, PlaylistRef, Shelf, Track};
+use crate::theme;
+use crate::widgets;
+
+/// Art sizes, in **points** — what is actually drawn. The pixel size is derived per-frame from
+/// the display scale in [`art_texture`]. These used to be hand-picked pixel constants (96, 320,
+/// 256) that had no relationship to the slots they filled: a 320px cover in a 132pt card is
+/// ~5.8x the pixels needed on a 1x display, and a full cache of them is 80 MB of texture memory.
+pub(crate) const ROW_ART_PT: f32 = theme::ART_SIZE;
+/// Page headers (artist / album / playlist art).
+pub(crate) const HEADER_ART_PT: f32 = 160.0;
+/// How small the header art gets before it refuses to shrink further — a disc, not a stamp.
+pub(crate) const HEADER_ART_FLOOR_PT: f32 = 64.0;
+/// Album and playlist headers, drawn large like the reference. Request matches display.
+pub(crate) const PAGE_ART_SIZE: f32 = 192.0;
+
+/// How wide a card is in a grid; its cover is inset by 8pt on each side.
+pub(crate) const CARD_W: f32 = 132.0;
+pub(crate) const CARD_ART_PT: f32 = CARD_W - 16.0;
+
+/// Rows kept on either side of the visible range, so a fast scroll never shows a gap.
+const OVERSCAN: usize = 2;
+
+/// How close to the end of a loaded list the viewport must get before the next page is requested.
+///
+/// Wider than the overscan on purpose: fetching a page takes a round trip, so asking only when the
+/// very last row is drawn would show the user the bottom of the list before more arrived.
+const PREFETCH_ROWS: usize = 10;
+
+/// The pixel size to request for something drawn `points` across.
+///
+/// Rounded up to a multiple of 32 so a handful of stable sizes cover the whole app — the cache is
+/// keyed on this number, and one entry per distinct float would defeat it.
+pub(crate) fn art_px(ctx: &egui::Context, points: f32) -> u32 {
+    let px = (points * ctx.pixels_per_point()).ceil().max(1.0) as u32;
+    px.next_multiple_of(32).clamp(32, 512)
+}
+
+/// Look up — and trigger the fetch of — a cover texture for something drawn `points` across.
+///
+/// A free function rather than an `App` method so callers can hold a borrow on another `App`
+/// field (e.g. the row being drawn) while it runs.
+pub(crate) fn art_texture<'a>(
+    images: &'a mut Images,
+    backend: &Backend,
+    ctx: &egui::Context,
+    url: Option<&Arc<str>>,
+    points: f32,
+) -> Option<&'a egui::TextureHandle> {
+    let px = art_px(ctx, points);
+    url.and_then(|url| {
+        images.texture(url, px, |key, sized, px, wide| {
+            backend.fetch_image(key, sized, px, wide)
+        })
+    })
+}
+
+/// Look up — and trigger the fetch of — a 16:9 still for something drawn `points` across.
+///
+/// `points` is the drawn *width*; the height follows from it. The cache key is that width, so a
+/// wide still and a square cover of the same URL never share an entry.
+pub(crate) fn art_texture_wide<'a>(
+    images: &'a mut Images,
+    backend: &Backend,
+    ctx: &egui::Context,
+    url: Option<&Arc<str>>,
+    points: f32,
+) -> Option<&'a egui::TextureHandle> {
+    let px = art_px(ctx, points);
+    url.and_then(|url| {
+        images.texture_wide(url, px, |key, sized, px, wide| {
+            backend.fetch_image(key, sized, px, wide)
+        })
+    })
+}
+
+/// Which row indices intersect the viewport, plus overscan.
+///
+/// Split out from [`virtual_rows`] because it is the part that can be wrong, and it needs no egui
+/// context to check. `top` is where the list starts and `clip_top`/`clip_h` are the viewport, both
+/// in the same (screen) coordinate space — scrolling moves `top`, not the clip.
+fn visible_range(
+    top: f32,
+    clip_top: f32,
+    clip_h: f32,
+    row_h: f32,
+    count: usize,
+) -> std::ops::Range<usize> {
+    let first = (((clip_top - top) / row_h).floor().max(0.0) as usize).saturating_sub(OVERSCAN);
+    let first = first.min(count);
+    let visible = (clip_h / row_h).ceil() as usize + OVERSCAN * 2 + 1;
+    first..(first + visible).min(count)
+}
+
+/// Draw a long list without paying for the rows nobody can see.
+///
+/// `ScrollArea::show_rows` would be the obvious tool, but these pages put a header and several
+/// sections inside one scroll area, so the list is not the scroll area. This does the same job
+/// from the inside: it works out which indices intersect the clip rect, reserves the space above
+/// and below with two spacers so the scrollbar stays honest, and calls `row` only for the visible
+/// range plus a little overscan.
+///
+/// Because art is requested inside `row`, this also stops a 500-song library from queueing 500
+/// cover fetches the moment it loads.
+pub(crate) fn virtual_rows(
+    ui: &mut egui::Ui,
+    row_h: f32,
+    count: usize,
+    mut row: impl FnMut(&mut egui::Ui, usize),
+) -> std::ops::Range<usize> {
+    if count == 0 {
+        return 0..0;
+    }
+    let clip = ui.clip_rect();
+    let top = ui.cursor().top();
+    let range = visible_range(top, clip.top(), clip.height(), row_h, count);
+    let (first, last) = (range.start, range.end);
+
+    if first > 0 {
+        ui.add_space(first as f32 * row_h);
+    }
+    for i in first..last {
+        row(ui, i);
+    }
+    if last < count {
+        ui.add_space((count - last) as f32 * row_h);
+    }
+    first..last
+}
+
+/// Everything a row shows, borrowed from the page's own data.
+///
+/// Deliberately carries the thumbnail *URL* rather than a texture: the texture has to be looked up
+/// inside the row loop, where the mutable borrow of the cache lives and dies within one iteration.
+/// A caller that handed back a `&TextureHandle` could not borrow the cache again for the next row.
+pub(crate) struct RowSpec<'a> {
+    pub number: Option<usize>,
+    /// A chart rank, shown in place of the position number where the track names one.
+    pub rank: Option<&'a str>,
+    /// Which way the rank moved. Unknown paints nothing.
+    pub trend: crate::model::ChartTrend,
+    pub title: &'a str,
+    pub subtitle: widgets::Subtitle<'a>,
+    pub duration: Option<u64>,
+    pub plays: Option<&'a str>,
+    pub explicit: bool,
+    pub active: bool,
+    pub badge: Option<&'a str>,
+    pub shape: widgets::ArtShape,
+    pub thumbnail: Option<&'a std::sync::Arc<str>>,
+    /// Right-click menu. `None` for rows that are not songs.
+    pub menu: Option<widgets::RowMenu<'a>>,
+    /// Whether the row offers rating thumbs. The queue turns them off.
+    pub show_rating: bool,
+    /// Your rating, for the hover thumbs. `Indifferent` where the source carries none.
+    pub like: LikeStatus,
+}
+
+/// The subtitle of a track row: its artist, then its album, each a link where we have the id.
+///
+/// This is what makes a song a way in to its artist and its album rather than a dead end.
+pub(crate) fn track_subtitle(t: &crate::model::Track) -> widgets::Subtitle<'_> {
+    track_subtitle_inner(t, false)
+}
+
+/// The subtitle where the album would be redundant: the album page (every row is this
+/// album) and the queue (a list of what happens next, not where each song is from).
+/// Artists stay linked and the plays/Radio tail is unaffected — those ride the separate
+/// `tail` parameter, not the subtitle slots.
+pub(crate) fn track_subtitle_no_album(t: &crate::model::Track) -> widgets::Subtitle<'_> {
+    track_subtitle_inner(t, true)
+}
+
+fn track_subtitle_inner(t: &crate::model::Track, hide_album: bool) -> widgets::Subtitle<'_> {
+    let mut out = widgets::no_subtitle();
+    // Each credited artist is its own link, joined the way YouTube writes them. The last slots
+    // are left for the album and whatever a page adds after it, so a track credited to more
+    // artists than there is room for keeps as many as fit rather than losing the album.
+    let n = fill_artists(&mut out, &t.artists);
+    if !hide_album && let Some(name) = t.album.as_deref() {
+        out[n] = Some(match t.album_id.as_deref() {
+            Some(id) => widgets::Part::link(name, widgets::LinkTarget::Album(id)),
+            None => widgets::Part::plain(name),
+        });
+    }
+    out
+}
+
+/// Fill `out` with the credited artists as linked parts, leaving the final slots free, and
+/// return the next free slot. Shared by track rows and the album/playlist header so a
+/// multi-artist credit is linked identically in both.
+fn fill_artists<'a>(
+    out: &mut widgets::Subtitle<'a>,
+    artists: &'a [crate::model::ArtistLink],
+) -> usize {
+    let mut n = 0;
+    for artist in artists.iter().take(widgets::SUBTITLE_PARTS - 2) {
+        let part = match artist.id.as_deref() {
+            Some(id) => widgets::Part::link(&artist.name, widgets::LinkTarget::Artist(id)),
+            None => widgets::Part::plain(&artist.name),
+        };
+        out[n] = Some(if n == 0 {
+            part
+        } else {
+            part.joined(widgets::NAME_SEP)
+        });
+        n += 1;
+    }
+    n
+}
+
+/// Turn a clicked link into the page it leads to.
+pub(crate) fn link_route(link: widgets::LinkTarget<'_>) -> Route {
+    match link {
+        widgets::LinkTarget::Artist(id) => Route::Artist(id.to_owned()),
+        widgets::LinkTarget::Album(id) => Route::Album(id.to_owned()),
+    }
+}
+
+/// What a virtualised list reported: a row was activated, or one of its links was followed.
+pub(crate) enum ListClick {
+    Row(usize),
+    Link(Route),
+}
+
+/// A song menu's choice, carrying everything it needs: the video id for mix and share, the
+/// track itself for the queue, the linked ids for navigation. Owned, so it crosses the borrow
+/// of the list it came from and every page forwards it with one line.
+pub(crate) enum RowAction {
+    /// Play whatever YouTube handed over — an artist's shuffle or mix.
+    PlayTarget {
+        seed: String,
+        target: crate::model::WatchTarget,
+    },
+    Subscribe {
+        channel_id: String,
+        subscribe: bool,
+    },
+    DontRecommend {
+        token: String,
+        name: String,
+    },
+    StartMix(String),
+    PlayNext(Track),
+    AddToQueue(Track),
+    GoToAlbum(String),
+    GoToArtist(String),
+    Share(String),
+    Rate {
+        video_id: String,
+        status: LikeStatus,
+    },
+    /// Flip a song's library membership with its own bookmark token.
+    ToggleLibrary(Track),
+    SaveToPlaylist {
+        playlist_id: String,
+        video_id: String,
+    },
+    /// A page header's ••• menu acting on the whole loaded list: shuffle the page, queue it
+    /// all, or save it all somewhere. Vecs, not slices — the choice crosses the borrow of the
+    /// list it came from, same as every other `RowAction`.
+    PageShuffle(Vec<Track>),
+    PagePlayNext(Vec<Track>),
+    PageQueue(Vec<Track>),
+    PageSaveToPlaylist {
+        playlist_id: String,
+        title: String,
+        video_ids: Vec<String>,
+    },
+    /// Not into an existing playlist — a brand new local one, seeded with the whole page (a
+    /// folder's tracks, in the Local tab's browser). `title` is just the default name offered
+    /// in the modal, editable before it commits.
+    PageSaveAsNewPlaylist {
+        title: String,
+        video_ids: Vec<String>,
+    },
+    /// Flip an album or playlist header's library membership. `album` picks the page;
+    /// `in_library` is the state being asked for, so a refusal reverts to `!in_library`.
+    PageLibrary {
+        album: bool,
+        write: crate::backend::PageWrite,
+        in_library: bool,
+    },
+    /// Share a page (an album or playlist URL, not a `watch?v=` one).
+    PageShare(String),
+    /// Show the page's description in the Info popup. The text lives on the page, so the
+    /// choice carries nothing.
+    PageInfo,
+    RemoveFromPlaylist {
+        playlist_id: String,
+        video_id: String,
+        set_video_id: String,
+    },
+    /// Open the rename editor for a playlist. The app uses the loaded page when it is that
+    /// playlist, else it navigates and opens the editor once the page arrives.
+    EditPlaylist(String),
+    /// Ask to delete a playlist (the app raises the confirm modal).
+    DeletePlaylist(String),
+    /// Remove a saved (not owned) playlist from the library.
+    UnsavePlaylist(String),
+    /// Drop a track from the queue by its position — only offered from the Queue panel, whose
+    /// rows carry their own index.
+    RemoveFromQueue(usize),
+}
+
+/// What a list did this frame.
+pub(crate) struct ListOutcome {
+    pub click: Option<ListClick>,
+    /// A right-click menu choice, if one was picked.
+    pub action: Option<RowAction>,
+    /// The viewport has reached the end of what is loaded — time to ask for the next page.
+    ///
+    /// Taken from the range the virtualiser actually drew rather than recomputed, so it cannot
+    /// disagree with what is on screen.
+    pub at_end: bool,
+    /// A row was dragged onto another one and released — `(from, to)`, both indices into the
+    /// list as it was *before* this frame's reorder. Only ever set for rows whose menu carries
+    /// a playlist id (an editable playlist's own track list); every other list's rows are not
+    /// draggable at all, so this is always `None` for them.
+    pub reorder: Option<(usize, usize)>,
+}
+
+/// Draw a virtualised list of rows and report what was clicked.
+///
+/// Takes `App`'s fields individually rather than `&mut App` so callers can destructure once and
+/// hand out disjoint borrows — which is what lets `spec` read the item it is describing while this
+/// mutates the texture cache.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spec_rows<'d>(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    stats: &mut crate::stats::Stats,
+    count: usize,
+    spec: impl Fn(usize) -> RowSpec<'d>,
+) -> ListOutcome {
+    let mut clicked = None;
+    let mut action = None;
+    let mut reorder = None;
+    let drawn = virtual_rows(ui, theme::ROW_HEIGHT, count, |ui, i| {
+        let s = spec(i);
+        // Only an editable playlist's own track list ever sets this — see `RowMenu::playlist_id`
+        // and `ListOutcome::reorder`'s own doc comments.
+        let draggable = s.menu.as_ref().and_then(|m| m.playlist_id).is_some();
+        // A video still is 16:9; fetch its wide crop so the row draws it at its own aspect
+        // instead of squeezing it into the square cover slot.
+        let art = if s.shape == crate::widgets::ArtShape::Wide {
+            art_texture_wide(
+                images,
+                backend,
+                ui.ctx(),
+                s.thumbnail,
+                ROW_ART_PT * 16.0 / 9.0,
+            )
+        } else {
+            art_texture(images, backend, ui.ctx(), s.thumbnail, ROW_ART_PT)
+        };
+        let hit = crate::widgets::track_row(
+            ui,
+            palette,
+            crate::widgets::TrackRow {
+                number: s.number,
+                rank: s.rank,
+                trend: s.trend,
+                title: s.title,
+                subtitle: s.subtitle,
+                duration: s.duration,
+                plays: s.plays,
+                explicit: s.explicit,
+                active: s.active,
+                badge: s.badge,
+                art,
+                shape: s.shape,
+                id_salt: i,
+                menu: s.menu,
+                like: s.like,
+                show_rating: s.show_rating,
+            },
+        );
+        // A link wins over the row: clicking the artist name must not also start the track.
+        if let Some(link) = hit.link {
+            clicked = Some(ListClick::Link(link_route(link)));
+        } else if hit.response.clicked() {
+            clicked = Some(ListClick::Row(i));
+        }
+        if action.is_none() {
+            action = hit.action;
+        }
+        if draggable {
+            if hit.response.drag_started() {
+                egui::DragAndDrop::set_payload(ui.ctx(), i);
+            }
+            if egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                && hit.response.contains_pointer()
+            {
+                if ui.ctx().input(|inp| inp.pointer.any_released()) {
+                    if let Some(from) = egui::DragAndDrop::take_payload::<usize>(ui.ctx())
+                        && *from != i
+                    {
+                        reorder = Some((*from, i));
+                    }
+                } else {
+                    // Always "insert before this row" — a single, direction-independent rule,
+                    // unlike the sidebar's own playlist-order drag (which flips edges because
+                    // that one is a plain `remove`+`insert` with no server call to match). This
+                    // one always becomes an `ACTION_MOVE_VIDEO_BEFORE`, which only ever means
+                    // "before", so the indicator never promising "after" keeps the two honest.
+                    ui.painter().hline(
+                        egui::Rangef::new(hit.response.rect.left(), hit.response.rect.right()),
+                        hit.response.rect.top(),
+                        egui::Stroke::new(2.0, palette.accent),
+                    );
+                }
+            }
+        }
+    });
+    stats.rows(drawn.len(), count);
+    ListOutcome {
+        click: clicked,
+        action,
+        at_end: count == 0 || drawn.end + PREFETCH_ROWS >= count,
+        reorder,
+    }
+}
+
+/// [`spec_rows`], but wraps into `cols` side-by-side columns instead of one full-width row per
+/// item — for a shelf with no sequential order to preserve (see [`track_shelf_rows`]). Bands,
+/// not rows, are what gets virtualised: each band is one `ROW_HEIGHT`-tall slice holding up to
+/// `cols` items, so the vertical math — and so scrolling/overscan — is unchanged from a plain
+/// `spec_rows` list of `count.div_ceil(cols)` bands. Each cell paints through its own child
+/// `Ui`, the same "explicit sub-rect, caller reserves the space" split `page_header` already
+/// uses for its control row — `track_row` itself needs no changes, since a ~300-400pt column
+/// is exactly what its existing narrow-row mode (built for the queue panel) already handles.
+#[allow(clippy::too_many_arguments)]
+fn spec_rows_grid<'d>(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    stats: &mut crate::stats::Stats,
+    count: usize,
+    cols: usize,
+    spec: impl Fn(usize) -> RowSpec<'d>,
+) -> ListOutcome {
+    let mut clicked = None;
+    let mut action = None;
+    let gap = 12.0;
+    let col_w = (ui.available_width() - gap * cols.saturating_sub(1) as f32) / cols as f32;
+    let bands = count.div_ceil(cols);
+    let drawn_bands = virtual_rows(ui, theme::ROW_HEIGHT, bands, |ui, band| {
+        let top_left = ui.cursor().min;
+        for c in 0..cols {
+            let i = band * cols + c;
+            if i >= count {
+                break;
+            }
+            let x = top_left.x + c as f32 * (col_w + gap);
+            let cell_rect = egui::Rect::from_min_size(
+                egui::pos2(x, top_left.y),
+                egui::vec2(col_w, theme::ROW_HEIGHT),
+            );
+            let (click, act) = paint_grid_cell(ui, palette, images, backend, cell_rect, i, spec(i));
+            if click.is_some() {
+                clicked = click;
+            }
+            if action.is_none() {
+                action = act;
+            }
+        }
+        // The cells painted through their own absolute-rect child `Ui`s and never touched this
+        // one's cursor, so the band's own height has to be reserved here — otherwise the next
+        // band, and whatever follows the shelf, would stack right on top of this one.
+        ui.add_space(theme::ROW_HEIGHT);
+    });
+    let first = (drawn_bands.start * cols).min(count);
+    let last = (drawn_bands.end * cols).min(count);
+    stats.rows(last - first, count);
+    ListOutcome {
+        click: clicked,
+        action,
+        at_end: count == 0 || last + PREFETCH_ROWS >= count,
+        // A wrapped shelf grid is never an editable playlist's own track list.
+        reorder: None,
+    }
+}
+
+/// One cell of a track grid: its own child `Ui` at an explicit rect, the same split
+/// `page_header` uses for its control row. Shared by the virtualised wrap (`spec_rows_grid`)
+/// and the paged view (`track_shelf_pages`), so the two layouts' rows cannot drift apart.
+fn paint_grid_cell<'d>(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    cell_rect: egui::Rect,
+    i: usize,
+    s: RowSpec<'d>,
+) -> (Option<ListClick>, Option<RowAction>) {
+    let mut cell = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("shelf-grid-cell", i))
+            .max_rect(cell_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    let art = if s.shape == crate::widgets::ArtShape::Wide {
+        art_texture_wide(
+            images,
+            backend,
+            cell.ctx(),
+            s.thumbnail,
+            ROW_ART_PT * 16.0 / 9.0,
+        )
+    } else {
+        art_texture(images, backend, cell.ctx(), s.thumbnail, ROW_ART_PT)
+    };
+    let hit = crate::widgets::track_row(
+        &mut cell,
+        palette,
+        crate::widgets::TrackRow {
+            number: s.number,
+            rank: s.rank,
+            trend: s.trend,
+            title: s.title,
+            subtitle: s.subtitle,
+            duration: s.duration,
+            plays: s.plays,
+            explicit: s.explicit,
+            active: s.active,
+            badge: s.badge,
+            art,
+            shape: s.shape,
+            id_salt: i,
+            menu: s.menu,
+            like: s.like,
+            show_rating: s.show_rating,
+        },
+    );
+    // A link wins over the row: clicking the artist name must not also start the track.
+    let click = if let Some(link) = hit.link {
+        Some(ListClick::Link(link_route(link)))
+    } else if hit.response.clicked() {
+        Some(ListClick::Row(i))
+    } else {
+        None
+    };
+    (click, hit.action)
+}
+
+/// A short, bounded track list — Top Songs — capped to 5 rows with ‹ › arrows to page through
+/// the rest, rather than `spec_rows_grid`'s open-ended wrap: at 3 columns the full 15 already
+/// fits in those 5 rows with nothing left to page through; the arrows only earn their keep on a
+/// narrower window, where fewer columns fit and 5 rows is not enough to show all 15 at once.
+/// Not virtualised — bounded lists like this are cheap enough to lay out in full every frame —
+/// so the page itself is the only thing that decides which slice is on screen.
+#[allow(clippy::too_many_arguments)]
+fn spec_pages<'d>(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    stats: &mut crate::stats::Stats,
+    heading: &str,
+    count: usize,
+    cols: usize,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    spec: impl Fn(usize) -> RowSpec<'d>,
+) -> ListOutcome {
+    const ROWS_PER_PAGE: usize = 5;
+    let per_page = (cols * ROWS_PER_PAGE).max(1);
+    let pages = count.div_ceil(per_page).max(1);
+
+    let id = ui.id().with(("track-shelf-page", id_salt));
+    let mut page: usize = ui
+        .ctx()
+        .data(|d| d.get_temp(id))
+        .unwrap_or(0)
+        .min(pages - 1);
+
+    ui.add_space(12.0);
+    let heading_label = || {
+        egui::RichText::new(heading)
+            .font(theme::semibold(14.0))
+            .color(palette.text)
+    };
+    if pages > 1 {
+        // The heading rides the same row as the arrows — same fix `artist_shelf`'s "Show all"
+        // already relies on: a plain `ui.label` first, then `with_layout` nested inside this
+        // `ui.horizontal` (never bare on the outer vertical `ui`, which would claim the rest of
+        // the page's height for this "row" instead of bounding it to the row's own content).
+        ui.horizontal(|ui| {
+            ui.label(heading_label());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(page + 1 < pages, |ui| {
+                    if widgets::icon_button(
+                        ui,
+                        palette,
+                        crate::icons::Icon::ChevronRight,
+                        14.0,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        page += 1;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.add_enabled_ui(page > 0, |ui| {
+                    if widgets::icon_button(
+                        ui,
+                        palette,
+                        crate::icons::Icon::ChevronLeft,
+                        14.0,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        page -= 1;
+                    }
+                });
+            });
+        });
+        ui.ctx().data_mut(|d| d.insert_temp(id, page));
+    } else {
+        ui.label(heading_label());
+    }
+    ui.add_space(4.0);
+
+    let mut clicked = None;
+    let mut action = None;
+    let gap = 12.0;
+    let col_w = (ui.available_width() - gap * cols.saturating_sub(1) as f32) / cols as f32;
+    let start = page * per_page;
+    let end = (start + per_page).min(count);
+    let rows_here = (end - start).div_ceil(cols.max(1));
+    for r in 0..rows_here {
+        let top_left = ui.cursor().min;
+        for c in 0..cols {
+            let i = start + r * cols + c;
+            if i >= end {
+                break;
+            }
+            let x = top_left.x + c as f32 * (col_w + gap);
+            let cell_rect = egui::Rect::from_min_size(
+                egui::pos2(x, top_left.y),
+                egui::vec2(col_w, theme::ROW_HEIGHT),
+            );
+            let (click, act) = paint_grid_cell(ui, palette, images, backend, cell_rect, i, spec(i));
+            if click.is_some() {
+                clicked = click;
+            }
+            if action.is_none() {
+                action = act;
+            }
+        }
+        ui.add_space(theme::ROW_HEIGHT);
+    }
+    stats.rows(end - start, count);
+    ListOutcome {
+        click: clicked,
+        action,
+        at_end: true,
+        // A paged shelf grid is never an editable playlist's own track list.
+        reorder: None,
+    }
+}
+
+/// [`spec_rows`] for a plain list of tracks, which is most of them.
+///
+/// Every track row carries its menu: Start Mix, queueing, navigation and share all derive
+/// from the track itself, so no page has anything to add. `playlist_id` is the open playlist
+/// when the list is its editable track list; `playlists` feeds the save picker. `hide_album`
+/// drops the album from the subtitle where it would be redundant — the album page, where
+/// every row is this album.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn track_rows(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    stats: &mut crate::stats::Stats,
+    now: &crate::player::NowPlaying,
+    tracks: &[crate::model::Track],
+    numbered: bool,
+    playlist_id: Option<&str>,
+    playlists: &[PlaylistRef],
+    signed_in: bool,
+    hide_album: bool,
+) -> ListOutcome {
+    spec_rows(ui, palette, images, backend, stats, tracks.len(), |i| {
+        let t = &tracks[i];
+        RowSpec {
+            number: numbered.then_some(i + 1),
+            rank: t.rank.as_deref(),
+            trend: t.trend,
+            title: &t.title,
+            subtitle: track_subtitle_inner(t, hide_album),
+            duration: t.duration,
+            plays: t.plays.as_deref(),
+            explicit: t.explicit,
+            active: is_active(now, &t.video_id),
+            badge: None,
+            // A video still is 16:9 and gets the wide slot; everything else is a square cover.
+            shape: if t.wide {
+                widgets::ArtShape::Wide
+            } else {
+                widgets::ArtShape::Square
+            },
+            thumbnail: t.thumbnail.as_ref(),
+            menu: Some(widgets::RowMenu {
+                track: t,
+                playlist_id,
+                playlists,
+                signed_in,
+                queue_index: None,
+            }),
+            like: t.like,
+            show_rating: true,
+        }
+    })
+}
+
+/// [`track_rows`] for a shelf with no sequential order to preserve — Home's "Quick picks", an
+/// artist's "Top songs" — wrapped into 2-3 columns when the window is wide enough instead of
+/// one full-width row per track. Always unnumbered and always the shelf's own tracks (no open
+/// playlist to save into), matching what both call sites already passed to `track_rows`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn track_shelf_rows(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    stats: &mut crate::stats::Stats,
+    now: &crate::player::NowPlaying,
+    tracks: &[crate::model::Track],
+    playlists: &[PlaylistRef],
+    signed_in: bool,
+) -> ListOutcome {
+    // The same shape `mood_chips` already picks its column count with (`mod.rs` above): a
+    // target width, clamped to a sane range. 1 keeps a narrow window — or the queue open next
+    // to it — a plain list; 3 is the ceiling asked for.
+    let cols = ((ui.available_width() / 400.0).floor() as usize).clamp(1, 3);
+    spec_rows_grid(
+        ui,
+        palette,
+        images,
+        backend,
+        stats,
+        tracks.len(),
+        cols,
+        |i| {
+            let t = &tracks[i];
+            RowSpec {
+                number: None,
+                rank: t.rank.as_deref(),
+                trend: t.trend,
+                title: &t.title,
+                subtitle: track_subtitle_inner(t, false),
+                duration: t.duration,
+                plays: t.plays.as_deref(),
+                explicit: t.explicit,
+                active: is_active(now, &t.video_id),
+                badge: None,
+                shape: if t.wide {
+                    widgets::ArtShape::Wide
+                } else {
+                    widgets::ArtShape::Square
+                },
+                thumbnail: t.thumbnail.as_ref(),
+                menu: Some(widgets::RowMenu {
+                    track: t,
+                    playlist_id: None,
+                    playlists,
+                    signed_in,
+                    queue_index: None,
+                }),
+                like: t.like,
+                show_rating: true,
+            }
+        },
+    )
+}
+
+/// [`track_shelf_rows`], but paged instead of wrapped — for a short, bounded list where
+/// growing indefinitely tall would be worse than paging: an artist's Top Songs, expanded past
+/// the 5 the page embeds up to a cap of 15 (see `App`'s handling of `Event::PlaylistLoaded` for
+/// the artist's own auto-generated playlist — 15 is enough, so there is no "show all" beyond
+/// it). `id_salt` resets the page to 0 per list — the artist id, so paging through one artist's
+/// songs does not leave a later one's opened mid-page.
+///
+/// 3 columns × 5 rows is the target: wide enough for that and the full 15 shows at once with no
+/// arrows at all. Only a narrower window — fewer columns fitting — needs them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn track_shelf_pages(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    stats: &mut crate::stats::Stats,
+    heading: &str,
+    now: &crate::player::NowPlaying,
+    tracks: &[crate::model::Track],
+    playlists: &[PlaylistRef],
+    signed_in: bool,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+) -> ListOutcome {
+    let cols = ((ui.available_width() / 400.0).floor() as usize).clamp(1, 3);
+    spec_pages(
+        ui,
+        palette,
+        images,
+        backend,
+        stats,
+        heading,
+        tracks.len(),
+        cols,
+        id_salt,
+        |i| {
+            let t = &tracks[i];
+            RowSpec {
+                number: None,
+                rank: t.rank.as_deref(),
+                trend: t.trend,
+                title: &t.title,
+                subtitle: track_subtitle_inner(t, false),
+                duration: t.duration,
+                plays: t.plays.as_deref(),
+                explicit: t.explicit,
+                active: is_active(now, &t.video_id),
+                badge: None,
+                shape: if t.wide {
+                    widgets::ArtShape::Wide
+                } else {
+                    widgets::ArtShape::Square
+                },
+                thumbnail: t.thumbnail.as_ref(),
+                menu: Some(widgets::RowMenu {
+                    track: t,
+                    playlist_id: None,
+                    playlists,
+                    signed_in,
+                    queue_index: None,
+                }),
+                like: t.like,
+                show_rating: true,
+            }
+        },
+    )
+}
+
+/// A grid of cards for a list of entries. Returns the index that was clicked.
+///
+/// One renderer for search results, artist shelves and home shelves — they are all lists of
+/// [`Entry`], and three near-identical grid loops is how the artist page ended up losing five of
+/// its shelves in the first place.
+pub(crate) fn entry_grid(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    items: &[Entry],
+    playlists: &[crate::model::PlaylistRef],
+    signed_in: bool,
+) -> GridOutcome {
+    let mut clicked = None;
+    let mut action = None;
+    ui.horizontal_wrapped(|ui| {
+        for (i, item) in items.iter().enumerate() {
+            let card = grid_card(ui, palette, images, backend, item, playlists, signed_in);
+            if action.is_none() {
+                action = card.action;
+            }
+            if card.clicked {
+                clicked = Some(i);
+            }
+        }
+    });
+    GridOutcome {
+        clicked,
+        action,
+        more: false,
+    }
+}
+
+/// One card in a grid or carousel: shape, art, menu and click, shared so the two layouts
+/// cannot drift apart.
+fn grid_card(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    item: &Entry,
+    playlists: &[crate::model::PlaylistRef],
+    signed_in: bool,
+) -> CardOutcome {
+    // A video still is 16:9: it gets the wide card and a server-side 16:9 crop, so it
+    // looks like a video instead of a squashed square.
+    let shape = match item {
+        Entry::Video(t) if t.wide => widgets::ArtShape::Wide,
+        _ if item.is_artist() => widgets::ArtShape::Circle,
+        _ => widgets::ArtShape::Square,
+    };
+    // Grids are not virtualised — every card in the shelf runs this loop, on- or off-screen —
+    // so skip the texture request *and* the `subtitle()` string build for the ones scrolled
+    // out of view. The card's size is fixed regardless of its subtitle, so layout is unmoved.
+    let visible = card_is_visible(ui, CARD_W, shape);
+    let art = visible
+        .then(|| {
+            if shape == widgets::ArtShape::Wide {
+                art_texture_wide(images, backend, ui.ctx(), item.thumbnail(), CARD_ART_PT)
+            } else {
+                art_texture(images, backend, ui.ctx(), item.thumbnail(), CARD_ART_PT)
+            }
+        })
+        .flatten();
+    // Every card gets the menu its kind deserves. Cards used to have none, which is
+    // why right-click worked on an artist page's Top songs and did nothing on its
+    // Videos shelf — the same songs, drawn as cards.
+    let menu = match item {
+        Entry::Song(t) | Entry::Video(t) => Some(widgets::CardMenu::Track(widgets::RowMenu {
+            track: t,
+            playlist_id: None,
+            playlists,
+            signed_in,
+            queue_index: None,
+        })),
+        Entry::Artist(a) => Some(widgets::CardMenu::Artist(a)),
+        Entry::Album(a) => Some(widgets::CardMenu::Release {
+            title: &a.title,
+            share_id: &a.id,
+        }),
+        Entry::Playlist(p) => Some(widgets::CardMenu::Release {
+            title: &p.title,
+            share_id: &p.id,
+        }),
+        Entry::Mood(_) => None,
+    };
+    let subtitle = if visible {
+        item.subtitle()
+    } else {
+        String::new()
+    };
+    let hit = widgets::art_card(
+        ui,
+        palette,
+        CARD_W,
+        art,
+        item.title(),
+        &subtitle,
+        shape,
+        menu,
+    );
+    CardOutcome {
+        clicked: hit.response.clicked(),
+        action: hit.action,
+    }
+}
+
+/// What one card reports.
+struct CardOutcome {
+    clicked: bool,
+    action: Option<RowAction>,
+}
+
+/// What a card grid reports: the card that was clicked, and any menu choice.
+pub(crate) struct GridOutcome {
+    pub clicked: Option<usize>,
+    pub action: Option<RowAction>,
+    /// The carousel's More pill was pressed. Grids have no More pill, so theirs is `false`.
+    pub more: bool,
+}
+
+/// One page step inside a carousel: never leaves `0..=max`, so the arrows cannot strand the
+/// row halfway past either end. Pure, so the bounds are unit-testable without an egui context.
+fn carousel_step(off: f32, dir: f32, view: f32, total: f32) -> f32 {
+    (off + dir * view).clamp(0.0, (total - view).max(0.0))
+}
+
+/// A shelf as a horizontal carousel: the reference's shape, with ‹ › arrows scrolling by a
+/// page and a More pill where the caller has somewhere for it to go.
+///
+/// The scroll offset lives in temp storage under `salt`, read back from the scroll area every
+/// frame — so dragging the row by hand and stepping it with the arrows never disagree. The
+/// offset is only *set* on an arrow frame; pinning it every frame would snap drags back.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn carousel(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    title: &str,
+    salt: impl std::hash::Hash + std::fmt::Debug + Copy,
+    items: &[Entry],
+    playlists: &[crate::model::PlaylistRef],
+    signed_in: bool,
+    more: Option<Route>,
+) -> GridOutcome {
+    let mut clicked = None;
+    let mut action = None;
+    let mut more_pressed = false;
+
+    let id = ui.id().with(("ytm-carousel-off", salt));
+    let off: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let view = ui.available_width();
+    let gap = 8.0;
+    let total = items.len() as f32 * CARD_W + items.len().saturating_sub(1) as f32 * gap;
+    let max = (total - view).max(0.0);
+
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(title)
+                .font(theme::semibold(14.0))
+                .color(palette.text),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let left_on = off > 1.0;
+            let right_on = off < max - 1.0;
+            ui.add_enabled_ui(right_on, |ui| {
+                if widgets::icon_button(ui, palette, crate::icons::Icon::ChevronRight, 14.0, false)
+                    .clicked()
+                {
+                    let next = carousel_step(off, 1.0, view, total);
+                    ui.ctx().data_mut(|d| d.insert_temp(id, next));
+                }
+            });
+            ui.add_enabled_ui(left_on, |ui| {
+                if widgets::icon_button(ui, palette, crate::icons::Icon::ChevronLeft, 14.0, false)
+                    .clicked()
+                {
+                    let next = carousel_step(off, -1.0, view, total);
+                    ui.ctx().data_mut(|d| d.insert_temp(id, next));
+                }
+            });
+            if more.is_some() && widgets::pill_button(ui, palette, "More").clicked() {
+                more_pressed = true;
+            }
+        });
+    });
+    ui.add_space(4.0);
+
+    // The arrows write the target into temp storage; the scroll area below reads it back.
+    // Setting `.scroll_offset` only on the click frame is what keeps hand drags working.
+    let want: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let mut area = egui::ScrollArea::horizontal().id_salt(("ytm-carousel", salt));
+    if (want - off).abs() > f32::EPSILON {
+        area = area.scroll_offset(egui::vec2(want, 0.0));
+    }
+    let out = area.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (i, item) in items.iter().enumerate() {
+                let card = grid_card(ui, palette, images, backend, item, playlists, signed_in);
+                if action.is_none() {
+                    action = card.action;
+                }
+                if card.clicked {
+                    clicked = Some(i);
+                }
+            }
+        });
+    });
+    ui.ctx().data_mut(|d| d.insert_temp(id, out.state.offset.x));
+
+    GridOutcome {
+        clicked,
+        action,
+        more: more_pressed,
+    }
+}
+
+/// Where an entry goes when clicked, for the kinds that navigate.
+/// A mood shelf's entry as the chip grid wants it: its label and its stripe colour.
+fn entry_chip(item: &Entry) -> (&str, Option<[u8; 3]>) {
+    match item {
+        Entry::Mood(m) => (m.title.as_str(), m.colour),
+        other => (other.title(), None),
+    }
+}
+
+pub(crate) fn entry_route(item: &Entry) -> Option<Route> {
+    match item {
+        Entry::Artist(a) => Some(Route::Artist(a.id.clone())),
+        Entry::Album(a) => Some(Route::Album(a.id.clone())),
+        Entry::Playlist(p) => Some(Route::Playlist(p.id.clone())),
+        Entry::Mood(m) => Some(Route::Mood(m.params.clone())),
+        Entry::Song(_) | Entry::Video(_) => None,
+    }
+}
+
+/// "Moods & genres" as a grid of coloured chips — the site's own shape, not cards and not
+/// default buttons. Each chip carries its stripe on the left; a chip whose source named no
+/// colour gets the dim outline instead of an invented one.
+pub(crate) fn mood_chips<'a>(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    // Title and stripe, not entries: the moods page holds `MoodRef`s while a mood shelf holds
+    // `Entry`s, and converting one into the other every frame copied every chip's text for a
+    // widget that only ever reads it.
+    items: impl Iterator<Item = (&'a str, Option<[u8; 3]>)>,
+) -> Option<usize> {
+    let mut clicked = None;
+    // Six across on a wide window, fewer when narrow — the reference's grid, not a wrap.
+    let cols = ((ui.available_width() / 180.0).floor() as usize).clamp(2, 6);
+    let gap = 8.0;
+    let chip_w = (ui.available_width() - (cols - 1) as f32 * gap) / cols as f32;
+    let chip_h = 44.0;
+    ui.horizontal_wrapped(|ui| {
+        // Wrapped, not a grid widget: every chip is identical, so wrapping lands on the
+        // column count by itself.
+        ui.spacing_mut().item_spacing.x = gap;
+        for (i, (title, colour)) in items.enumerate() {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(chip_w, chip_h), egui::Sense::click());
+            if ui.is_rect_visible(rect) {
+                let t = widgets::lit(ui, &response);
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius::same(theme::RADIUS),
+                    widgets::mix(palette.surface, palette.surface_hover, t),
+                );
+                match colour {
+                    Some([r, g, b]) => {
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(rect.min, egui::vec2(4.0, chip_h)),
+                            egui::CornerRadius::same(2),
+                            egui::Color32::from_rgb(r, g, b),
+                        );
+                    }
+                    None => {
+                        ui.painter().rect(
+                            rect,
+                            egui::CornerRadius::same(theme::RADIUS),
+                            egui::Color32::TRANSPARENT,
+                            egui::Stroke::new(1.0, palette.outline),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+                let label = widgets::truncate_to(ui, title, theme::medium(13.0), chip_w - 24.0);
+                ui.painter().text(
+                    rect.left_center() + egui::vec2(14.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    theme::medium(13.0),
+                    widgets::mix(palette.secondary, palette.text, t),
+                );
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            }
+            if response.clicked() {
+                clicked = Some(i);
+            }
+        }
+    });
+    clicked
+}
+
+/// Render one shelf — a track list when it is all songs, a card grid otherwise — and report what
+/// the user did with it.
+pub(crate) fn shelf(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) {
+    if shelf.items.is_empty() {
+        return;
+    }
+    section(ui, &app.palette, &shelf.title);
+
+    if shelf.is_mood_list() {
+        if let Some(i) = mood_chips(ui, &app.palette, shelf.items.iter().map(entry_chip))
+            && let Some(route) = shelf.items.get(i).and_then(entry_route)
+        {
+            app.navigate(route);
+        }
+        return;
+    }
+
+    if shelf.is_track_list() {
+        shelf_tracks(app, ui, shelf);
+        return;
+    }
+
+    let signed_in = app.signed_in();
+    let grid = {
+        let crate::app::App {
+            palette,
+            images,
+            backend,
+            library,
+            ..
+        } = app;
+        entry_grid(
+            ui,
+            palette,
+            images,
+            backend,
+            &shelf.items,
+            &library.playlists.items,
+            signed_in,
+        )
+    };
+    finish_grid(app, shelf, grid);
+}
+
+/// The same shelf with its card grid as a carousel — the reference's shape. Track lists and
+/// mood chips are unchanged; only grids scroll sideways. `more` is the carousel's More pill
+/// destination, if the caller has somewhere for it to go.
+pub(crate) fn shelf_carousel(
+    app: &mut crate::app::App,
+    ui: &mut egui::Ui,
+    page_salt: &str,
+    shelf: &Shelf,
+    more: Option<Route>,
+) {
+    if shelf.items.is_empty() {
+        return;
+    }
+    if shelf.is_mood_list() {
+        section(ui, &app.palette, &shelf.title);
+        if let Some(i) = mood_chips(ui, &app.palette, shelf.items.iter().map(entry_chip))
+            && let Some(route) = shelf.items.get(i).and_then(entry_route)
+        {
+            app.navigate(route);
+        }
+        return;
+    }
+    if shelf.is_track_list() {
+        // Ranked or not, a list of songs is rows — the carousel is for cards.
+        shelf_tracks(app, ui, shelf);
+        return;
+    }
+
+    let signed_in = app.signed_in();
+    let grid = {
+        let crate::app::App {
+            palette,
+            images,
+            backend,
+            library,
+            ..
+        } = app;
+        carousel(
+            ui,
+            palette,
+            images,
+            backend,
+            &shelf.title,
+            // Hashed into the carousel's scroll-offset id — a tuple hashes without the
+            // per-shelf-per-frame `format!` a joined string needed.
+            (page_salt, shelf.title.as_str()),
+            &shelf.items,
+            &library.playlists.items,
+            signed_in,
+            more.clone(),
+        )
+    };
+    if grid.more
+        && let Some(route) = more
+    {
+        app.navigate(route);
+    }
+    finish_grid(app, shelf, grid);
+}
+
+/// One of an artist's shelves (Albums, Singles & EPs, Videos, Live performances, Featured on,
+/// Playlists, Fans might also like) — never a mood or track list; Top Songs is its own
+/// dedicated section, not one of these. Not yet expanded, it's the plain wrapped card grid with
+/// a low-key "Show all" in the top right of its own heading, in place of a separate button or a
+/// carousel's arrows — one flowing page, not a row of mini-carousels to operate individually.
+/// Once "Show all" lands, the same grid draws under the same heading, "Show all" simply gone —
+/// no renamed heading, no colour change, no box, so the row that was already on screen doesn't
+/// move: both states build the heading the same way, and the title's own height is what sets
+/// the row's height either way.
+pub(crate) fn artist_shelf(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) {
+    if shelf.items.is_empty() {
+        return;
+    }
+    let mut show_all = false;
+    // A bit more room than a plain `section()` gets — these are separate categories on the
+    // page, not paragraphs of the same one.
+    ui.add_space(20.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(&shelf.title)
+                .font(theme::semibold(14.0))
+                .color(app.palette.text),
+        );
+        if !shelf.expanded && shelf.more_params.is_some() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if shelf_show_all(ui, &app.palette).clicked() {
+                    show_all = true;
+                }
+            });
+        }
+    });
+    ui.add_space(4.0);
+    draw_shelf_grid(app, ui, shelf);
+    if show_all {
+        app.expand_artist_shelf(&shelf.title);
+    }
+
+    if shelf.expanded {
+        return;
+    }
+    // Loading/error feedback for whichever shelf is currently expanding — only ever this one,
+    // since `App::expand_artist_shelf` overwrites the single in-flight slot on a second click.
+    let expanding = app
+        .artist_expand
+        .as_ref()
+        .is_some_and(|(_, t)| *t == shelf.title);
+    if expanding && app.artist_expand_loading {
+        // `draw_shelf_grid` always renders through `entry_grid` — a card grid, never rows.
+        ui.add_space(4.0);
+        widgets::skeleton_cards(ui, &app.palette, 4, widgets::ArtShape::Square);
+    }
+    if expanding && let Some(err) = app.artist_expand_error.clone() {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(err)
+                .font(theme::regular(12.0))
+                .color(app.palette.danger),
+        );
+    }
+}
+
+/// "Show all", low-key — plain text with a hover underline, not a button, so a shelf's heading
+/// doesn't compete with its own title for attention. Kept shorter than the title's own line so
+/// it never grows the heading row `artist_shelf` builds around it.
+fn shelf_show_all(ui: &mut egui::Ui, palette: &theme::Palette) -> egui::Response {
+    let font = theme::regular(12.0);
+    let text = "Show all";
+    let w = widgets::text_width(ui, text, &font);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(w, 14.0), egui::Sense::click());
+    let colour = if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        palette.text
+    } else {
+        palette.secondary
+    };
+    crate::emoji::paint_line(
+        ui,
+        egui::pos2(rect.left(), rect.center().y),
+        text,
+        font,
+        colour,
+    );
+    if response.hovered() {
+        ui.painter().hline(
+            rect.left()..=rect.right(),
+            rect.bottom(),
+            egui::Stroke::new(1.0, palette.text),
+        );
+    }
+    response
+}
+
+fn draw_shelf_grid(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) {
+    let signed_in = app.signed_in();
+    let grid = {
+        let crate::app::App {
+            palette,
+            images,
+            backend,
+            library,
+            ..
+        } = app;
+        entry_grid(
+            ui,
+            palette,
+            images,
+            backend,
+            &shelf.items,
+            &library.playlists.items,
+            signed_in,
+        )
+    };
+    finish_grid(app, shelf, grid);
+}
+
+/// The colour of the wash at `t`, where 0 is its top edge and 1 is where it has gone.
+///
+/// Two segments, so the tint holds near the top and then falls away: a soft accent to a
+/// fainter one over the first half, that to nothing over the second.
+fn wash_stop(panel: egui::Color32, wash: egui::Color32, t: f32, alpha: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let strong = panel.lerp_to_gamma(wash, 0.38);
+    let mid = panel.lerp_to_gamma(wash, 0.18);
+    let stop = if t <= 0.5 {
+        strong.lerp_to_gamma(mid, t * 2.0)
+    } else {
+        mid.lerp_to_gamma(egui::Color32::TRANSPARENT, (t - 0.5) * 2.0)
+    };
+    // As opaque as the card it sits on, so a translucent page does not wear an opaque band
+    // across its header. At `Off` this is `gamma_multiply(1.0)` — an identity.
+    stop.gamma_multiply(alpha)
+}
+
+/// A wash of the active scheme's accent across the top of the content card.
+///
+/// Painted first inside the page's scroll content, so the tint travels with the header and
+/// scrolls away instead of lingering as a background. A smooth gradient mesh, full-bleed —
+/// it reaches the card's own edges, past the content's inner margins, which needs a painter
+/// whose clip rect is grown to match: clipped to the scroll viewport it left a bare strip of
+/// panel colour above the tint, the width of the card's top margin. The topmost slice is a
+/// rounded cap in the card's own radius, so a square mesh cannot poke past the card's
+/// corners onto the gutter, and it is pinned to the card's top edge rather than to the
+/// scrolled content — scroll and the *colour* there fades, as the gradient passing upward
+/// under a fixed corner should. Tinted at the top, gone a quarter of the way down. Always
+/// painted, so it no longer waits on the cover decoding before it appears.
+///
+/// `wash` is the colour it blends from `panel` down to nothing — the fixed accent, or (see
+/// [`header_wash_colour`]) the current cover's own dominant colour.
+pub(crate) fn header_wash(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    content: egui::Rect,
+    top: f32,
+    wash: egui::Color32,
+) {
+    let h = content.height();
+    if h <= 0.0 {
+        return;
+    }
+    // The tint owns the top quarter of the box and nothing more.
+    let bottom = top + h * 0.25;
+    // The card's own edges: the page's content rect grown by the margin the card holds it in.
+    // `content` comes from the panel itself (`App::content_rect`) rather than from this ui's
+    // clip rect, which a scroll area builds from its viewport and its parent's clip and which
+    // is several points out on every side.
+    let card = egui::Rect::from_min_max(
+        egui::pos2(
+            content.min.x - theme::CONTENT_INSET_X,
+            content.min.y - theme::CONTENT_INSET_TOP,
+        ),
+        egui::pos2(content.max.x + theme::CONTENT_INSET_X, content.max.y),
+    );
+    // The card's top edge, not the content's: the strip the inner margin opens above the
+    // first row is part of the header, and leaving it panel-coloured is the seam that made
+    // the tint look like it started late. Above `top` the colour simply holds at full
+    // strength; scroll and the gradient travels up under a cap that stays put.
+    let start = card.top();
+    if card.width() <= 0.0 || bottom <= start {
+        return;
+    }
+    let span = bottom - top;
+    let colour = |y: f32| wash_stop(palette.panel, wash, (y - top) / span, palette.card_alpha);
+
+    // A painter built from scratch, not `ui.painter().with_clip_rect(card)`: that *intersects*
+    // with the ui's clip, which inside a scroll area starts below the card's top margin — so
+    // the cap was clipped away and the strip stayed panel-coloured. This one is clipped to the
+    // card and nothing else, and the card never reaches past the panel it lives in.
+    let painter = egui::Painter::new(ui.ctx().clone(), ui.layer_id(), card);
+    // The cap's rounding, tessellated straight into the gradient mesh. A `rect_filled` cap
+    // would not do: egui clamps a shape's corner radius to half its height, and a cap one
+    // radius tall renders its corners at half the card's rounding — visibly squarer than the
+    // panel it sits on. Walking the quarter-circle as mesh rows keeps the true radius and the
+    // gradient continuous — no seam where a flat cap used to meet the mesh.
+    let rad = (theme::PANEL_RADIUS as f32).min(bottom - start);
+    // (y, left x, right x) — pulled in along the arc, full width once past it.
+    let mut rows: Vec<(f32, f32, f32)> = Vec::new();
+    const ARC_STEPS: usize = 10;
+    for i in 0..=ARC_STEPS {
+        let y = start + rad * i as f32 / ARC_STEPS as f32;
+        let dy = start + rad - y;
+        let inset = rad - (rad * rad - dy * dy).max(0.0).sqrt();
+        rows.push((y, card.left() + inset, card.right() - inset));
+    }
+    let kink = top + span * 0.5;
+    let mut lower: Vec<f32> = vec![start + rad];
+    if kink > start + rad && kink < bottom {
+        lower.push(kink);
+    }
+    if bottom > start + rad {
+        lower.push(bottom);
+    }
+    for y in lower {
+        rows.push((y, card.left(), card.right()));
+    }
+    let mut mesh = egui::Mesh::default();
+    for &(y, xl, xr) in &rows {
+        for x in [xl, xr] {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(x, y),
+                uv: egui::epaint::WHITE_UV,
+                color: colour(y),
+            });
+        }
+    }
+    for row in 0..rows.len() - 1 {
+        let a = (row * 2) as u32;
+        mesh.add_triangle(a, a + 2, a + 1);
+        mesh.add_triangle(a + 1, a + 2, a + 3);
+    }
+    painter.add(mesh);
+}
+
+/// The header wash's colour: the current page's cover-art dominant colour, when "Match header
+/// colour to the cover art" is on and that art has finished decoding — the fixed accent
+/// otherwise. Self-healing: on the frame a page opens the art usually hasn't decoded yet, so
+/// this falls back to the accent that frame; once `page_header`'s own `art_texture()` call
+/// finishes the fetch, `images.dominant(url)` starts returning `Some` and the wash picks up
+/// the art's colour on the next frame, the same way the cover itself fades in once ready.
+pub(crate) fn header_wash_colour(
+    app: &crate::app::App,
+    art_url: Option<&std::sync::Arc<str>>,
+) -> egui::Color32 {
+    if app.settings.adaptive_art_color
+        && let Some(url) = art_url
+        && let Some([r, g, b]) = app.images.dominant(url)
+    {
+        egui::Color32::from_rgb(r, g, b)
+    } else {
+        app.palette.accent
+    }
+}
+
+/// What a detail header is built from. Album and playlist fill all of it; the artist page
+/// fills art and texts and draws its own buttons, since Shuffle/Mix/Subscribe are not
+/// Play/Save/•••.
+pub(crate) struct PageHeader<'a> {
+    pub art_url: Option<&'a std::sync::Arc<str>>,
+    pub art_size: f32,
+    pub circle: bool,
+    /// The type line (`ALBUM · 1995`). Empty hides it.
+    pub kind_label: &'a str,
+    pub title: &'a str,
+    /// A lowkey one-line description, between the title and the credits (Spotify-style). Only
+    /// playlists fill it.
+    pub description: Option<&'a str>,
+    /// The credited artists: each is linked where the source gave an id, so a multi-artist
+    /// album links every name rather than only the first. Empty for pages with no artist line.
+    pub artists: &'a [crate::model::ArtistLink],
+    /// The second line where there is no artist to name: the artist page's audience.
+    pub second_plain: Option<&'a str>,
+    /// The quiet third line.
+    pub meta: Option<&'a str>,
+    /// When set, prefixes the meta line with this linked name instead of drawing a separate
+    /// artist/owner row above it — the playlist page's creator. `None` (album, artist) keeps
+    /// the separate-line behaviour above.
+    pub owner: Option<&'a crate::model::ArtistLink>,
+    /// Gap from the title down to the artist/owner/audience line below it. The album's credit
+    /// is the identity of the page in a way the playlist's stats aren't, so it sits closer.
+    pub credit_gap: f32,
+    /// Play button diameter. `None` draws no Play — the artist page brings its own buttons.
+    pub play_size: Option<f32>,
+    /// Whether the track currently loaded is one of this page's own and is actively playing
+    /// (not paused) — paints the button as Pause rather than Play. Ignored when `play_size` is
+    /// `None`.
+    pub playing: bool,
+    /// Save/Saved chip. `None` draws none; the label follows the state, as YouTube writes it.
+    pub save_in_library: Option<bool>,
+    /// Whether the ••• button is drawn. Its menu stays the page's own.
+    pub dots: bool,
+    /// Id salt for the artist link, so neighbouring headers never share an interaction id.
+    pub salt: &'static str,
+}
+
+/// What `page_header` reports: the control row's clicks, the dots button for the page's own
+/// menu, a clicked artist link, and the text anchor for pages with custom buttons.
+pub(crate) struct HeaderOutcome {
+    pub play: bool,
+    pub save: bool,
+    pub dots: Option<egui::Response>,
+    pub link: Option<Route>,
+    pub text_x: f32,
+    pub text_w: f32,
+    pub art_bottom: f32,
+    /// The art as it was actually drawn — shrunken from the request when the card is narrow.
+    pub art_size: f32,
+    /// The bottom of the last text row painted, controls included. Callers that draw their
+    /// own button row (the artist page) use it to decide whether the row still fits.
+    pub text_bottom: f32,
+    /// The point just past the last button drawn (Play, Save or •••, whichever was last),
+    /// vertically centred on the row — where a caller-specific extra control (the playlist
+    /// page's sort icon) can paint itself on the same baseline. `None` when no control row was
+    /// drawn at all (every one of `play_size`/`save_in_library`/`dots` was off).
+    pub controls_end: Option<egui::Pos2>,
+}
+
+/// One header for the album, playlist and artist pages: wash, art, type line, title, artist
+/// line, meta, and — for the releases — the Play / Save / ••• row on its own baseline.
+///
+/// Painted absolutely, like the headers it replaces, so callers reserve the space the same
+/// way: `add_space(art_size + 12.0)` afterwards.
+pub(crate) fn page_header(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    images: &mut Images,
+    backend: &Backend,
+    h: PageHeader<'_>,
+) -> HeaderOutcome {
+    let available = ui.available_width();
+    // The art yields before the title does. A card narrowed by the queue panel (or a small
+    // window) otherwise hands the name single-letter ellipsis: "sl…" under a full-size art and
+    // a gutter it never asked to keep. The art shrinks — to its floor — first, so a shrunken
+    // art and a readable name survive; only then does the title truncate, and only when the
+    // card is honestly too small for both.
+    let art_size = h
+        .art_size
+        .min((available - 20.0 - 8.0 - 140.0).max(HEADER_ART_FLOOR_PT));
+    let art = art_texture(images, backend, ui.ctx(), h.art_url, h.art_size);
+    let art_rect = egui::Rect::from_min_size(
+        ui.cursor().min + egui::vec2(0.0, 4.0),
+        egui::vec2(art_size, art_size),
+    );
+    widgets::paint_art(
+        ui,
+        palette,
+        art_rect,
+        art,
+        if h.circle {
+            widgets::ArtShape::Circle
+        } else {
+            widgets::ArtShape::Square
+        },
+    );
+
+    let big = art_size >= 128.0;
+    let gutter = 20.0;
+    let tx = art_rect.right() + gutter;
+    // Relative, not `available - tx`: `tx` is an absolute x, `available` a width — mixing
+    // them undercounted the text by the page's whole left offset (~300pt), which is why
+    // headers truncated while the window still had room, and lost their text entirely
+    // once that subtraction went negative.
+    let text_w = (available - art_size - gutter - 8.0).max(0.0);
+    // The type line costs a row where it shows; without it the title sits higher — and with a
+    // large art it still starts low enough to sit in the circle rather than float above it.
+    let mut y = art_rect.top()
+        + if h.kind_label.is_empty() {
+            if big { 26.0 } else { 12.0 }
+        } else {
+            34.0
+        };
+    if !h.kind_label.is_empty() {
+        ui.painter().text(
+            egui::pos2(tx, art_rect.top() + 8.0),
+            egui::Align2::LEFT_CENTER,
+            widgets::truncate_to(ui, h.kind_label, theme::semibold(11.0), text_w),
+            theme::semibold(11.0),
+            palette.dim,
+        );
+    }
+    crate::emoji::paint_line(
+        ui,
+        egui::pos2(tx, y),
+        &widgets::truncate_to(ui, h.title, theme::semibold(24.0), text_w),
+        theme::semibold(24.0),
+        palette.text,
+    );
+    // The last text line painted, so the controls' baseline stays under it whether or not
+    // the header has an artist line and a meta line.
+    let mut last_line = y;
+    // The description, if any, sits between the title and the credits — one small line, the
+    // way Spotify writes it, so it reads as an aside and never pushes the tracks down. Same
+    // `secondary` colour as the merged owner/meta line below it: that line gets its own
+    // distinction from a bold owner name, not from a separate colour tier here, so the two
+    // read as one calm paragraph rather than clashing tones.
+    //
+    // `y` moves past the description's own row (not just `credit_gap`, which was calibrated
+    // for "title straight to the credits, no description in between") — playlists are the only
+    // page that ever fills `description`, and with `y` left untouched here the owner/meta line
+    // below used to land only 12pt under it (`credit_gap` 36 vs the description's own 24),
+    // squeezed against a real line's worth of text rather than given room for one.
+    if let Some(description) = h.description {
+        let dy = y + 24.0;
+        ui.painter().text(
+            egui::pos2(tx, dy),
+            egui::Align2::LEFT_CENTER,
+            widgets::truncate_to(ui, description, theme::regular(12.0), text_w),
+            theme::regular(12.0),
+            palette.secondary,
+        );
+        last_line = dy;
+        y = dy + if big { 28.0 } else { 27.0 };
+    } else {
+        y += h.credit_gap;
+    }
+    let mut link = None;
+    match (h.artists.is_empty(), h.second_plain) {
+        (false, _) => {
+            // Every credited artist is its own linked part, so a multi-artist album header
+            // no longer collapses to one string with only the first name clickable.
+            let mut subtitle = widgets::no_subtitle();
+            fill_artists(&mut subtitle, h.artists);
+            if let Some(target) = widgets::paint_subtitle(
+                ui,
+                palette,
+                egui::pos2(tx, y),
+                tx + text_w,
+                &subtitle,
+                None,
+                h.salt,
+            ) {
+                link = Some(link_route(target));
+            }
+            last_line = y;
+            y += if big { 28.0 } else { 27.0 };
+        }
+        (true, Some(plain)) => {
+            ui.painter().text(
+                egui::pos2(tx, y),
+                egui::Align2::LEFT_CENTER,
+                widgets::truncate_to(ui, plain, theme::regular(12.0), text_w),
+                theme::regular(12.0),
+                palette.secondary,
+            );
+            last_line = y;
+            y += if big { 28.0 } else { 27.0 };
+        }
+        // No line between title and meta: the meta takes the artist's slot, so the gap
+        // below the title is the same 36 pt on a page that has no author to show. Before
+        // this, the empty arm still advanced past a line that was never painted and a
+        // playlist with no author wore a double gap under its name.
+        (true, None) => {}
+    }
+    if let Some(meta) = h.meta {
+        // The playlist page folds its creator into this line instead of a separate row above
+        // it. The name is painted bold and full-brightness rather than routed through
+        // `paint_subtitle` (which gives every part the same weight) — like Spotify's and Apple
+        // Music's own playlist headers, the bold name is what makes this read as *the* credit
+        // line rather than a continuation of the description above it.
+        if let Some(owner) = h.owner {
+            let name_font = theme::semibold(12.0);
+            let stat_font = theme::regular(12.0);
+            let shown_name = widgets::truncate_to(ui, &owner.name, name_font.clone(), text_w);
+            if !shown_name.is_empty() {
+                let name_w = widgets::text_width(ui, &shown_name, &name_font);
+                if let Some(id) = owner.id.as_deref() {
+                    let hit = egui::Rect::from_min_size(
+                        egui::pos2(tx, y - 8.0),
+                        egui::vec2(name_w, 16.0),
+                    );
+                    let r = ui.interact(hit, ui.id().with((h.salt, "owner")), egui::Sense::click());
+                    if r.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        ui.painter().hline(
+                            tx..=(tx + name_w),
+                            y + 7.0,
+                            egui::Stroke::new(1.0, palette.text),
+                        );
+                    }
+                    if r.clicked() {
+                        link = Some(Route::Artist(id.to_owned()));
+                    }
+                }
+                crate::emoji::paint_line(
+                    ui,
+                    egui::pos2(tx, y),
+                    &shown_name,
+                    name_font,
+                    palette.text,
+                );
+                let sep_x = tx + name_w;
+                let sep_w = widgets::text_width(ui, widgets::FIELD_SEP, &stat_font);
+                let shown_meta = widgets::truncate_to(
+                    ui,
+                    meta,
+                    stat_font.clone(),
+                    (tx + text_w - sep_x - sep_w).max(0.0),
+                );
+                if !shown_meta.is_empty() {
+                    ui.painter().text(
+                        egui::pos2(sep_x, y),
+                        egui::Align2::LEFT_CENTER,
+                        widgets::FIELD_SEP,
+                        stat_font.clone(),
+                        palette.secondary,
+                    );
+                    crate::emoji::paint_line(
+                        ui,
+                        egui::pos2(sep_x + sep_w, y),
+                        &shown_meta,
+                        stat_font,
+                        palette.secondary,
+                    );
+                }
+            }
+        } else {
+            // `dim` is right when this line sits *below* a real credit line (Album's artists,
+            // Artist's audience count) — a genuinely secondary stats row. But a playlist with
+            // no owner (only ever Liked Music, whose header has no artist/audience line above
+            // this at all — playlist always passes `artists: &[]`, `second_plain: None`) has
+            // nothing else credit-shaped drawn, so this line *is* the credit line, same as the
+            // bold-name branch above treats its own stats text: `secondary`, not the fainter
+            // `dim`, or the same information reads visibly greyer than on every other playlist.
+            let color = if h.artists.is_empty() && h.second_plain.is_none() {
+                palette.secondary
+            } else {
+                palette.dim
+            };
+            ui.painter().text(
+                egui::pos2(tx, y),
+                egui::Align2::LEFT_CENTER,
+                widgets::truncate_to(ui, meta, theme::regular(12.0), text_w),
+                theme::regular(12.0),
+                color,
+            );
+        }
+        last_line = y;
+    }
+
+    // The bottom of the text column: the last row painted above, plus half a line of
+    // breathing room.
+    let text_bottom = last_line + 10.0;
+
+    let mut outcome = HeaderOutcome {
+        play: false,
+        save: false,
+        dots: None,
+        link,
+        text_x: tx,
+        text_w,
+        art_bottom: art_rect.bottom(),
+        art_size,
+        text_bottom,
+        controls_end: None,
+    };
+    if h.play_size.is_none() && h.save_in_library.is_none() && !h.dots {
+        return outcome;
+    }
+    // Play, Save, ••• on their own baseline, nudged up from the art's bottom edge. When
+    // the art has shrunk to its floor (a card narrowed by the queue panel), that baseline
+    // climbs into the title and the column is too narrow for the three of them anyway —
+    // so the row drops below both art and text and takes the card's full width.
+    let inline_y = art_rect.bottom() - 46.0;
+    let below = inline_y < text_bottom;
+    let controls_rect = if below {
+        egui::Rect::from_min_size(
+            egui::pos2(art_rect.left(), text_bottom + 6.0),
+            egui::vec2(available - 8.0, 46.0),
+        )
+    } else {
+        egui::Rect::from_min_size(egui::pos2(tx, inline_y), egui::vec2(text_w, 46.0))
+    };
+    let mut controls = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(controls_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    if let Some(size) = h.play_size
+        && widgets::play_button(&mut controls, palette, h.playing, size).clicked()
+    {
+        outcome.play = true;
+    }
+    controls.add_space(6.0);
+    if let Some(in_library) = h.save_in_library {
+        if widgets::chip(
+            &mut controls,
+            palette,
+            if in_library { "Saved" } else { "Save" },
+            in_library,
+        )
+        .clicked()
+        {
+            outcome.save = true;
+        }
+        controls.add_space(6.0);
+    }
+    let dots = widgets::icon_button(
+        &mut controls,
+        palette,
+        crate::icons::Icon::Ellipsis,
+        16.0,
+        false,
+    );
+    outcome.controls_end = Some(controls.min_rect().right_center());
+    drop(controls);
+    outcome.dots = Some(dots);
+    outcome.art_bottom = outcome.art_bottom.max(controls_rect.bottom() + 6.0);
+    outcome
+}
+
+/// The description behind a ••• menu's Info item. One copy: the album and playlist pages
+/// showed the same window from the same state.
+pub(crate) fn info_popup(app: &mut crate::app::App, ui: &mut egui::Ui) {
+    let Some(text) = app.page_info.clone() else {
+        return;
+    };
+    let mut open = true;
+    egui::Window::new("Info")
+        .collapsible(false)
+        .resizable(false)
+        .max_width(520.0)
+        .open(&mut open)
+        .show(ui.ctx(), |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(text)
+                            .font(theme::regular(13.0))
+                            .color(app.palette.secondary),
+                    );
+                });
+        });
+    if !open {
+        app.page_info = None;
+    }
+}
+
+/// A shelf that is all songs, as track rows — shared by the wrapped and carousel layouts,
+///
+/// which is why a ranked "Top songs" shelf plays the same wherever it appears.
+fn shelf_tracks(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) {
+    let tracks = shelf.tracks();
+    let signed_in = app.signed_in();
+    let clicked = {
+        let crate::app::App {
+            palette,
+            images,
+            backend,
+            stats,
+            now,
+            library,
+            ..
+        } = app;
+        track_shelf_rows(
+            ui,
+            palette,
+            images,
+            backend,
+            stats,
+            now,
+            &tracks,
+            &library.playlists.items,
+            signed_in,
+        )
+    };
+    match clicked.click {
+        Some(ListClick::Row(i)) => app.start_from(tracks, i),
+        Some(ListClick::Link(route)) => app.navigate(route),
+        None => {}
+    }
+    if let Some(action) = clicked.action {
+        app.row_action(action);
+    }
+}
+/// What a card grid — wrapped or carousel — does with a click or a menu choice.
+fn finish_grid(app: &mut crate::app::App, shelf: &Shelf, grid: GridOutcome) {
+    if let Some(action) = grid.action {
+        app.row_action(action);
+    }
+    if let Some(i) = grid.clicked
+        && let Some(item) = shelf.items.get(i)
+    {
+        match entry_route(item) {
+            Some(route) => app.navigate(route),
+            // A video card in a card shelf still plays; it queues that shelf's playables.
+            None => {
+                let tracks = shelf.tracks();
+                if let Some(index) = shelf.track_index(i) {
+                    app.start_from(tracks, index);
+                }
+            }
+        }
+    }
+}
+
+/// The scroll area a page's content lives in.
+///
+/// Two things it exists to get right:
+///
+/// * **Its own scroll position.** Every page used to build a bare `ScrollArea::vertical()`, which
+///   takes its id from the `Ui` path — the same `CentralPanel` for every route — so all pages
+///   shared one offset. Opening Home after scrolling the library dropped you into the middle of it.
+///   An `id_salt` per route gives each page its own, so Back also returns you where you were.
+/// * **Starting at the top of a page you just opened**, which is what [`crate::app::App`] sets
+///   `scroll_to_top` for. Back and Forward deliberately do not set it. The flag is sticky
+///   until a scroll area consumes it: a fresh fetch shows a loader first, and clearing the
+///   flag on a loader frame would reopen the feed at the old offset once it arrives.
+pub(crate) fn page_scroll(app: &mut crate::app::App, salt: &str) -> egui::ScrollArea {
+    let mut area = egui::ScrollArea::vertical()
+        .id_salt(salt)
+        .auto_shrink([false, false]);
+    if app.scroll_to_top {
+        area = area.vertical_scroll_offset(0.0);
+        app.scroll_to_top = false;
+    }
+    if let Some(offset) = app.autoscroll {
+        area = area.vertical_scroll_offset(offset);
+    }
+    area
+}
+
+/// A section heading, e.g. "Top songs" between blocks of a page.
+pub(crate) fn section(ui: &mut egui::Ui, palette: &theme::Palette, name: &str) {
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new(name)
+            .font(theme::semibold(14.0))
+            .color(palette.text),
+    );
+    ui.add_space(4.0);
+}
+
+/// A grid of cards laid out with `horizontal_wrapped`, skipping the art fetch for cards that are
+/// scrolled out of view. Grids hold far fewer items than track lists, so they are not virtualised
+/// — but an off-screen card must still not cost a network request.
+pub(crate) fn card_is_visible(ui: &egui::Ui, width: f32, shape: widgets::ArtShape) -> bool {
+    let cursor = ui.cursor();
+    let card = egui::Rect::from_min_size(cursor.min, widgets::card_size(width, shape));
+    ui.clip_rect().intersects(card)
+}
+
+/// Whether this track is the one currently loaded in the player.
+pub(crate) fn is_active(now: &crate::player::NowPlaying, video_id: &str) -> bool {
+    now.track.as_ref().is_some_and(|t| t.video_id == video_id)
+}
+
+/// A dim message centred in the remaining space, for loading / empty / error pages.
+pub(crate) fn centered(app: &crate::app::App, ui: &mut egui::Ui, message: &str) {
+    ui.centered_and_justified(|ui| {
+        ui.label(
+            egui::RichText::new(message)
+                .font(theme::regular(13.0))
+                .color(app.palette.dim),
+        );
+    });
+}
+
+/// An error message with a "Try again" button. Takes the message by value so callers can pass
+/// a clone and keep no borrow on `App` while the retry closure runs.
+pub(crate) fn failed(
+    app: &mut crate::app::App,
+    ui: &mut egui::Ui,
+    message: String,
+    retry: impl FnOnce(&mut crate::app::App),
+) {
+    ui.centered_and_justified(|ui| {
+        ui.label(
+            egui::RichText::new(message)
+                .font(theme::regular(13.0))
+                .color(app.palette.danger),
+        );
+    });
+    ui.add_space(8.0);
+    ui.centered_and_justified(|ui| {
+        if crate::widgets::pill_button(ui, &app.palette, "Try again").clicked() {
+            retry(app);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROW: f32 = 56.0;
+
+    /// The wash's ramp: full strength where the header starts, gone where it ends, and never
+    /// brightening on the way down. The top stop is what fills the card's top margin, so a
+    /// value there that was already fading would put the seam back.
+    #[test]
+    fn the_wash_starts_at_full_strength_and_ends_at_nothing() {
+        let panel = egui::Color32::from_rgb(20, 20, 24);
+        let wash = egui::Color32::from_rgb(200, 40, 90);
+        assert_eq!(
+            wash_stop(panel, wash, 0.0, 1.0),
+            panel.lerp_to_gamma(wash, 0.38)
+        );
+        assert_eq!(
+            wash_stop(panel, wash, 1.0, 1.0).a(),
+            0,
+            "the foot must be gone"
+        );
+        // Clamped: above the header the colour holds rather than inverting.
+        assert_eq!(
+            wash_stop(panel, wash, -0.5, 1.0),
+            wash_stop(panel, wash, 0.0, 1.0)
+        );
+        let mut last = 255;
+        for i in 0..=10 {
+            let a = wash_stop(panel, wash, i as f32 / 10.0, 1.0).a();
+            assert!(a <= last, "alpha rose at {i}: {a} after {last}");
+            last = a;
+        }
+    }
+
+    /// A viewport that fits the whole list must draw the whole list — the case that made the
+    /// first live measurement look like a bug when it was not.
+    #[test]
+    fn a_short_list_in_a_tall_window_draws_everything() {
+        assert_eq!(visible_range(235.0, 106.0, 848.0, ROW, 20), 0..20);
+    }
+
+    /// Paging is driven off the drawn range: reaching the end of what is loaded is what asks for
+    /// more, and the top of a long list must not.
+    #[test]
+    fn only_the_end_of_a_list_asks_for_another_page() {
+        let at_end = |r: std::ops::Range<usize>, count: usize| r.end + PREFETCH_ROWS >= count;
+
+        // A viewport at the top of 689 rows: nothing to fetch yet.
+        assert!(!at_end(visible_range(0.0, 0.0, 560.0, ROW, 689), 689));
+        // Scrolled to the last screen of them: fetch.
+        assert!(at_end(
+            visible_range(-680.0 * ROW, 0.0, 560.0, ROW, 689),
+            689
+        ));
+        // A list that fits entirely on screen is already at its end.
+        assert!(at_end(visible_range(0.0, 0.0, 848.0, ROW, 12), 12));
+    }
+
+    /// The case that matters: a long list costs the viewport, not the list.
+    #[test]
+    fn a_long_list_draws_only_the_viewport() {
+        let r = visible_range(0.0, 0.0, 560.0, ROW, 5000);
+        assert_eq!(r.start, 0);
+        assert!(r.len() <= 16, "drew {} rows for a 560px viewport", r.len());
+    }
+
+    #[test]
+    fn scrolling_moves_the_window_and_keeps_it_the_same_size() {
+        let unscrolled = visible_range(0.0, 0.0, 560.0, ROW, 5000);
+        // Scrolled down 100 rows: the list start has moved above the viewport.
+        let scrolled = visible_range(-100.0 * ROW, 0.0, 560.0, ROW, 5000);
+        assert_eq!(scrolled.start, 98, "100 rows up, minus overscan");
+        assert_eq!(scrolled.len(), unscrolled.len());
+    }
+
+    #[test]
+    fn the_end_of_the_list_is_not_overrun() {
+        let r = visible_range(-4990.0 * ROW, 0.0, 560.0, ROW, 5000);
+        assert_eq!(r.end, 5000);
+        assert!(r.start < r.end);
+    }
+
+    /// A list scrolled entirely past the bottom of the viewport must not panic or invert.
+    #[test]
+    fn scrolling_far_past_the_end_yields_an_empty_range() {
+        let r = visible_range(-9_000.0 * ROW, 0.0, 560.0, ROW, 100);
+        assert!(r.start <= r.end, "{r:?}");
+        assert_eq!(r.end, 100);
+    }
+
+    #[test]
+    fn an_empty_list_has_an_empty_range() {
+        assert!(visible_range(0.0, 0.0, 560.0, ROW, 0).is_empty());
+    }
+
+    /// Carousel paging never leaves its rails: a step past either end clamps, and a view
+    /// wider than the row never moves at all.
+    #[test]
+    fn carousel_paging_stays_on_its_rails() {
+        assert_eq!(carousel_step(0.0, 1.0, 500.0, 1200.0), 500.0);
+        assert_eq!(carousel_step(600.0, 1.0, 500.0, 1200.0), 700.0);
+        assert_eq!(carousel_step(0.0, -1.0, 500.0, 1200.0), 0.0);
+        assert_eq!(carousel_step(0.0, 1.0, 1500.0, 1200.0), 0.0);
+    }
+
+    fn subtitle_track() -> crate::model::Track {
+        crate::model::Track {
+            video_id: "vid".to_owned(),
+            title: "Song".to_owned(),
+            artists: vec![
+                crate::model::ArtistLink {
+                    name: "Artist".to_owned(),
+                    id: Some("UCartist".to_owned()),
+                },
+                crate::model::ArtistLink {
+                    name: "Guest".to_owned(),
+                    id: None,
+                },
+            ],
+            album: Some("Album".to_owned()),
+            album_id: Some("MPREalbum".to_owned()),
+            duration: Some(200),
+            plays: Some("1M plays".to_owned()),
+            explicit: false,
+            like: crate::model::LikeStatus::Indifferent,
+            in_library: false,
+            library_add: None,
+            library_remove: None,
+            set_video_id: None,
+            thumbnail: None,
+            rank: None,
+            trend: crate::model::ChartTrend::Unknown,
+            wide: false,
+            local_path: None,
+        }
+    }
+
+    fn part_texts<'a>(sub: &'a widgets::Subtitle<'a>) -> Vec<(&'a str, bool)> {
+        sub.iter()
+            .flatten()
+            .map(|p| (p.text, p.target.is_some()))
+            .collect()
+    }
+
+    /// The full subtitle names the album with its link, after the artists.
+    #[test]
+    fn full_subtitle_keeps_artists_and_linked_album() {
+        let t = subtitle_track();
+        assert_eq!(
+            part_texts(&track_subtitle(&t)),
+            [("Artist", true), ("Guest", false), ("Album", true)]
+        );
+    }
+
+    /// The album page and the queue drop the album slot but keep everything else: linked
+    /// artists stay linked, and the plays/Radio tail is unaffected (it rides `tail`, not
+    /// the subtitle slots — asserted by its absence here, not its presence).
+    #[test]
+    fn no_album_subtitle_drops_only_the_album() {
+        let t = subtitle_track();
+        let sub = track_subtitle_no_album(&t);
+        assert_eq!(part_texts(&sub), [("Artist", true), ("Guest", false)]);
+        assert!(
+            sub.iter().flatten().all(|p| p.text != "Album"),
+            "the album must not appear in any slot"
+        );
+    }
+
+    /// No album on the track, no empty slot left behind.
+    #[test]
+    fn no_album_subtitle_without_an_album_is_just_artists() {
+        let mut t = subtitle_track();
+        t.album = None;
+        t.album_id = None;
+        assert_eq!(
+            part_texts(&track_subtitle(&t)),
+            part_texts(&track_subtitle_no_album(&t))
+        );
+    }
+}

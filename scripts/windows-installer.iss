@@ -1,0 +1,62 @@
+; refryt's Windows installer. Compiled by scripts/build-windows.sh via ISCC under Wine — see
+; docs/BUILDING.md. Version and the staged input folder are passed in with /D, not hardcoded,
+; so this stays in sync with whatever the Rust build actually produced.
+;
+; Stable across releases so Windows treats a new installer as an *upgrade* of the same app
+; rather than a second, separate install:
+; A doubled leading brace is Inno Setup's own escape for a literal "{" — without it, the GUID
+; below parses as a (nonexistent) named constant rather than a literal string.
+#define AppId "{{534D3A53-19D8-4423-94FD-1AEE64DBD7C3}"
+
+#ifndef AppVersion
+  #define AppVersion "0.0.0"
+#endif
+#ifndef StageDir
+  #define StageDir "stage"
+#endif
+
+[Setup]
+AppId={#AppId}
+AppName=refryt
+AppVersion={#AppVersion}
+AppPublisher=refryt
+AppPublisherURL=https://github.com/gridoe/refryt
+DefaultDirName={autopf}\refryt
+DefaultGroupName=refryt
+UninstallDisplayIcon={app}\refryt.exe
+OutputDir=..\dist
+OutputBaseFilename=refryt-{#AppVersion}-windows-x86_64-setup
+Compression=lzma2
+SolidCompression=yes
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+LicenseFile=..\LICENSE
+DisableProgramGroupPage=yes
+; No signing key exists for this project, so an unsigned installer will still trip Windows'
+; SmartScreen the first few times anyone runs it — a known, disclosed limitation, not a bug.
+SetupIconFile=..\assets\icons\app\refryt.ico
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
+
+[Files]
+Source: "{#StageDir}\refryt.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\libmpv-2.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\yt-dlp.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{group}\refryt"; Filename: "{app}\refryt.exe"
+Name: "{autodesktop}\refryt"; Filename: "{app}\refryt.exe"; Tasks: desktopicon
+Name: "{group}\Uninstall refryt"; Filename: "{uninstallexe}"
+
+[Run]
+Filename: "{app}\refryt.exe"; Description: "Launch refryt"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+; Nothing under {app} to clean up beyond the files listed above — settings and the signed-in
+; session live under the user's own AppData, same as on Linux they live under ~/.config, and an
+; uninstall leaving those behind (rather than silently deleting a session) is the same choice
+; every other app on the platform makes.

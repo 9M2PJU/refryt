@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+rust-version = "1.90"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "fs", "sync"] }
+tracing = "0.1"
+# No `env-filter`: `filter::Targets` (see `refryt::init_tracing`) parses the same `RUST_LOG`
+# syntax without `matchers` + `regex-automata` + `regex-syntax`, the only regex in the build.
+tracing-subscriber = "0.3"
+url = "2.5"
+
+# UI
+eframe = { version = "0.36", default-features = false, features = [
+  "glow", "wayland", "x11", "persistence", "default_fonts",
+] }
+egui = "0.36"
+# Only `svg`: the `image` loader (raster bytes:// / http:// URIs) is unused — every cover and
+# emoji is decoded by hand in `images.rs` / `emoji.rs` and handed to egui as a `TextureHandle`.
+egui_extras = { version = "0.36", features = ["svg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+directories = "6.0"
+libmpv2 = "6.0"
+# `serde_json` exposes `Json::into_inner`, which is how `innertube.rs` gets at the raw
+# response for the two endpoints whose typed parsers are stale.
+ytmapi-rs = { version = "0.3", default-features = false, features = ["rustls", "simplified-queries", "reqwest", "serde_json"] }
+refryt-resolve = { path = "crates/refryt-resolve" }
+
+# Iteration speed: our code compiles fast, dependencies are optimised once and then cached.
+# Without this an egui debug build is unusably slow at runtime; with it the edit-run loop stays
+# a couple of seconds.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+# Fat LTO and no unwinding: nothing in the workspace catches a panic (no `catch_unwind`,
+# `panic::set_hook` or `resume_unwind` anywhere in `crates/`), so the unwind tables and
+# landing pads are pure weight — `.eh_frame` + `.gcc_except_table` alone are ~1.7 MB.
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

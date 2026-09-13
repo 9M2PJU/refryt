@@ -1,0 +1,19 @@
+{
+  "playabilityStatus": {
+    "status": "OK"
+  },
+  "videoDetails": {
+    "videoId": "XFkzRNyygfk",
+    "title": "Creep",
+    "lengthSeconds": "236",
+    "author": "Radiohead"
+  },
+  "playbackTracking": {
+    "videostatsPlaybackUrl": {
+      "baseUrl": "https://www.youtube.com/api/stats/playback?ns=yt&el=detailpage&ver=2&docid=XFkzRNyygfk&ei=AAAAAAAAAAA&cl=123456789&of=abcDEF123&vm=CAIQARgB"
+    },
+    "videostatsWatchtimeUrl": {
+      "baseUrl": "https://www.youtube.com/api/stats/watchtime?ns=yt&el=detailpage&ver=2&docid=XFkzRNyygfk&ei=AAAAAAAAAAA&cl=123456789&of=abcDEF123&vm=CAIQARgB"
+    }
+  }
+}

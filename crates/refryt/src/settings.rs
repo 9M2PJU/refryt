@@ -1,0 +1,533 @@
+//! User preferences, persisted to `~/.config/refryt/settings.json`.
+//!
+//! Everything here changes something real. There is no setting that only writes itself to disk:
+//! the theme and the scheme repaint, the opacity changes what the window lets through,
+//! normalisation changes the gain applied to the stream, the quality choice changes the format
+//! `yt-dlp` is asked for,
+//! and scrobbling reports plays to the account's watch history.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::theme::{Palette, Scheme, Variant};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    /// Follow the desktop's light/dark preference.
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::System, Theme::Dark, Theme::Light];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::System => "System",
+            Theme::Dark => "Dark",
+            Theme::Light => "Light",
+        }
+    }
+
+    /// Which polarity to paint, resolving `System` against what the desktop reports. The
+    /// colours themselves come from the [`Scheme`]; this only picks dark or light.
+    pub fn is_dark(self, ctx: &egui::Context) -> bool {
+        match self {
+            Theme::Dark => true,
+            Theme::Light => false,
+            // What the desktop reports; egui falls back to dark when it cannot tell.
+            Theme::System => ctx.system_theme().unwrap_or(egui::Theme::Dark) == egui::Theme::Dark,
+        }
+    }
+}
+
+/// How much of the desktop shows through the shell: a sheer amount, `0.0` (opaque, the
+/// default) to `1.0` (as much as the window can show through and still read).
+///
+/// A slider rather than levels, because the composite is a continuum. The four named levels the
+/// setting shipped with still parse from an old `settings.json` or `--opacity`, and the curve
+/// passes through their exact values — an old file repaints as it did.
+///
+/// Each amount names what the gutter and a card should *composite* to; the card's own fill alpha
+/// is solved from the pair in [`Palette::with_opacity`], because the two are painted one over
+/// the other and a single alpha would leave the card nearly opaque.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Opacity(f32);
+
+impl Default for Opacity {
+    fn default() -> Self {
+        Self::OFF
+    }
+}
+
+impl Opacity {
+    /// Fully opaque — what every build before opacity existed painted.
+    pub const OFF: Self = Self(0.0);
+    /// As sheer as the window gets. The old "Strong" level sat here.
+    pub const MAX: f32 = 1.0;
+
+    /// A sheer amount, clamped to what the window can paint. A non-finite amount is opaque.
+    pub fn new(sheer: f32) -> Self {
+        if sheer.is_finite() {
+            Self(sheer.clamp(0.0, Self::MAX))
+        } else {
+            Self::OFF
+        }
+    }
+
+    /// The sheer amount behind the slider.
+    pub fn sheer(self) -> f32 {
+        self.0
+    }
+
+    /// Whether nothing at all shows through.
+    pub fn is_opaque(self) -> bool {
+        self.0 <= 0.0
+    }
+
+    /// Parse an `--opacity` argument: a number between 0 and 1, or one of the four level names
+    /// the setting used before the slider.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::level(name).or_else(|| {
+            name.trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .map(Self::new)
+        })
+    }
+
+    /// The old named levels, on the curve where the slider's ends and thirds sit.
+    fn level(name: &str) -> Option<Self> {
+        [
+            ("off", Self::OFF),
+            ("subtle", Self::new(1.0 / 3.0)),
+            ("medium", Self::new(2.0 / 3.0)),
+            ("strong", Self::new(Self::MAX)),
+        ]
+        .into_iter()
+        .find(|(label, _)| label.eq_ignore_ascii_case(name.trim()))
+        .map(|(_, level)| level)
+    }
+
+    /// What the gutter, the top bar and the player bar composite to. Piecewise linear through
+    /// `(0, 1.00)`, `(1/3, 0.88)`, `(2/3, 0.74)`, `(1, 0.58)` — the old levels.
+    pub fn gutter(self) -> f32 {
+        let s = self.0;
+        if s <= 1.0 / 3.0 {
+            lerp(1.00, 0.88, s * 3.0)
+        } else if s <= 2.0 / 3.0 {
+            lerp(0.88, 0.74, (s - 1.0 / 3.0) * 3.0)
+        } else {
+            lerp(0.74, 0.58, (s - 2.0 / 3.0) * 3.0)
+        }
+    }
+
+    /// What a card composites to, the gutter underneath it included. Through `(0, 1.00)`,
+    /// `(1/3, 0.94)`, `(2/3, 0.86)`, `(1, 0.74)`.
+    pub fn card(self) -> f32 {
+        let s = self.0;
+        if s <= 1.0 / 3.0 {
+            lerp(1.00, 0.94, s * 3.0)
+        } else if s <= 2.0 / 3.0 {
+            lerp(0.94, 0.86, (s - 1.0 / 3.0) * 3.0)
+        } else {
+            lerp(0.86, 0.74, (s - 2.0 / 3.0) * 3.0)
+        }
+    }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+impl Serialize for Opacity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Opacity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Amount;
+        impl<'de> serde::de::Visitor<'de> for Amount {
+            type Value = Opacity;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a sheer amount between 0 and 1, or off/subtle/medium/strong")
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Opacity, E> {
+                Ok(Opacity::new(v as f32))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Opacity, E> {
+                Ok(Opacity::new(v as f32))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Opacity, E> {
+                Ok(Opacity::new(v as f32))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Opacity, E> {
+                Opacity::parse(v).ok_or_else(|| E::custom(format!("unknown opacity {v:?}")))
+            }
+        }
+        deserializer.deserialize_any(Amount)
+    }
+}
+
+/// What to ask `yt-dlp` for.
+///
+/// YouTube Music's ceiling without the official player is Opus ~160k (itag 251); the lower
+/// settings are for metered connections and genuinely fetch a smaller stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quality {
+    #[default]
+    High,
+    Medium,
+    Low,
+}
+
+impl Quality {
+    pub const ALL: [Quality; 3] = [Quality::High, Quality::Medium, Quality::Low];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::High => "High",
+            Quality::Medium => "Medium",
+            Quality::Low => "Low",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Quality::High => "Opus ~160 kbps, the best available without the official player",
+            Quality::Medium => "up to 128 kbps",
+            Quality::Low => "the smallest usable stream, for metered connections",
+        }
+    }
+
+    /// The `yt-dlp` format selector. Each falls back to *some* audio rather than failing.
+    pub fn format(self) -> &'static str {
+        match self {
+            Quality::High => "bestaudio[acodec=opus]/bestaudio",
+            Quality::Medium => "bestaudio[abr<=128]/bestaudio",
+            Quality::Low => "worstaudio[abr>=48]/worstaudio/bestaudio",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub theme: Theme,
+    /// Which colour family to paint. The polarity still comes from `theme`.
+    pub scheme: Scheme,
+    /// The family's flavour as last chosen in Settings — its label, e.g. "Macchiato". `None`
+    /// paints the family's own default for the polarity on screen. A stored flavour that does
+    /// not match the current family or polarity simply does not resolve, and the default
+    /// paints — which is what makes the choice survive Light → Dark → Light.
+    pub scheme_variant: Option<String>,
+    /// How much shows through the shell.
+    pub opacity: Opacity,
+    /// Ask the compositor to blur what shows through, where it offers it.
+    pub blur: bool,
+    /// Tint an album/playlist header with a colour pulled from its own cover art, instead of
+    /// the scheme's fixed accent. Off falls back to the accent everywhere, unconditionally.
+    pub adaptive_art_color: bool,
+    /// What the resolver asks for.
+    pub quality: Quality,
+    /// Keep playing related songs when a hand-picked queue nears its end. YouTube's own radio,
+    /// fetched for the queue's last track. On by default, as on the site.
+    pub autoplay: bool,
+    /// Apply YouTube's own loudness measurement so tracks do not jump in level.
+    pub normalise_volume: bool,
+    /// Report plays to the signed-in account's watch history. Anonymous listening never
+    /// reports — there is no account to count on — so this only matters while signed in.
+    pub scrobble: bool,
+    /// The brand account to browse as, when the signed-in Google account has more than one.
+    /// `None` is the personal channel.
+    pub account_page_id: Option<String>,
+    /// The rail's playlist order, by id, as the user dragged it. Ids YouTube no longer returns
+    /// are ignored; new ones keep YouTube's order after the ones that are named.
+    pub playlist_order: Vec<String>,
+    /// Launch on login, via an XDG autostart entry (Linux only — no autostart mechanism is
+    /// wired up for any other target today).
+    pub start_on_boot: bool,
+    /// Closing the window hides it to a tray icon instead of quitting. Off by default: a tray
+    /// icon that appears the first time someone closes the window, with no prior warning that
+    /// closing no longer quits, would look like the close button broke.
+    pub hide_tray_on_close: bool,
+    /// Folders scanned for local audio files, shown in the Library's Local tab. Absolute paths,
+    /// same shape as `playlist_order`.
+    pub local_folders: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            scheme: Scheme::default(),
+            scheme_variant: None,
+            opacity: Opacity::default(),
+            blur: true,
+            adaptive_art_color: true,
+            quality: Quality::default(),
+            autoplay: true,
+            normalise_volume: true,
+            scrobble: true,
+            account_page_id: None,
+            playlist_order: Vec::new(),
+            start_on_boot: false,
+            hide_tray_on_close: false,
+            local_folders: Vec::new(),
+        }
+    }
+}
+
+impl Settings {
+    /// The flavour to paint in, given the polarity: the stored choice when it resolves, the
+    /// family's own default otherwise.
+    pub fn variant(&self, dark: bool) -> &'static Variant {
+        self.scheme.resolve(dark, self.scheme_variant.as_deref())
+    }
+
+    /// The palette to paint with: the scheme's chosen flavour in the theme's polarity, at the
+    /// chosen opacity. The one place those four meet.
+    pub fn palette(&self, ctx: &egui::Context) -> Palette {
+        self.variant(self.theme.is_dark(ctx))
+            .palette()
+            .with_opacity(self.opacity)
+    }
+}
+
+fn path() -> Result<std::path::PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "refryt")
+        .context("could not find the config directory")?;
+    Ok(dirs.config_dir().join("settings.json"))
+}
+
+/// Load saved settings, falling back to the defaults for anything unreadable — a broken settings
+/// file should not stop the app starting.
+pub fn load() -> Settings {
+    let Ok(path) = path() else {
+        return Settings::default();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Settings::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "settings file could not be parsed; using defaults");
+        Settings::default()
+    })
+}
+
+pub fn save(settings: &Settings) -> Result<()> {
+    let path = path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(settings).context("could not encode the settings")?;
+    std::fs::write(&path, json).with_context(|| format!("could not write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A settings file from an older build, or a hand-edited one, must not stop the app.
+    #[test]
+    fn unknown_and_missing_fields_fall_back_to_defaults() {
+        let partial: Settings =
+            serde_json::from_str(r#"{"theme":"light","something_new":42}"#).unwrap();
+        assert_eq!(partial.theme, Theme::Light);
+        assert_eq!(partial.quality, Quality::High);
+        assert_eq!(
+            partial.scheme,
+            Scheme::Classic,
+            "no scheme named yet defaults to ours"
+        );
+        assert_eq!(
+            partial.opacity,
+            Opacity::OFF,
+            "opaque until asked otherwise"
+        );
+        assert!(
+            partial.blur,
+            "blur defaults on; it only ever does anything once opacity is too"
+        );
+        assert!(
+            partial.scrobble,
+            "an older settings file without the toggle must still scrobble"
+        );
+        assert!(
+            partial.autoplay,
+            "an older settings file without the toggle must still autoplay"
+        );
+    }
+
+    /// The literal shape of every file on disk before this milestone: a theme and the tint
+    /// toggle that no longer exists. It must still parse, and land on today's defaults for the
+    /// three fields it never mentioned — this is the actual migration every user's file takes.
+    #[test]
+    fn a_settings_file_from_before_schemes_still_loads() {
+        let migrated: Settings =
+            serde_json::from_str(r#"{"theme":"dark","tint_from_art":false}"#).unwrap();
+        assert_eq!(migrated.theme, Theme::Dark);
+        assert_eq!(migrated.scheme, Scheme::Classic);
+        assert_eq!(
+            migrated.scheme_variant, None,
+            "an older file has no flavour; the family's default paints"
+        );
+        assert_eq!(migrated.opacity, Opacity::OFF);
+
+        // The default family was called "ytm" before it was renamed; an old file must land on
+        // Classic, not fall back to the whole default struct.
+        let old_name: Settings = serde_json::from_str(r#"{"scheme":"ytm"}"#).unwrap();
+        assert_eq!(old_name.scheme, Scheme::Classic);
+    }
+
+    /// The slider is new, but a file written while the setting was four named levels must
+    /// repaint exactly as it did — and a hand-edited number must reach the slider.
+    #[test]
+    fn an_opacity_from_before_the_slider_keeps_its_exact_pair() {
+        let old: Settings = serde_json::from_str(r#"{"opacity":"medium"}"#).unwrap();
+        assert_eq!(old.opacity.gutter(), 0.74);
+        assert_eq!(old.opacity.card(), 0.86);
+
+        let number: Settings = serde_json::from_str(r#"{"opacity":0.5}"#).unwrap();
+        assert_eq!(number.opacity.sheer(), 0.5);
+        // An integer is a number too.
+        let zero: Settings = serde_json::from_str(r#"{"opacity":0}"#).unwrap();
+        assert_eq!(zero.opacity, Opacity::OFF);
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let s = Settings {
+            theme: Theme::Dark,
+            scheme: Scheme::Catppuccin,
+            scheme_variant: Some("Macchiato".into()),
+            opacity: Opacity::new(0.5),
+            blur: false,
+            quality: Quality::Low,
+            account_page_id: Some("page-1".into()),
+            ..Settings::default()
+        };
+        let back: Settings = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        assert_eq!(s, back);
+    }
+
+    /// A stored flavour resolves within its polarity, falls back when the polarity does not
+    /// offer it, and — the whole point — comes back when the polarity does.
+    #[test]
+    fn a_stored_flavour_survives_a_polarity_round_trip() {
+        let mut s = Settings {
+            scheme: Scheme::Catppuccin,
+            scheme_variant: Some("Macchiato".into()),
+            ..Settings::default()
+        };
+        assert_eq!(s.variant(true).label, "Macchiato");
+        // Light has one Catppuccin flavour, and Macchiato is not it.
+        assert_eq!(s.variant(false).label, "Latte");
+        assert_eq!(
+            s.scheme_variant,
+            Some("Macchiato".into()),
+            "the fallback must not overwrite the stored choice"
+        );
+        // And a flavour of another family is simply not offered here.
+        s.scheme = Scheme::Nord;
+        assert_eq!(s.variant(true).label, "Polar Night");
+    }
+
+    /// Every quality must ask for something, and they must differ — a setting that changes no
+    /// request is a lie.
+    #[test]
+    fn each_quality_selects_a_different_format() {
+        let formats: std::collections::HashSet<&str> =
+            Quality::ALL.iter().map(|q| q.format()).collect();
+        assert_eq!(formats.len(), 3);
+        assert!(Quality::ALL.iter().all(|q| !q.format().is_empty()));
+    }
+
+    /// `Off` is not "a little bit less opaque" — it must be exactly opaque, so the default
+    /// build paints exactly what it painted before opacity existed.
+    #[test]
+    fn opacity_off_is_fully_opaque() {
+        assert_eq!(Opacity::OFF.gutter(), 1.0);
+        assert_eq!(Opacity::OFF.card(), 1.0);
+    }
+
+    /// Every step of the slider lets through at least as much as the last, and a card is never
+    /// *less* opaque than the gutter beneath it — the arithmetic in `Palette::with_opacity`
+    /// divides by `1 - gutter` and would go negative if it ever were.
+    #[test]
+    fn the_opacity_curve_is_ordered() {
+        let mut last_gutter = 2.0;
+        let mut last_card = 2.0;
+        for i in 0..=100 {
+            let o = Opacity::new(i as f32 / 100.0);
+            assert!(o.gutter() <= last_gutter, "{o:?} gutter rose");
+            assert!(o.card() <= last_card, "{o:?} card rose");
+            assert!(
+                o.gutter() <= o.card(),
+                "{o:?}: the gutter must read as behind the card"
+            );
+            last_gutter = o.gutter();
+            last_card = o.card();
+        }
+    }
+
+    /// `--scheme` accepts the label in whatever shape someone types it.
+    #[test]
+    fn scheme_parses_loosely() {
+        assert_eq!(Scheme::parse("tokyo-night"), Some(Scheme::TokyoNight));
+        assert_eq!(Scheme::parse("Tokyo Night"), Some(Scheme::TokyoNight));
+        assert_eq!(Scheme::parse("rose pine"), Some(Scheme::RosePine));
+        assert_eq!(Scheme::parse("CATPPUCCIN"), Some(Scheme::Catppuccin));
+        assert_eq!(Scheme::parse("not a scheme"), None);
+    }
+
+    /// `--scheme catppuccin-macchiato` reaches both the family and the flavour, by the same
+    /// loose rules, in whatever shape someone types it — and a flavour that matches nothing
+    /// fails rather than silently falling back to the family default.
+    #[test]
+    fn scheme_parses_with_a_flavour() {
+        let (family, flavour) = Scheme::parse_with_flavour("catppuccin-macchiato").unwrap();
+        assert_eq!(family, Scheme::Catppuccin);
+        assert_eq!(flavour.as_deref(), Some("Macchiato"));
+        let (family, flavour) = Scheme::parse_with_flavour("catppuccin frappé").unwrap();
+        assert_eq!(family, Scheme::Catppuccin);
+        assert_eq!(flavour.as_deref(), Some("Frappé"));
+        assert_eq!(
+            Scheme::parse_with_flavour("tokyo night storm")
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("Storm")
+        );
+        // A family alone carries no flavour...
+        assert_eq!(
+            Scheme::parse_with_flavour("dracula"),
+            Some((Scheme::Dracula, None))
+        );
+        // ...and nonsense stays nonsense.
+        assert_eq!(Scheme::parse_with_flavour("nord-frobnicate"), None);
+        assert_eq!(Scheme::parse_with_flavour("not a scheme"), None);
+    }
+
+    #[test]
+    fn opacity_parses_number_or_name_case_insensitively() {
+        assert_eq!(Opacity::parse("strong"), Some(Opacity::new(1.0)));
+        assert_eq!(Opacity::parse("STRONG"), Some(Opacity::new(1.0)));
+        assert_eq!(Opacity::parse("off"), Some(Opacity::OFF));
+        assert_eq!(Opacity::parse("0.4"), Some(Opacity::new(0.4)));
+        assert_eq!(Opacity::parse("nonsense"), None);
+    }
+}

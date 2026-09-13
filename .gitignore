@@ -1,0 +1,21 @@
+# Build output and packaging artifacts.
+/target/
+/dist/
+/.windows-tools/
+/.appimage-tools/
+
+# Claude Code's own local session/permission settings — machine-specific, never shared.
+/.claude/
+
+# Internal planning notes: working history for this project's own development, not
+# documentation for anyone building or using it. See docs/ for what actually ships.
+/PLAN.md
+/M*-plan.md
+
+# Nothing in this repo holds real session cookies or API keys — the app keeps those in
+# ~/.config/refryt/ on whatever machine runs it, never in the source tree — but this stays
+# as a guard in case a local diagnostic dump (REFRYT_DUMP_*) or test cookie jar ever lands
+# here by accident.
+*.session
+*cookie*.txt
+.env
