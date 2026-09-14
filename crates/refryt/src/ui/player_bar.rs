@@ -176,6 +176,8 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
                     None,
                     "np-subtitle",
                     false,
+                    theme::regular(12.0),
+                    p.secondary,
                 ) {
                     navigate = Some(crate::ui::link_route(link));
                 }
@@ -306,7 +308,7 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
     // `vui` packs right-to-left, so whatever is added first ends up closest to the window's
-    // edge: the volume slider goes first to sit rightmost, with Lyrics and Queue to its left.
+    // edge: the volume slider goes first to sit rightmost, with Queue and Lyrics to its left.
     vui.add_space(14.0);
     let volume = app.player.as_ref().map(|pl| pl.volume()).unwrap_or(0.0);
     if let Some(v) = widgets::volume_slider(&mut vui, &p, volume, app.last_volume)
@@ -318,12 +320,12 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         pl.set_volume(v);
     }
     vui.add_space(8.0);
-    if widgets::icon_button(&mut vui, &p, Icon::MicVocal, 16.0, app.lyrics_open).clicked() {
-        app.toggle_lyrics();
-    }
-    vui.add_space(8.0);
     if widgets::icon_button(&mut vui, &p, Icon::ListMusic, 16.0, app.upnext_open).clicked() {
         app.upnext_open = !app.upnext_open;
+    }
+    vui.add_space(8.0);
+    if widgets::icon_button(&mut vui, &p, Icon::MicVocal, 16.0, app.lyrics_open).clicked() {
+        app.toggle_lyrics();
     }
 
     // The now-playing song's menu, last: painting is done, and the choices route through the

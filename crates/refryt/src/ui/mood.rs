@@ -59,6 +59,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
                     &pl.author,
                     widgets::ArtShape::Square,
                     None,
+                    false,
                 )
                 .response
                 .clicked()

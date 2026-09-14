@@ -17,7 +17,8 @@ use crate::api::Api;
 use crate::auth::{self, AuthState};
 use crate::images;
 use crate::model::{
-    Album, Artist, Entry, Library, MoodPlaylists, Playlist, SearchResults, Shelf, Track,
+    Album, Artist, Entry, Library, MoodPlaylists, Playlist, SearchResults, SearchScope, Shelf,
+    Track,
 };
 use crate::player;
 
@@ -89,6 +90,15 @@ pub enum Event {
     PlaylistMoreFailed {
         id: String,
         error: String,
+    },
+    /// An album/playlist card's own play button was pressed — its tracks, fetched just to
+    /// start playing them, not to open the page. Deliberately its own event rather than
+    /// reusing `AlbumLoaded`/`PlaylistLoaded`: those are guarded by `album_is_for`/
+    /// `playlist_is_for` so a fetch for a card you never navigated to is silently discarded,
+    /// which is exactly wrong here.
+    CardTracksReady {
+        id: String,
+        tracks: Vec<Track>,
     },
     LibraryLoaded {
         library: Library,
@@ -399,6 +409,32 @@ async fn lrclib(http: &reqwest::Client, track: &Track) -> Option<crate::model::L
     })
 }
 
+/// A single/album track's `wide: true` id points at a music-video upload, with no separate
+/// audio-only id anywhere in the album metadata itself — the typed and raw album parsers both
+/// read exactly one id per row (see `map_album`/`track_states`), so the only way to find the
+/// audio version, when one exists, is to search for it. Match confidence is deliberately loose
+/// (trimmed, case-insensitive whole-string compare) since remasters/features/parenthetical tags
+/// can differ between the two uploads; a search failure or no close-enough match just means the
+/// caller falls back to the original id, never blocks or delays playback.
+async fn audio_alternative(api: &Api, track: &Track) -> Option<String> {
+    let artist = track.artist_line();
+    let query = format!("{} {}", track.title, artist);
+    let results = api
+        .search_scoped(&query, SearchScope::Songs)
+        .await
+        .inspect_err(|e| warn!(error = %format!("{e:#}"), "audio-alternative search failed"))
+        .ok()?;
+    results.into_iter().find_map(|entry| match entry {
+        Entry::Song(t)
+            if t.title.trim().eq_ignore_ascii_case(track.title.trim())
+                && t.artist_line().trim().eq_ignore_ascii_case(artist.trim()) =>
+        {
+            Some(t.video_id)
+        }
+        _ => None,
+    })
+}
+
 /// Split plain text into lines, trimming the ends.
 fn plain_lines(text: &str) -> Vec<crate::model::LyricLine> {
     text.lines()
@@ -471,7 +507,11 @@ pub(crate) fn yt_dlp_program() -> String {
     if let Ok(appdir) = std::env::var("APPDIR") {
         return format!("{appdir}/usr/bin/yt-dlp");
     }
-    let exe_name = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
+    let exe_name = if cfg!(windows) {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    };
     let bundled = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(exe_name)));
@@ -625,6 +665,48 @@ impl Backend {
                 },
             };
             Self::emit(&tx, &ctx, event);
+        });
+    }
+
+    /// An album card's own play button: start playing it without opening its page. Whatever
+    /// the first page of tracks turns out to be is what plays — the same as the album/playlist
+    /// page's own Play button, which never waits for pagination either.
+    pub fn play_album(&self, id: String) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            match api.get_album(&id).await {
+                Ok(album) => Self::emit(
+                    &tx,
+                    &ctx,
+                    Event::CardTracksReady {
+                        id,
+                        tracks: album.tracks,
+                    },
+                ),
+                Err(e) => {
+                    tracing::warn!(%id, error = %format!("{e:#}"), "could not load album to play it")
+                }
+            }
+        });
+    }
+
+    /// [`Self::play_album`], for a playlist card.
+    pub fn play_playlist(&self, id: String) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            match api.playlist(&id).await {
+                Ok(playlist) => Self::emit(
+                    &tx,
+                    &ctx,
+                    Event::CardTracksReady {
+                        id,
+                        tracks: playlist.tracks.items,
+                    },
+                ),
+                Err(e) => {
+                    tracing::warn!(%id, error = %format!("{e:#}"), "could not load playlist to play it")
+                }
+            }
         });
     }
 
@@ -1307,8 +1389,9 @@ impl Backend {
     }
 
     pub fn play(&self, track: Track, mpv: Arc<Mpv>, volume: f64, normalise: bool) {
-        let (resolver, tx, ctx) = (
+        let (resolver, api, tx, ctx) = (
             Arc::clone(&self.resolver),
+            Arc::clone(&self.api),
             self.tx.clone(),
             self.ctx.clone(),
         );
@@ -1337,7 +1420,21 @@ impl Backend {
                 Self::emit(&tx, &ctx, event);
                 return;
             }
-            let id = match VideoId::new(track.video_id.clone()) {
+            // A single/album track can hand back a music-video id with no audio-only
+            // alternative at all — that's just what YouTube's own album metadata carries for
+            // it, and there's nothing to substitute. But when an audio match does exist, it's
+            // what you actually meant by pressing play on an album track, so look for one and
+            // resolve/scrobble it instead. `track` itself (row, title, thumbnail, album link)
+            // stays exactly the album track throughout; only the id handed to the resolver
+            // changes.
+            let resolve_id = if track.wide {
+                audio_alternative(&api, &track)
+                    .await
+                    .unwrap_or_else(|| track.video_id.clone())
+            } else {
+                track.video_id.clone()
+            };
+            let id = match VideoId::new(resolve_id) {
                 Ok(id) => id,
                 Err(e) => {
                     Self::emit(

@@ -289,7 +289,11 @@ pub fn paint_art(
 ///
 /// `corner` puts it at the bottom-right of a grid card, the way a shelf does; otherwise it is
 /// centred, which is what a small row cover wants.
-pub fn play_overlay(ui: &Ui, palette: &Palette, art: Rect, t: f32, corner: bool) {
+///
+/// `playing` is this row/card's own track, actually playing right now (not paused) — paints
+/// Pause rather than Play, the same convention the player bar's own big button follows, so
+/// hovering the track that's already going shows you can press it to pause, not restart it.
+pub fn play_overlay(ui: &Ui, palette: &Palette, art: Rect, t: f32, corner: bool, playing: bool) {
     if t <= 0.01 {
         return;
     }
@@ -310,11 +314,18 @@ pub fn play_overlay(ui: &Ui, palette: &Palette, art: Rect, t: f32, corner: bool)
     ui.painter()
         .circle_filled(centre, d / 2.0, palette.accent.gamma_multiply(t));
     let glyph = d * 0.44;
-    Icon::PlayFilled
-        .image(palette.on_accent.gamma_multiply(t), glyph)
+    let icon = if playing {
+        Icon::PauseFilled
+    } else {
+        Icon::PlayFilled
+    };
+    // The play triangle's visual centre sits left of its bounding box, so nudge it right; Pause
+    // is symmetric and needs none.
+    let offset = if playing { 0.0 } else { glyph * 0.06 };
+    icon.image(palette.on_accent.gamma_multiply(t), glyph)
         .paint_at(
             ui,
-            Rect::from_center_size(centre + vec2(glyph * 0.06, 0.0), vec2(glyph, glyph)),
+            Rect::from_center_size(centre + vec2(offset, 0.0), vec2(glyph, glyph)),
         );
 }
 
@@ -438,11 +449,19 @@ pub struct TrackRow<'a> {
     /// Which way the rank moved. Unknown paints nothing.
     pub trend: crate::model::ChartTrend,
     pub title: &'a str,
+    /// The album/single this track belongs to, when known — lets the title itself carry the
+    /// same kind of link the artist credit below it already can. `None` just leaves the title
+    /// plain, exactly as it always was.
+    pub album_id: Option<&'a str>,
     pub subtitle: Subtitle<'a>,
     pub duration: Option<u64>,
     pub plays: Option<&'a str>,
     pub explicit: bool,
     pub active: bool,
+    /// `active`, and actually playing right now rather than paused — the row's own hover play
+    /// button shows Pause instead of Play when this is set, so you can tell (and press) it to
+    /// pause the track that's already going instead of restarting it.
+    pub playing: bool,
     /// A small right-aligned type label ("ARTIST", "ALBUM"), for mixed lists where the rows are
     /// not all songs. Shown in place of the duration, which those rows do not have.
     pub badge: Option<&'a str>,
@@ -475,8 +494,9 @@ pub fn paint_subtitle<'a>(
     subtitle: &Subtitle<'a>,
     tail: Option<&'a str>,
     id_salt: impl std::hash::Hash + Clone + std::fmt::Debug,
+    font: egui::FontId,
+    base_colour: Color32,
 ) -> Option<LinkTarget<'a>> {
-    let font = theme::regular(12.0);
     let mut x = pos.x;
     let mut clicked = None;
 
@@ -514,7 +534,7 @@ pub fn paint_subtitle<'a>(
         }
         let w = text_width(ui, &shown, &font);
 
-        let mut colour = palette.secondary;
+        let mut colour = base_colour;
         if let Some(target) = part.target {
             let hit = Rect::from_min_size(egui::pos2(x, pos.y - 8.0), vec2(w, 16.0));
             let r = ui.interact(hit, ui.id().with((id_salt.clone(), i)), Sense::click());
@@ -767,8 +787,9 @@ pub fn paint_subtitle_marquee<'a>(
     id_salt: impl std::hash::Hash + Clone + std::fmt::Debug,
     // See `marquee_line`'s own doc on this parameter.
     row_hovered: bool,
+    font: egui::FontId,
+    base_colour: Color32,
 ) -> Option<LinkTarget<'a>> {
-    let font = theme::regular(12.0);
     let visible_parts = || {
         subtitle
             .iter()
@@ -787,7 +808,17 @@ pub fn paint_subtitle_marquee<'a>(
         full += text_width(ui, part.text, &font);
     }
     if full <= max_width {
-        return paint_subtitle(ui, palette, pos, pos.x + max_width, subtitle, tail, id_salt);
+        return paint_subtitle(
+            ui,
+            palette,
+            pos,
+            pos.x + max_width,
+            subtitle,
+            tail,
+            id_salt,
+            font,
+            base_colour,
+        );
     }
 
     let parts: Vec<Part> = visible_parts().collect();
@@ -853,7 +884,7 @@ pub fn paint_subtitle_marquee<'a>(
             x += text_width(ui, part.sep, &font);
         }
         let w = text_width(ui, part.text, &font);
-        let mut colour = palette.secondary;
+        let mut colour = base_colour;
         if let Some(target) = part.target {
             let hit = Rect::from_min_size(egui::pos2(x, pos.y - 8.0), vec2(w, 16.0));
             let r = ui.interact(hit, ui.id().with((id, i)), Sense::click());
@@ -1261,11 +1292,13 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         rank,
         trend,
         title,
+        album_id,
         subtitle,
         duration,
         plays,
         explicit,
         active,
+        playing,
         badge,
         art,
         shape,
@@ -1350,7 +1383,7 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         paint_art(ui, palette, art_rect, art, shape);
         // A cover you can press is a control; one you cannot is a picture.
         if shape == ArtShape::Square {
-            play_overlay(ui, palette, art_rect, t, false);
+            play_overlay(ui, palette, art_rect, t, false, playing);
         }
 
         if !narrow && let Some(rank) = rank {
@@ -1439,18 +1472,29 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         } else {
             Some(palette.row_fill())
         };
-        let _ = marquee_line(
+        // A one-part "subtitle" so the title can carry the same album link the artist credit
+        // below it already can, through the exact machinery that lets that link coexist with
+        // clicking elsewhere on the row to play it (`ListClick::Link` vs `ListClick::Row`).
+        let mut title_parts = no_subtitle();
+        title_parts[0] = Some(match album_id {
+            Some(id) => Part::link(title, LinkTarget::Album(id)),
+            None => Part::plain(title),
+        });
+        if let Some(target) = paint_subtitle_marquee(
             ui,
+            palette,
             egui::pos2(title_x, rect.center().y - 9.0),
             text_w,
-            title,
+            marquee_bg,
+            &title_parts,
+            None,
+            ("ytm-row-title", id_salt),
+            over,
             theme::medium(13.0),
             title_color,
-            marquee_bg,
-            ("ytm-row-title", id_salt),
-            Sense::hover(),
-            over,
-        );
+        ) {
+            link = Some(target);
+        }
         // Subtitle pieces, laid out left to right so each linked piece gets its own hit area.
         // The play-count tail rides the same line and scrolls with it.
         let sub_right = rect.right() - right_pad - duration_w - thumb_w;
@@ -1465,6 +1509,8 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
             plays,
             ("ytm-row-link", id_salt),
             over,
+            theme::regular(12.0),
+            palette.secondary,
         ) {
             link = Some(target);
         }
@@ -1574,16 +1620,16 @@ pub(crate) fn row_menu(
 
             // Block one: what to do with it now. No title header — you know which row you
             // right-clicked, and a truncated one only ate a row's worth of height.
+            if menu_item(mui, palette, Icon::Radio, "Start mix", None).clicked() {
+                choice = Some(RowAction::StartMix(t.video_id.clone()));
+                mui.close();
+            }
             if menu_item(mui, palette, Icon::ListStart, "Play next", None).clicked() {
                 choice = Some(RowAction::PlayNext(t.clone()));
                 mui.close();
             }
             if menu_item(mui, palette, Icon::ListPlus, "Add to queue", None).clicked() {
                 choice = Some(RowAction::AddToQueue(t.clone()));
-                mui.close();
-            }
-            if menu_item(mui, palette, Icon::Radio, "Start mix", None).clicked() {
-                choice = Some(RowAction::StartMix(t.video_id.clone()));
                 mui.close();
             }
             if let Some(i) = menu.queue_index
@@ -2056,13 +2102,21 @@ pub fn art_card(
     subtitle: &str,
     shape: ArtShape,
     menu: Option<CardMenu<'_>>,
+    // The caller's own to compute (it has the entry `art_card` itself is never given) — see
+    // `crate::ui::grid_card`'s own doc comment for how much of this it can actually tell today.
+    playing: bool,
 ) -> CardClick {
     let size = card_size(width, shape);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let mut play = false;
 
     if ui.is_rect_visible(rect) {
         let radius = CornerRadius::same(theme::RADIUS);
-        let t = lit(ui, &response);
+        // Geometric, not `hovered()`: the play button's own hit region sits stacked on top of
+        // this card and would steal the hover flag the instant the pointer reached it, fading
+        // the whole card — button included — out from directly under the pointer. See `fade`'s
+        // own doc comment; this is exactly the case it warns about.
+        let t = fade(ui, response.id.with("lit"), response.contains_pointer());
         if t > 0.001 {
             // Lifts: a fill plus a shadow underneath, both fading with the hover.
             ui.painter().add(egui::epaint::RectShape::filled(
@@ -2078,9 +2132,23 @@ pub fn art_card(
         paint_art(ui, palette, art, texture, shape);
         // Circles are people — an artist has no single thing to play, so no play button.
         if shape != ArtShape::Circle {
-            play_overlay(ui, palette, art, t, true);
+            play_overlay(ui, palette, art, t, true, playing);
+            // A separate hit region over just the button, sized at its full (settled) diameter
+            // regardless of the fade's current progress — a click only ever lands once it is
+            // basically visible anyway, and a fixed target beats one that moves under the
+            // pointer mid-animation. Independent of `response`'s own click below: the caller
+            // checks this first and treats it as authoritative, the same way a row's title link
+            // wins over the row's own click, so clicking the button plays instead of opening
+            // the page while clicking anywhere else on the card still does.
+            if t > 0.01 {
+                let centre = art.right_bottom() - vec2(25.0, 25.0);
+                let hit = Rect::from_center_size(centre, vec2(34.0, 34.0));
+                play = ui
+                    .interact(hit, response.id.with("play"), Sense::click())
+                    .clicked();
+            }
         }
-        if response.hovered() {
+        if response.contains_pointer() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
@@ -2103,7 +2171,11 @@ pub fn art_card(
     // Outside the visibility check, as the row menu is: a menu opened at the pointer must
     // survive its card scrolling out from under it.
     let action = menu.and_then(|m| card_menu(ui, palette, &response, m));
-    CardClick { response, action }
+    CardClick {
+        response,
+        play,
+        action,
+    }
 }
 
 /// A folder card for the Local tab's file-explorer-style browser — always a plain folder
@@ -2171,12 +2243,20 @@ pub fn folder_card(
         );
     }
     let action = page_menu(ui, palette, &response, menu);
-    CardClick { response, action }
+    CardClick {
+        response,
+        play: false,
+        action,
+    }
 }
 
 /// What a card reports: the click, and any menu choice.
 pub struct CardClick {
     pub response: egui::Response,
+    /// The corner play button specifically, when the card has one — wins over `response`, the
+    /// same way a row's title link wins over its own click: a caller that sees this set should
+    /// act on it and skip treating `response.clicked()` as an ordinary card click.
+    pub play: bool,
     pub(crate) action: Option<super::ui::RowAction>,
 }
 

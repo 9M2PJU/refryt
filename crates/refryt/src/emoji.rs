@@ -211,6 +211,9 @@ struct Cache(Arc<Mutex<Inner>>);
 struct Inner {
     /// `None` until looked for, then the mapped font or `None` if there is not one.
     font: Option<Option<Arc<memmap2::Mmap>>>,
+    /// Set the moment a background lookup starts, so a second caller on the same frame (or the
+    /// next one, before it lands) does not spawn a second one.
+    font_loading: bool,
     glyphs: HashMap<char, Option<egui::TextureHandle>>,
 }
 
@@ -227,12 +230,30 @@ fn texture(ctx: &egui::Context, ch: char) -> Option<egui::TextureHandle> {
     let font = match &inner.font {
         Some(font) => font.clone(),
         None => {
-            let found = load_font();
-            if found.is_none() {
-                tracing::info!("no colour emoji font found; emoji will be monochrome");
+            // `load_font` can fall through to shelling out to `fc-match` as a last resort — a
+            // slow or stuck fontconfig (a stale cache it decides to rebuild, disk contention,
+            // anything) must never be able to freeze the whole window with no way to recover,
+            // which is exactly what calling it inline here used to risk. Looked up once, off
+            // this thread; every frame before it lands just draws the monochrome glyph, same as
+            // when there turns out to be no colour font at all.
+            if !inner.font_loading {
+                inner.font_loading = true;
+                let cache = cache.clone();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let found = load_font();
+                    if found.is_none() {
+                        tracing::info!("no colour emoji font found; emoji will be monochrome");
+                    }
+                    if let Ok(mut inner) = cache.0.lock() {
+                        inner.font = Some(found);
+                    }
+                    ctx.request_repaint();
+                });
             }
-            inner.font = Some(found.clone());
-            found
+            // Not cached below: once the background lookup lands, the next frame tries again
+            // for real instead of being stuck with whatever this one frame's guess was.
+            return None;
         }
     };
 

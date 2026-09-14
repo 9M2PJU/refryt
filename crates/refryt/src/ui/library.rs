@@ -271,6 +271,7 @@ fn artist_grid(app: &mut App, ui: &mut egui::Ui) {
                 // Round here too, so an artist looks the same wherever it appears.
                 widgets::ArtShape::Circle,
                 None,
+                false,
             )
             .response
             .clicked()
@@ -317,6 +318,12 @@ fn album_grid(app: &mut App, ui: &mut egui::Ui) {
                 sub.push_str(" • ");
                 sub.push_str(y);
             }
+            let playing = app
+                .now
+                .track
+                .as_ref()
+                .is_some_and(|t| t.album_id.as_deref() == Some(al.id.as_str()))
+                && !app.now.paused;
             if widgets::art_card(
                 ui,
                 &app.palette,
@@ -326,6 +333,7 @@ fn album_grid(app: &mut App, ui: &mut egui::Ui) {
                 &sub,
                 widgets::ArtShape::Square,
                 None,
+                playing,
             )
             .response
             .clicked()
@@ -379,6 +387,7 @@ fn playlist_grid(app: &mut App, ui: &mut egui::Ui) {
                 "",
                 widgets::ArtShape::Square,
                 None,
+                false,
             )
             .response
             .clicked()

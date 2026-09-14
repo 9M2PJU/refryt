@@ -56,11 +56,13 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                         rank: t.rank.as_deref(),
                         trend: t.trend,
                         title: &t.title,
+                        album_id: t.album_id.as_deref(),
                         subtitle,
                         duration: t.duration,
                         plays: t.plays.as_deref(),
                         explicit: t.explicit,
                         active: is_active(now, &t.video_id),
+                        playing: is_active(now, &t.video_id) && !now.paused,
                         badge: None,
                         shape: if t.wide {
                             ArtShape::Wide
@@ -99,9 +101,14 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
             None => return,
         };
         // Jumping sets `current`; the `Playing` event's `prefetch_next` follows, same as
-        // every other way of moving through the queue.
+        // every other way of moving through the queue. Clicking the row already playing just
+        // pauses/resumes it (see `play_index`) — nothing new to show, so the scroll position
+        // is left alone rather than jumping to the top under you.
+        let already_here = app.current == Some(i);
         app.play_index(i);
-        app.queue_scroll_reset = true;
+        if !already_here {
+            app.queue_scroll_reset = true;
+        }
     });
 }
 
@@ -126,36 +133,57 @@ fn now_playing(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
     section(app, ui, 0.0, "Now playing");
-    let App {
-        palette,
-        images,
-        backend,
-        stats,
-        now,
-        ..
-    } = app;
-    let subtitle = track_subtitle_no_album(&track);
-    spec_rows(ui, palette, images, backend, stats, 1, |_| RowSpec {
-        number: None,
-        rank: track.rank.as_deref(),
-        trend: track.trend,
-        title: &track.title,
-        subtitle,
-        duration: track.duration,
-        plays: None,
-        explicit: track.explicit,
-        active: is_active(now, &track.video_id),
-        badge: None,
-        shape: if track.wide {
-            ArtShape::Wide
-        } else {
-            ArtShape::Square
-        },
-        thumbnail: track.thumbnail.as_ref(),
-        // No menu on the current track: everything it offers is already in the player bar,
-        // and a menu here would be the only row in the panel that could remove itself.
-        menu: None,
-        like: track.like,
-        show_rating: false,
-    });
+    // Namespaced under its own id: this row and "Next up"'s first row both start their own
+    // `spec_rows` call at index 0, so without this their title/artist links resolve to the
+    // exact same widget id (`ui.id()` is the same parent for both — they're sequential calls on
+    // the same `Ui`, not separately salted children) and neither one's link reliably works.
+    let clicked = ui
+        .push_id("now-playing", |ui| {
+            let App {
+                palette,
+                images,
+                backend,
+                stats,
+                now,
+                ..
+            } = app;
+            let subtitle = track_subtitle_no_album(&track);
+            spec_rows(ui, palette, images, backend, stats, 1, |_| RowSpec {
+                number: None,
+                rank: track.rank.as_deref(),
+                trend: track.trend,
+                title: &track.title,
+                album_id: track.album_id.as_deref(),
+                subtitle,
+                duration: track.duration,
+                plays: None,
+                explicit: track.explicit,
+                active: is_active(now, &track.video_id),
+                playing: is_active(now, &track.video_id) && !now.paused,
+                badge: None,
+                shape: if track.wide {
+                    ArtShape::Wide
+                } else {
+                    ArtShape::Square
+                },
+                thumbnail: track.thumbnail.as_ref(),
+                // No menu on the current track: everything it offers is already in the player
+                // bar, and a menu here would be the only row in the panel that could remove
+                // itself.
+                menu: None,
+                like: track.like,
+                show_rating: false,
+            })
+        })
+        .inner;
+    if let Some(action) = clicked.action {
+        app.row_action(action);
+    }
+    match clicked.click {
+        Some(ListClick::Link(route)) => app.navigate(route),
+        // Elsewhere on the row: it's already what's playing, so a click means pause/resume,
+        // same as clicking it anywhere else it appears.
+        Some(ListClick::Row(_)) => app.toggle_playback(),
+        None => {}
+    }
 }

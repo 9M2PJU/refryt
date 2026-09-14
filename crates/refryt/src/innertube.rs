@@ -462,6 +462,10 @@ pub fn track_states(root: &Value) -> std::collections::HashMap<String, TrackStat
                         .filter(|s| !s.is_empty())
                     {
                         let toggle = library_toggle(row);
+                        let wide = matches!(
+                            row_target(row),
+                            Some(Target::Watch { kind, .. }) if kind != VIDEO_ATV
+                        );
                         out.entry(id.to_owned()).or_insert(TrackState {
                             like: like_status(row),
                             in_library: toggle.as_ref().map(|t| t.in_library).unwrap_or(false),
@@ -472,6 +476,7 @@ pub fn track_states(root: &Value) -> std::collections::HashMap<String, TrackStat
                                 .and_then(Value::as_str)
                                 .filter(|s| !s.is_empty())
                                 .map(Arc::from),
+                            wide,
                         });
                     }
                     return;
@@ -494,6 +499,10 @@ pub struct TrackState {
     pub library_add: Option<Arc<str>>,
     pub library_remove: Option<Arc<str>>,
     pub set_video_id: Option<Arc<str>>,
+    /// A music video rather than an album-audio track — see `Track::wide`'s own doc. The typed
+    /// album parser has no field for this at all (it reads only the play button's video id), so
+    /// this is the only place that ever learns it for an album/single track.
+    pub wide: bool,
 }
 
 /// Your rating, from the row menu's like button.
@@ -1768,12 +1777,7 @@ pub fn parse_artist(root: &Value) -> Option<Artist> {
         dont_recommend: None,
     };
 
-    let sections = root
-        .pointer(
-            "/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content\
-             /sectionListRenderer/contents",
-        )
-        .and_then(Value::as_array);
+    let sections = find_section_list(root);
 
     let mut top_songs = Vec::new();
     let mut top_songs_playlist = None;
@@ -2053,8 +2057,8 @@ fn parse_card(item: &Value) -> Option<Entry> {
                         .map(|f| vec![crate::model::ArtistLink::plain(*f)])
                         .unwrap_or_default(),
                 },
-                album: None,
-                album_id: None,
+                album: linked_album(&segs).map(|s| s.text.clone()),
+                album_id: linked_album(&segs).and_then(album_id_of),
                 duration: None,
                 plays: fields.get(1).map(|f| (*f).to_owned()),
                 explicit: false,
@@ -2638,6 +2642,41 @@ mod tests {
         assert!(!t.wide, "an ATV card should parse square");
     }
 
+    /// A card's subtitle can carry an album link the same way a search/artist-songs row's
+    /// byline does — `parse_card` used to hardcode `album_id: None` unconditionally, so a
+    /// track surfaced via a home/artist-page card shelf could never have a clickable title.
+    #[test]
+    fn a_card_with_an_album_link_keeps_its_album_id() {
+        let card = serde_json::json!({"musicTwoRowItemRenderer": {
+            "title": {"runs": [{"text": "Some Song"}]},
+            "subtitle": {"runs": [
+                {"text": "Some Artist"},
+                {"text": " • "},
+                {"text": "Some Album", "navigationEndpoint": {"browseEndpoint": {
+                    "browseId": "MPREb_album123",
+                    "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                        "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                    }}
+                }}}
+            ]},
+            "navigationEndpoint": {"watchEndpoint": {
+                "videoId": "vid3",
+                "watchEndpointMusicSupportedConfigs": {"watchEndpointMusicConfig": {
+                    "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+                }}
+            }},
+            "thumbnailRenderer": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [
+                {"url": "https://x/y=w60-h60"}
+            ]}}}
+        }});
+        let entry = parse_card(&card).expect("a song card parsed");
+        let Entry::Song(t) = entry else {
+            panic!("an ATV card should be a song, got {entry:?}");
+        };
+        assert_eq!(t.album.as_deref(), Some("Some Album"));
+        assert_eq!(t.album_id.as_deref(), Some("MPREb_album123"));
+    }
+
     /// A video's byline links its channel, not an artist page — and that id must survive the
     /// parse, or the channel is not clickable.
     #[test]
@@ -2707,6 +2746,45 @@ mod tests {
         );
         assert!(a.actions.shuffle.is_none() && a.actions.mix.is_none());
         assert!(a.top_songs.is_empty() && a.shelves.is_empty());
+    }
+
+    /// `parse_artist` used to hardcode a single-column section path, unlike every other feed
+    /// parser (home/explore/history/library), which tries several shapes via
+    /// `find_section_list`. A profile/channel response in the two-column shape used to parse
+    /// with an empty `top_songs` even though its header (name/photo) still came through.
+    #[test]
+    fn a_two_column_profile_still_finds_its_top_songs() {
+        let root = serde_json::json!({
+            "header": {"musicVisualHeaderRenderer": {
+                "title": {"runs": [{"text": "Some Channel"}]}
+            }},
+            "contents": {"twoColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {"content": {
+                "sectionListRenderer": {"contents": [{"musicShelfRenderer": {"contents": [
+                    {"musicResponsiveListItemRenderer": {
+                        "flexColumns": [
+                            {"musicResponsiveListItemFlexColumnRenderer": {
+                                "text": {"runs": [{"text": "Test Song"}]}
+                            }}
+                        ],
+                        "navigationEndpoint": {"watchEndpoint": {
+                            "videoId": "vid9",
+                            "watchEndpointMusicSupportedConfigs": {"watchEndpointMusicConfig": {
+                                "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+                            }}
+                        }}
+                    }}
+                ]}}]}
+            }}}]}}
+        });
+        let a = parse_artist(&root).expect("a two-column profile parsed");
+        assert_eq!(a.name, "Some Channel");
+        assert_eq!(
+            a.top_songs.len(),
+            1,
+            "the two-column shape's shelf never got read: {:?}",
+            a.top_songs
+        );
+        assert_eq!(a.top_songs[0].title, "Test Song");
     }
 
     /// Albums and singles are separate shelves, and the five that used to be discarded survive.

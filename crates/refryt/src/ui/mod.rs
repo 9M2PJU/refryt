@@ -168,11 +168,15 @@ pub(crate) struct RowSpec<'a> {
     /// Which way the rank moved. Unknown paints nothing.
     pub trend: crate::model::ChartTrend,
     pub title: &'a str,
+    /// See `widgets::TrackRow::album_id` — lets the title itself carry an album link.
+    pub album_id: Option<&'a str>,
     pub subtitle: widgets::Subtitle<'a>,
     pub duration: Option<u64>,
     pub plays: Option<&'a str>,
     pub explicit: bool,
     pub active: bool,
+    /// See `widgets::TrackRow::playing` — `active` and not paused.
+    pub playing: bool,
     pub badge: Option<&'a str>,
     pub shape: widgets::ArtShape,
     pub thumbnail: Option<&'a std::sync::Arc<str>>,
@@ -392,11 +396,13 @@ pub(crate) fn spec_rows<'d>(
                 rank: s.rank,
                 trend: s.trend,
                 title: s.title,
+                album_id: s.album_id,
                 subtitle: s.subtitle,
                 duration: s.duration,
                 plays: s.plays,
                 explicit: s.explicit,
                 active: s.active,
+                playing: s.playing,
                 badge: s.badge,
                 art,
                 shape: s.shape,
@@ -550,11 +556,18 @@ fn paint_grid_cell<'d>(
             rank: s.rank,
             trend: s.trend,
             title: s.title,
+            // Unlike a full-width row, a card is narrow enough that the title's link hit box
+            // (sized to the rendered text, not the column) can cover most of its clickable
+            // surface — turning "click the card to play it" into "click the card to go to its
+            // album" almost every time. Cards keep "Go to album" in their own right-click menu
+            // instead.
+            album_id: None,
             subtitle: s.subtitle,
             duration: s.duration,
             plays: s.plays,
             explicit: s.explicit,
             active: s.active,
+            playing: s.playing,
             badge: s.badge,
             art,
             shape: s.shape,
@@ -722,11 +735,13 @@ pub(crate) fn track_rows(
             rank: t.rank.as_deref(),
             trend: t.trend,
             title: &t.title,
+            album_id: t.album_id.as_deref(),
             subtitle: track_subtitle_inner(t, hide_album),
             duration: t.duration,
             plays: t.plays.as_deref(),
             explicit: t.explicit,
             active: is_active(now, &t.video_id),
+            playing: is_active(now, &t.video_id) && !now.paused,
             badge: None,
             // A video still is 16:9 and gets the wide slot; everything else is a square cover.
             shape: if t.wide {
@@ -783,11 +798,13 @@ pub(crate) fn track_shelf_rows(
                 rank: t.rank.as_deref(),
                 trend: t.trend,
                 title: &t.title,
+                album_id: t.album_id.as_deref(),
                 subtitle: track_subtitle_inner(t, false),
                 duration: t.duration,
                 plays: t.plays.as_deref(),
                 explicit: t.explicit,
                 active: is_active(now, &t.video_id),
+                playing: is_active(now, &t.video_id) && !now.paused,
                 badge: None,
                 shape: if t.wide {
                     widgets::ArtShape::Wide
@@ -850,11 +867,13 @@ pub(crate) fn track_shelf_pages(
                 rank: t.rank.as_deref(),
                 trend: t.trend,
                 title: &t.title,
+                album_id: t.album_id.as_deref(),
                 subtitle: track_subtitle_inner(t, false),
                 duration: t.duration,
                 plays: t.plays.as_deref(),
                 explicit: t.explicit,
                 active: is_active(now, &t.video_id),
+                playing: is_active(now, &t.video_id) && !now.paused,
                 badge: None,
                 shape: if t.wide {
                     widgets::ArtShape::Wide
@@ -881,30 +900,38 @@ pub(crate) fn track_shelf_pages(
 /// One renderer for search results, artist shelves and home shelves — they are all lists of
 /// [`Entry`], and three near-identical grid loops is how the artist page ended up losing five of
 /// its shelves in the first place.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn entry_grid(
     ui: &mut egui::Ui,
     palette: &theme::Palette,
     images: &mut Images,
     backend: &Backend,
+    now: &crate::player::NowPlaying,
     items: &[Entry],
     playlists: &[crate::model::PlaylistRef],
     signed_in: bool,
 ) -> GridOutcome {
     let mut clicked = None;
+    let mut played = None;
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
         for (i, item) in items.iter().enumerate() {
-            let card = grid_card(ui, palette, images, backend, item, playlists, signed_in);
+            let card = grid_card(
+                ui, palette, images, backend, now, item, playlists, signed_in,
+            );
             if action.is_none() {
                 action = card.action;
             }
-            if card.clicked {
+            if card.play {
+                played = Some(i);
+            } else if card.clicked {
                 clicked = Some(i);
             }
         }
     });
     GridOutcome {
         clicked,
+        played,
         action,
         more: false,
     }
@@ -912,11 +939,13 @@ pub(crate) fn entry_grid(
 
 /// One card in a grid or carousel: shape, art, menu and click, shared so the two layouts
 /// cannot drift apart.
+#[allow(clippy::too_many_arguments)]
 fn grid_card(
     ui: &mut egui::Ui,
     palette: &theme::Palette,
     images: &mut Images,
     backend: &Backend,
+    now: &crate::player::NowPlaying,
     item: &Entry,
     playlists: &[crate::model::PlaylistRef],
     signed_in: bool,
@@ -927,6 +956,36 @@ fn grid_card(
         Entry::Video(t) if t.wide => widgets::ArtShape::Wide,
         _ if item.is_artist() => widgets::ArtShape::Circle,
         _ => widgets::ArtShape::Square,
+    };
+    // A song/video card is active the same way a row is. An album has no id of its own on
+    // `now.track` — but every track already carries the album it belongs to, which is exactly
+    // the signal needed here. A playlist has no such per-track field (the same song can sit in
+    // many), so its own branch below reads `now.playlist_playing` instead.
+    let playing = match item {
+        Entry::Song(t) | Entry::Video(t) => {
+            now.track
+                .as_ref()
+                .is_some_and(|nt| nt.video_id == t.video_id)
+                && !now.paused
+        }
+        Entry::Album(a) => {
+            now.track
+                .as_ref()
+                .is_some_and(|nt| nt.album_id.as_deref() == Some(a.id.as_str()))
+                && !now.paused
+        }
+        // No per-track field names a playlist the way `album_id` names an album, so this
+        // reads the cache `NowPlaying::playlist_playing`'s own doc comment explains.
+        Entry::Playlist(p) => {
+            now.playlist_playing.as_ref().is_some_and(|(id, ids)| {
+                id == &p.id
+                    && now
+                        .track
+                        .as_ref()
+                        .is_some_and(|nt| ids.contains(&nt.video_id))
+            }) && !now.paused
+        }
+        _ => false,
     };
     // Grids are not virtualised — every card in the shelf runs this loop, on- or off-screen —
     // so skip the texture request *and* the `subtitle()` string build for the ones scrolled
@@ -977,9 +1036,11 @@ fn grid_card(
         &subtitle,
         shape,
         menu,
+        playing,
     );
     CardOutcome {
         clicked: hit.response.clicked(),
+        play: hit.play,
         action: hit.action,
     }
 }
@@ -987,12 +1048,17 @@ fn grid_card(
 /// What one card reports.
 struct CardOutcome {
     clicked: bool,
+    /// See `widgets::CardClick::play` — wins over `clicked`.
+    play: bool,
     action: Option<RowAction>,
 }
 
 /// What a card grid reports: the card that was clicked, and any menu choice.
 pub(crate) struct GridOutcome {
     pub clicked: Option<usize>,
+    /// The card whose corner play button specifically was clicked — wins over `clicked`, the
+    /// same way a row's title link wins over its own click.
+    pub played: Option<usize>,
     pub action: Option<RowAction>,
     /// The carousel's More pill was pressed. Grids have no More pill, so theirs is `false`.
     pub more: bool,
@@ -1016,6 +1082,7 @@ pub(crate) fn carousel(
     palette: &theme::Palette,
     images: &mut Images,
     backend: &Backend,
+    now: &crate::player::NowPlaying,
     title: &str,
     salt: impl std::hash::Hash + std::fmt::Debug + Copy,
     items: &[Entry],
@@ -1024,6 +1091,7 @@ pub(crate) fn carousel(
     more: Option<Route>,
 ) -> GridOutcome {
     let mut clicked = None;
+    let mut played = None;
     let mut action = None;
     let mut more_pressed = false;
 
@@ -1077,11 +1145,15 @@ pub(crate) fn carousel(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for (i, item) in items.iter().enumerate() {
-                let card = grid_card(ui, palette, images, backend, item, playlists, signed_in);
+                let card = grid_card(
+                    ui, palette, images, backend, now, item, playlists, signed_in,
+                );
                 if action.is_none() {
                     action = card.action;
                 }
-                if card.clicked {
+                if card.play {
+                    played = Some(i);
+                } else if card.clicked {
                     clicked = Some(i);
                 }
             }
@@ -1091,6 +1163,7 @@ pub(crate) fn carousel(
 
     GridOutcome {
         clicked,
+        played,
         action,
         more: more_pressed,
     }
@@ -1212,6 +1285,7 @@ pub(crate) fn shelf(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf)
             palette,
             images,
             backend,
+            now,
             library,
             ..
         } = app;
@@ -1220,6 +1294,7 @@ pub(crate) fn shelf(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf)
             palette,
             images,
             backend,
+            now,
             &shelf.items,
             &library.playlists.items,
             signed_in,
@@ -1262,6 +1337,7 @@ pub(crate) fn shelf_carousel(
             palette,
             images,
             backend,
+            now,
             library,
             ..
         } = app;
@@ -1270,6 +1346,7 @@ pub(crate) fn shelf_carousel(
             palette,
             images,
             backend,
+            now,
             &shelf.title,
             // Hashed into the carousel's scroll-offset id — a tuple hashes without the
             // per-shelf-per-frame `format!` a joined string needed.
@@ -1387,6 +1464,7 @@ fn draw_shelf_grid(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) 
             palette,
             images,
             backend,
+            now,
             library,
             ..
         } = app;
@@ -1395,6 +1473,7 @@ fn draw_shelf_grid(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) 
             palette,
             images,
             backend,
+            now,
             &shelf.items,
             &library.playlists.items,
             signed_in,
@@ -1716,6 +1795,8 @@ pub(crate) fn page_header(
                 &subtitle,
                 None,
                 h.salt,
+                theme::regular(12.0),
+                palette.secondary,
             ) {
                 link = Some(link_route(target));
             }
@@ -1961,10 +2042,172 @@ fn shelf_tracks(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) {
         app.row_action(action);
     }
 }
+
+/// Every playable entry in `items`, in order — mirrors [`crate::model::SearchResults::playable`]
+/// for a plain `Vec<Entry>` with no such method of its own.
+pub(crate) fn playable_queue(items: &[Entry]) -> Vec<Track> {
+    items.iter().filter_map(|e| e.track().cloned()).collect()
+}
+
+/// Where `items[index]` sits among [`playable_queue`] — mirrors
+/// [`crate::model::SearchResults::playable_index`] for a plain `Vec<Entry>`.
+pub(crate) fn playable_index(items: &[Entry], index: usize) -> Option<usize> {
+    items.get(index)?.track()?;
+    Some(
+        items[..index]
+            .iter()
+            .filter(|e| e.track().is_some())
+            .count(),
+    )
+}
+
+/// One entry's row, whatever kind it is — every field a song/video needs, plus the plainer
+/// shape every other kind falls back to. Shared by Search's per-category tier and History's
+/// dated shelves, so a mixed Song/Album/Playlist/Artist list reads and behaves identically
+/// wherever it appears, rather than drifting between two copies of the same match.
+pub(crate) fn entry_row_spec<'a>(
+    item: &'a Entry,
+    now: &crate::player::NowPlaying,
+    library: &'a crate::model::Library,
+    signed_in: bool,
+) -> RowSpec<'a> {
+    let (subtitle, duration, plays, explicit, active) = match item {
+        // A song row's artist and album are links, which is what makes a result a way in to
+        // the rest of the catalogue rather than a dead end.
+        Entry::Song(t) | Entry::Video(t) => (
+            track_subtitle(t),
+            t.duration,
+            t.plays.as_deref(),
+            t.explicit,
+            is_active(now, &t.video_id),
+        ),
+        Entry::Artist(a) => (
+            widgets::plain_subtitle(a.subscribers.as_deref().unwrap_or("")),
+            None,
+            None,
+            false,
+            false,
+        ),
+        Entry::Album(a) => (
+            widgets::plain_subtitle(&a.artist),
+            None,
+            a.year.as_deref(),
+            false,
+            false,
+        ),
+        Entry::Playlist(p) => (widgets::plain_subtitle(&p.author), None, None, false, false),
+        // Neither Search nor History ever returns mood chips; this arm keeps the match total.
+        Entry::Mood(_) => (widgets::plain_subtitle(""), None, None, false, false),
+    };
+    RowSpec {
+        number: None,
+        rank: match item {
+            Entry::Song(t) | Entry::Video(t) => t.rank.as_deref(),
+            _ => None,
+        },
+        trend: match item {
+            Entry::Song(t) | Entry::Video(t) => t.trend,
+            _ => crate::model::ChartTrend::Unknown,
+        },
+        title: item.title(),
+        album_id: match item {
+            Entry::Song(t) | Entry::Video(t) => t.album_id.as_deref(),
+            _ => None,
+        },
+        subtitle,
+        duration,
+        plays,
+        explicit,
+        active,
+        playing: active && !now.paused,
+        badge: Some(item.kind()),
+        // Artists are round so a mixed list is scannable at a glance; a video still is 16:9
+        // and gets the wide slot.
+        shape: match item {
+            Entry::Video(t) if t.wide => widgets::ArtShape::Wide,
+            _ if item.is_artist() => widgets::ArtShape::Circle,
+            _ => widgets::ArtShape::Square,
+        },
+        thumbnail: item.thumbnail(),
+        menu: match item {
+            Entry::Song(t) | Entry::Video(t) => Some(widgets::RowMenu {
+                track: t,
+                playlist_id: None,
+                playlists: &library.playlists.items,
+                signed_in,
+                queue_index: None,
+            }),
+            _ => None,
+        },
+        like: match item {
+            Entry::Song(t) | Entry::Video(t) => t.like,
+            _ => crate::model::LikeStatus::Indifferent,
+        },
+        show_rating: true,
+    }
+}
+
+/// Every entry kind rendered as one plain full-width row list, never cards — History's dated
+/// shelves want this even for a shelf that is entirely songs, unlike Home/Explore's shelves,
+/// which wrap song shelves into a card grid instead (`shelf_tracks`/`track_shelf_rows`).
+pub(crate) fn entry_rows(app: &mut crate::app::App, ui: &mut egui::Ui, items: &[Entry]) {
+    let signed_in = app.signed_in();
+    let clicked = {
+        let crate::app::App {
+            palette,
+            images,
+            backend,
+            stats,
+            now,
+            library,
+            ..
+        } = app;
+        spec_rows(ui, palette, images, backend, stats, items.len(), |i| {
+            entry_row_spec(&items[i], now, library, signed_in)
+        })
+    };
+    if let Some(action) = clicked.action {
+        app.row_action(action);
+    }
+    match clicked.click {
+        Some(ListClick::Row(i)) => match &items[i] {
+            Entry::Song(_) | Entry::Video(_) => {
+                if let Some(index) = playable_index(items, i) {
+                    app.start_from(playable_queue(items), index);
+                }
+            }
+            Entry::Artist(a) => app.navigate(Route::Artist(a.id.clone())),
+            Entry::Album(a) => app.navigate(Route::Album(a.id.clone())),
+            Entry::Playlist(p) => app.navigate(Route::Playlist(p.id.clone())),
+            Entry::Mood(m) => app.navigate(Route::Mood(m.params.clone())),
+        },
+        Some(ListClick::Link(route)) => app.navigate(route),
+        None => {}
+    }
+}
+
 /// What a card grid — wrapped or carousel — does with a click or a menu choice.
 fn finish_grid(app: &mut crate::app::App, shelf: &Shelf, grid: GridOutcome) {
     if let Some(action) = grid.action {
         app.row_action(action);
+    }
+    // The corner play button specifically: an album/playlist plays directly instead of opening
+    // its page, matching what the button visually promises. Any other kind (a mood chip has no
+    // play button to press) falls through to the ordinary click below, unaffected.
+    if let Some(i) = grid.played
+        && let Some(item) = shelf.items.get(i)
+    {
+        match item {
+            Entry::Album(a) => {
+                app.play_album(a.id.clone());
+                return;
+            }
+            Entry::Playlist(p) => {
+                app.play_playlist(p.id.clone());
+                return;
+            }
+            _ => {}
+        }
     }
     if let Some(i) = grid.clicked
         && let Some(item) = shelf.items.get(i)

@@ -1488,6 +1488,18 @@ impl App {
         self.backend.fetch_album(id);
     }
 
+    /// An album card's own play button: start playing it without navigating to its page —
+    /// see `Event::CardTracksReady`'s own doc comment for why this is a separate fetch from
+    /// `load_album`'s.
+    pub(crate) fn play_album(&mut self, id: String) {
+        self.backend.play_album(id);
+    }
+
+    /// [`Self::play_album`], for a playlist card.
+    pub(crate) fn play_playlist(&mut self, id: String) {
+        self.backend.play_playlist(id);
+    }
+
     fn load_playlist(&mut self, id: String) {
         if self.playlist_for.as_deref() == Some(id.as_str()) {
             return;
@@ -1554,7 +1566,18 @@ impl App {
     }
 
     /// The home feed loads once per filter and stays cached while it is selected.
+    ///
+    /// Waits out `Checking` rather than firing on whatever cookie is stored before it is
+    /// actually confirmed: a stored cookie `verify_session` still needs to refresh (Google
+    /// rotates it under us) makes this exact fetch come back in the thin, signed-out shape —
+    /// and unlike `home()`'s own signed-out padding, which only ever covers a *genuinely*
+    /// signed-out response, there is nothing here to retry it once the real session settles.
+    /// `ensure_route_loaded` runs every frame, so this simply tries again once `Checking`
+    /// resolves either way.
     fn load_home(&mut self) {
+        if matches!(self.auth, crate::auth::AuthState::Checking) {
+            return;
+        }
         if self.home.is_none() && self.home_error.is_none() && !self.home_loading {
             self.home_loading = true;
             self.backend.fetch_home(self.home_filter.clone());
@@ -1989,6 +2012,24 @@ impl App {
                 }
                 Event::AlbumLoaded { .. } | Event::AlbumFailed { .. } => {}
 
+                // An album/playlist card's play button, not a page view — see
+                // `Event::CardTracksReady`'s own doc comment for why this isn't folded into
+                // `AlbumLoaded`/`PlaylistLoaded`. Same "already loaded → pause/resume" rule
+                // the album/playlist header's own Play button follows.
+                Event::CardTracksReady { id, tracks } if !tracks.is_empty() => {
+                    // See `NowPlaying::playlist_playing`'s own doc comment: a playlist card has
+                    // no per-track field naming it the way an album card reads `album_id`, so
+                    // this is what lets its own play button show Pause too.
+                    self.now.playlist_playing =
+                        Some((id, tracks.iter().map(|t| t.video_id.clone()).collect()));
+                    if self.queue_matches(&tracks) {
+                        self.toggle_playback();
+                    } else {
+                        self.start_from(tracks, 0);
+                    }
+                }
+                Event::CardTracksReady { .. } => {}
+
                 // The expansion replaces the shelf it came from, in place, and drops its
                 // "Show all" button along with it. `expanded` is what `artist.rs::shelves()`
                 // reads to switch that shelf from its carousel preview to the full boxed grid.
@@ -2365,6 +2406,8 @@ impl App {
                         track: Some(track),
                         resolving: true,
                         error: None,
+                        paused: false,
+                        playlist_playing: self.now.playlist_playing.clone(),
                     };
                 }
                 Event::Playing(mut track) => {
@@ -2374,6 +2417,8 @@ impl App {
                         track: Some(track),
                         resolving: false,
                         error: None,
+                        paused: false,
+                        playlist_playing: self.now.playlist_playing.clone(),
                     };
                     self.playback_started = true;
                     self.prefetch_next();
@@ -2668,6 +2713,8 @@ impl App {
                         track: Some(track),
                         resolving: false,
                         error: Some(error),
+                        paused: false,
+                        playlist_playing: self.now.playlist_playing.clone(),
                     };
                     self.playback_started = false;
                 }
@@ -2682,6 +2729,13 @@ impl App {
     /// Make `tracks` the queue and start playing `index`.
     pub(crate) fn start_from(&mut self, tracks: Vec<Track>, index: usize) {
         if index >= tracks.len() {
+            return;
+        }
+        // The clicked row is already the one loaded: pause/resume it, the same convention an
+        // album/playlist header's own Play button already follows (`queue_matches`/
+        // `toggle_playback`), rather than restarting it from the top.
+        if self.queue_matches(&tracks[index..=index]) {
+            self.toggle_playback();
             return;
         }
         // Leaving one queue for another: keep the whole old queue so `Previous` can bring it
@@ -2699,13 +2753,23 @@ impl App {
         // A new queue has different tracks; the shuffle seen-set does not carry over.
         self.shuffle_seen.clear();
         self.play_index_restore(index);
+        // A brand new queue, so the panel should show its start — matching what the queue
+        // panel's own row click already does for the in-queue case. Set here rather than in
+        // `play_index_restore` itself, which is also what natural end-of-track auto-advance and
+        // Previous/Next share: neither of those should jerk the scroll position around on every
+        // track change.
+        self.queue_scroll_reset = true;
     }
 
     /// Start the queue item at `index`, remembering the track we are leaving for `Previous`.
     pub(crate) fn play_index(&mut self, index: usize) {
-        if self.current != Some(index) {
-            self.record_play();
+        // Already the loaded track: pause/resume it rather than restarting from the top — the
+        // same convention `start_from` follows for the same reason.
+        if self.current == Some(index) {
+            self.toggle_playback();
+            return;
         }
+        self.record_play();
         self.play_index_restore(index);
     }
 
@@ -4174,6 +4238,10 @@ impl eframe::App for App {
             .as_ref()
             .map(|pl| pl.state())
             .unwrap_or_default();
+        // Kept in sync here rather than at every `toggle_pause`/`set_paused` call site — mpv is
+        // the single source of truth for this, and every row/card's play-vs-pause glyph reads
+        // it off `now` rather than reaching for the player directly.
+        self.now.paused = state.paused;
         if self.playback_started && state.idle && !self.now.resolving {
             self.playback_started = false;
             // Repeat One replays the track that just ended; anything else advances normally.

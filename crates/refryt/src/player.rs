@@ -172,6 +172,21 @@ pub struct NowPlaying {
     /// Set while we are resolving, so the UI can say so instead of looking frozen.
     pub resolving: bool,
     pub error: Option<String>,
+    /// Kept in sync every frame from `PlayerState::paused` (see `App::ui`'s per-frame poll) —
+    /// carried on `NowPlaying` rather than queried separately so every row/card that already
+    /// takes `&NowPlaying` can tell "is my track the current one, and is it actually playing"
+    /// without a second parameter threaded everywhere `now` already reaches.
+    pub paused: bool,
+    /// The playlist a card most recently started playing, and the video ids it fetched to do
+    /// so. An album card can tell it's the one playing from `Track::album_id` alone — every
+    /// track already carries it — but a playlist has no such back-reference on its tracks (the
+    /// same song can sit in many playlists), so this is the only way a playlist card knows.
+    /// Self-correcting the same way `App::queue_matches` already is: once `track` is no longer
+    /// one of these ids, nothing checks this as a match, so it is never explicitly cleared —
+    /// only ever replaced by the next card played this way. Carried forward (not reset) across
+    /// every other `NowPlaying` rebuild, since it describes the queue's source, not this one
+    /// track.
+    pub playlist_playing: Option<(String, Vec<String>)>,
 }
 
 #[cfg(test)]

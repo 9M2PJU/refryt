@@ -15,8 +15,8 @@
 use crate::app::{App, Route};
 use crate::model::{Entry, SearchScope};
 use crate::theme;
-use crate::ui::{ListClick, RowSpec, centered, is_active, spec_rows, track_subtitle};
-use crate::widgets::{self, ArtShape};
+use crate::ui::{ListClick, centered, spec_rows};
+use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(6.0);
@@ -97,24 +97,6 @@ fn scope_chips(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(4.0);
 }
 
-/// Every playable entry in `items`, in order — mirrors [`crate::model::SearchResults::playable`]
-/// for `app.scoped_results`, a plain `Vec<Entry>` with no such method of its own.
-fn playable_queue(items: &[Entry]) -> Vec<crate::model::Track> {
-    items.iter().filter_map(|e| e.track().cloned()).collect()
-}
-
-/// Where `items[index]` sits among [`playable_queue`] — mirrors
-/// [`crate::model::SearchResults::playable_index`] for `app.scoped_results`.
-fn playable_index(items: &[Entry], index: usize) -> Option<usize> {
-    items.get(index)?.track()?;
-    Some(
-        items[..index]
-            .iter()
-            .filter(|e| e.track().is_some())
-            .count(),
-    )
-}
-
 /// The list. Every kind renders through the same row, so art, hover, truncation and the
 /// active-track highlight are shared, and the list virtualises like every other.
 ///
@@ -152,78 +134,7 @@ fn results_list(app: &mut App, ui: &mut egui::Ui) {
         } = app;
         let items: &[Entry] = if all { &results.items } else { scoped_results };
         spec_rows(ui, palette, images, backend, stats, indices.len(), |i| {
-            let item = &items[indices[i]];
-            let (subtitle, duration, plays, explicit, active) = match item {
-                // A song row's artist and album are links, which is what makes a search result a
-                // way in to the rest of the catalogue rather than a dead end.
-                Entry::Song(t) | Entry::Video(t) => (
-                    track_subtitle(t),
-                    t.duration,
-                    t.plays.as_deref(),
-                    t.explicit,
-                    is_active(now, &t.video_id),
-                ),
-                Entry::Artist(a) => (
-                    widgets::plain_subtitle(a.subscribers.as_deref().unwrap_or("")),
-                    None,
-                    None,
-                    false,
-                    false,
-                ),
-                Entry::Album(a) => (
-                    widgets::plain_subtitle(&a.artist),
-                    None,
-                    a.year.as_deref(),
-                    false,
-                    false,
-                ),
-                Entry::Playlist(p) => {
-                    (widgets::plain_subtitle(&p.author), None, None, false, false)
-                }
-                // Search never returns mood chips; this arm keeps the match total.
-                Entry::Mood(_) => (widgets::plain_subtitle(""), None, None, false, false),
-            };
-            RowSpec {
-                number: None,
-                rank: match item {
-                    Entry::Song(t) | Entry::Video(t) => t.rank.as_deref(),
-                    _ => None,
-                },
-                trend: match item {
-                    Entry::Song(t) | Entry::Video(t) => t.trend,
-                    _ => crate::model::ChartTrend::Unknown,
-                },
-                title: item.title(),
-                subtitle,
-                duration,
-                plays,
-                explicit,
-                active,
-                badge: Some(item.kind()),
-                // Artists are round so a mixed list is scannable at a glance; a video still is
-                // 16:9 and gets the wide slot.
-                shape: match item {
-                    Entry::Video(t) if t.wide => ArtShape::Wide,
-                    _ if item.is_artist() => ArtShape::Circle,
-                    _ => ArtShape::Square,
-                },
-                thumbnail: item.thumbnail(),
-                menu: match item {
-                    Entry::Song(t) | Entry::Video(t) => Some(widgets::RowMenu {
-                        track: t,
-                        playlist_id: None,
-                        playlists: &library.playlists.items,
-                        signed_in,
-                        queue_index: None,
-                    }),
-                    _ => None,
-                },
-                like: match item {
-                    Entry::Song(t) | Entry::Video(t) => t.like,
-                    _ => crate::model::LikeStatus::Indifferent,
-                },
-                show_rating: true,
-            }
+            crate::ui::entry_row_spec(&items[indices[i]], now, library, signed_in)
         })
     };
 
@@ -253,8 +164,8 @@ fn results_list(app: &mut App, ui: &mut egui::Ui) {
                 (app.results.playable_index(i), app.results.playable())
             } else {
                 (
-                    playable_index(&app.scoped_results, i),
-                    playable_queue(&app.scoped_results),
+                    crate::ui::playable_index(&app.scoped_results, i),
+                    crate::ui::playable_queue(&app.scoped_results),
                 )
             };
             if let Some(index) = index {

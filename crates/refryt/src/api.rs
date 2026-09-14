@@ -639,7 +639,23 @@ impl Api {
         if !self.is_signed_in().await {
             anyhow::bail!("not signed in");
         }
-        self.library_page(LIBRARY_PLAYLISTS, None, None).await
+        // The sidebar wants the whole collection, not just page one — a playlist sorting past
+        // the first page used to simply never show up there, even though the full Library page
+        // (which pages on demand via `library_more`) had it all along.
+        let mut page = self.library_page(LIBRARY_PLAYLISTS, None, None).await?;
+        let mut token = page.next.take();
+        for _ in 0..SIDEBAR_PLAYLIST_PAGES {
+            let Some(next) = token.take() else { break };
+            let mut more = self
+                .library_page(LIBRARY_PLAYLISTS, None, Some(next))
+                .await?;
+            if more.items.is_empty() {
+                break;
+            }
+            page.items.append(&mut more.items);
+            token = more.next;
+        }
+        Ok(page)
     }
 
     /// The next page of one library section.
@@ -927,8 +943,9 @@ impl Api {
     ///
     /// Signed in this is the personalised one — Listen again, Mixed for you, Quick picks. Signed
     /// out YouTube returns only two shelves, so Explore's shelves are appended to fill the page.
-    /// The test is the shelf count rather than the auth state, so a signed-in feed that happens to
-    /// be thin is also topped up, and a rich one never pays the extra request.
+    /// The top-up only fires when actually signed out, not merely on a thin shelf count — a
+    /// signed-in feed that happens to come back thin (a hiccup, a fresh account, pagination
+    /// stalling early) should stay as-is rather than get Explore's shelves mixed in.
     /// The home feed through an optional mood-bar filter, with its chips.
     ///
     /// One browse serves both: the chips ride the response header, so no second request. A
@@ -962,7 +979,15 @@ impl Api {
             token = innertube::continuation_token(&json);
         }
 
-        if filter.is_none() && shelves.len() < THIN_HOME {
+        if filter.is_none() && shelves.len() < THIN_HOME && !self.is_signed_in().await {
+            // This only ever runs for a genuinely signed-out response — if Explore-like shelves
+            // still show up on Home while signed in, this line's absence from the log (with
+            // `RUST_LOG=refryt=debug`) proves it: that content came from YouTube's own
+            // personalised feed, not from this top-up.
+            tracing::debug!(
+                shelves = shelves.len(),
+                "home feed thin and signed out — topping up with Explore"
+            );
             match self.browse(EXPLORE).await {
                 Ok(json) => shelves.extend(innertube::parse_browse_shelves(&json)),
                 Err(e) => tracing::warn!(error = %format!("{e:#}"), "explore feed unavailable"),
@@ -1024,6 +1049,14 @@ impl Api {
     pub async fn history(&self) -> Result<Vec<model::Shelf>> {
         let json = self.browse(HISTORY).await?;
         if innertube::looks_signed_out(&json) {
+            // The cookie may have gone stale under us, same as `library_page` already guards
+            // against — retry once after a fresh browser re-import before giving up.
+            if self.refresh_from_browser().await {
+                let json = self.browse(HISTORY).await?;
+                if !innertube::looks_signed_out(&json) {
+                    return Ok(innertube::parse_browse_shelves(&json));
+                }
+            }
             anyhow::bail!("YouTube returned an empty history feed");
         }
         Ok(innertube::parse_browse_shelves(&json))
@@ -1939,6 +1972,10 @@ const THIN_HOME: usize = 4;
 /// which more costs a request and buys nothing anyone will scroll to.
 const HOME_PAGES: usize = 3;
 
+/// How many extra pages of library playlists the sidebar will follow to get the whole
+/// collection, not just the first page. Bounded for the same reason `HOME_PAGES` is.
+const SIDEBAR_PLAYLIST_PAGES: usize = 20;
+
 /// Which library section a continuation belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibrarySection {
@@ -2142,6 +2179,9 @@ fn merge_track_states(
             .set_video_id
             .take()
             .or_else(|| state.set_video_id.clone());
+        // The typed album parser has no field for this at all, so it never has anything to
+        // downgrade from — only ever learned here, never unlearned.
+        track.wide |= state.wide;
     }
 }
 
@@ -2417,7 +2457,9 @@ fn map_album(id: &str, a: GetAlbum) -> model::Album {
             library_add: None,
             library_remove: None,
             set_video_id: None,
-            // The typed parsers carry no video kind, so a typed track is never wide.
+            // The typed parser carries no video kind at all — `get_album`'s raw-browse pass
+            // corrects this afterward via `merge_track_states`, so this default only survives
+            // for a track that pass couldn't resolve.
             wide: false,
             rank: None,
             trend: crate::model::ChartTrend::Unknown,

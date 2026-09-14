@@ -1,12 +1,14 @@
 //! What you played, in the dated shelves YouTube serves — Today, This week, and so on.
 //!
-//! The shelves are the same shape as every other feed, so the ordinary shelf renderer covers
-//! them: playing, right-clicking and rating work here for free.
+//! Rendered as plain rows regardless of entry kind, never the card grid the generic shelf
+//! renderer would otherwise pick for a shelf that isn't all songs — a whole album or single you
+//! played shows up as a shelf item here too, and History reads better as one consistent list of
+//! rows than as a row/card mix that changes shape by what happened to be played that day.
 
 use crate::app::{App, Route};
 use crate::auth::AuthState;
 use crate::theme;
-use crate::ui::{centered, failed, shelf};
+use crate::ui::{centered, entry_rows, failed, section};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
@@ -65,7 +67,11 @@ fn content(app: &mut App, ui: &mut egui::Ui) {
     }
     crate::ui::page_scroll(app, "history").show(ui, |ui| {
         for s in shelves.iter() {
-            shelf(app, ui, s);
+            if s.items.is_empty() {
+                continue;
+            }
+            section(ui, &app.palette, &s.title);
+            entry_rows(app, ui, &s.items);
         }
     });
 }
