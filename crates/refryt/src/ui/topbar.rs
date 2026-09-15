@@ -18,9 +18,14 @@ use crate::icons::Icon;
 use crate::theme;
 use crate::widgets;
 
-/// How wide the search pill is.
+/// How wide the search pill is at most, and how small it is allowed to get before the bar is
+/// just too narrow to hold everything.
 const SEARCH_W: f32 = 360.0;
+const MIN_SEARCH_W: f32 = 140.0;
 const SEARCH_H: f32 = 36.0;
+
+/// Back + Forward and the gaps around them, the fixed part left of the search pill.
+const LEFT_W: f32 = 32.0 + 4.0 + 32.0 + 12.0;
 
 pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
     let p = app.palette;
@@ -29,28 +34,8 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
     // The drag surface goes down first so every control painted after it wins the pointer.
     chrome::drag_surface(ui, rect, app.decorated);
 
-    let mut bar = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-
-    let can_back = app.can_go_back();
-    let can_forward = app.can_go_forward();
-    let back = history_button(&mut bar, &p, Icon::ChevronLeft, can_back);
-    bar.add_space(4.0);
-    let forward = history_button(&mut bar, &p, Icon::ChevronRight, can_forward);
-    bar.add_space(12.0);
-    search_field(app, &mut bar);
-
-    if back.clicked() && can_back {
-        app.back();
-    }
-    if forward.clicked() && can_forward {
-        app.forward();
-    }
-
-    // Right-aligned: window buttons outermost, then the account, then settings.
+    // The right-hand controls go down *first*, so the search can size itself to whatever is left
+    // of the bar instead of running under them when the window is dragged narrow.
     let mut right = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect)
@@ -81,6 +66,30 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
     // door, one keyhole — a second gear beside the chip was two doors to the same room.
     if widgets::icon_button(&mut right, &p, Icon::History, 18.0, false).clicked() {
         app.navigate(Route::History);
+    }
+    // Whatever the right group took, plus a gap so the search never touches it.
+    let reserved = (rect.right() - right.min_rect().left()).max(0.0) + 12.0;
+
+    let mut bar = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+
+    let can_back = app.can_go_back();
+    let can_forward = app.can_go_forward();
+    let back = history_button(&mut bar, &p, Icon::ChevronLeft, can_back);
+    bar.add_space(4.0);
+    let forward = history_button(&mut bar, &p, Icon::ChevronRight, can_forward);
+    bar.add_space(12.0);
+    let search_w = (rect.width() - LEFT_W - reserved).clamp(MIN_SEARCH_W, SEARCH_W);
+    search_field(app, &mut bar, search_w);
+
+    if back.clicked() && can_back {
+        app.back();
+    }
+    if forward.clicked() && can_forward {
+        app.forward();
     }
 }
 
@@ -124,9 +133,9 @@ fn history_button(
 }
 
 /// The search box as a pill with the magnifier inside it, rather than egui's default field.
-fn search_field(app: &mut App, ui: &mut Ui) {
+fn search_field(app: &mut App, ui: &mut Ui, width: f32) {
     let p = app.palette;
-    let (rect, response) = ui.allocate_exact_size(vec2(SEARCH_W, SEARCH_H), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, SEARCH_H), Sense::hover());
     let focused = ui.memory(|m| m.has_focus(search_id()));
     let t = widgets::lit(ui, &response).max(if focused { 1.0 } else { 0.0 });
 
@@ -151,17 +160,110 @@ fn search_field(app: &mut App, ui: &mut Ui) {
             .max_rect(inner)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
+    // Autocomplete is offered only while the field has focus and the reply matches the text in
+    // the box, so a late answer for an older query never flashes up.
+    let show = focused
+        && !app.suggestions.is_empty()
+        && app.suggestions_for.as_deref() == Some(app.query.as_str());
+    // Consume the list-navigation keys *before* the field so they drive the popup rather than the
+    // caret; Left/Right are left alone, so editing still feels normal.
+    let (mut up, mut down, mut enter, mut esc) = (false, false, false, false);
+    if show {
+        ui.input_mut(|i| {
+            up = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
+            down = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown);
+            enter = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            esc = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+        });
+    }
+
     let field = egui::TextEdit::singleline(&mut app.query)
         .id(search_id())
         .hint_text("What do you want to play?")
         .desired_width(inner.width())
         .frame(egui::Frame::NONE)
         .font(theme::regular(13.0));
-    if field_ui.add(field).changed() {
-        if !matches!(app.current_route(), Route::Search) {
-            app.navigate(Route::Search);
-        }
+    let field_response = field_ui.add(field);
+    if field_response.changed() {
+        // Typing refetches autocomplete only; the search waits for a submit. `suggestion_navigated`
+        // resets so a stale arrow selection cannot attach to new text.
         app.query_changed_at = Some(std::time::Instant::now());
+        app.suggestion_cursor = 0;
+        app.suggestion_navigated = false;
+    }
+
+    // Submit on a bare Enter. When the suggestion list is open it consumes Enter above, so this
+    // path only runs with no list up: search exactly what was typed.
+    if !show {
+        if field_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            app.submit_search();
+        }
+        return;
+    }
+
+    // The items are cloned out so the popup closure does not borrow `app` while the actions
+    // below still need it. `p` is a copy for the same reason.
+    let items = app.suggestions.clone();
+    let cursor = app.suggestion_cursor.min(items.len().saturating_sub(1));
+    let mut picked = None;
+    egui::Popup::from_response(&response)
+        .id(ui.id().with("ytm-search-suggestions"))
+        .kind(egui::PopupKind::Menu)
+        .layout(egui::Layout::top_down_justified(egui::Align::Min))
+        .align(egui::RectAlign::BOTTOM_START)
+        .width(width)
+        .gap(4.0)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .open_memory(Some(egui::SetOpenCommand::Bool(true)))
+        .show(|mui| {
+            for (i, item) in items.iter().enumerate() {
+                let (row, resp) =
+                    mui.allocate_exact_size(vec2(mui.available_width(), 30.0), Sense::click());
+                if mui.is_rect_visible(row) {
+                    let selected = i == cursor;
+                    let t = widgets::lit(mui, &resp).max(if selected { 1.0 } else { 0.0 });
+                    if t > 0.001 {
+                        mui.painter().rect_filled(
+                            row,
+                            CornerRadius::same(theme::RADIUS_SMALL + 2),
+                            widgets::mix(p.surface, p.surface_hover, t),
+                        );
+                    }
+                    crate::emoji::paint_line(
+                        mui,
+                        row.left_center() + vec2(14.0, 0.0),
+                        item,
+                        theme::regular(13.0),
+                        p.text,
+                    );
+                }
+                if resp.clicked() {
+                    picked = Some(i);
+                }
+            }
+        });
+
+    // A click accepts and searches that suggestion outright. Enter searches what was typed,
+    // unless the arrow keys moved the highlight — then the highlighted suggestion wins. Escape
+    // hides the list without changing the query; Up/Down move the cursor.
+    if let Some(i) = picked {
+        app.query = items[i].clone();
+        app.clear_suggestions();
+        app.submit_search();
+    } else if enter {
+        if app.suggestion_navigated && !items.is_empty() {
+            app.query = items[cursor].clone();
+        }
+        app.clear_suggestions();
+        app.submit_search();
+    } else if esc {
+        app.clear_suggestions();
+    } else if up {
+        app.suggestion_cursor = cursor.saturating_sub(1);
+        app.suggestion_navigated = true;
+    } else if down {
+        app.suggestion_cursor = (cursor + 1).min(items.len() - 1);
+        app.suggestion_navigated = true;
     }
 }
 
@@ -263,6 +365,7 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response) {
         Profile(String),
         Switch(Option<String>),
         Settings,
+        Help,
         SignOut,
     }
     let mut choice = None;
@@ -356,6 +459,10 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response) {
             choice = Some(Choice::Settings);
             mui.close();
         }
+        if widgets::menu_item(mui, &p, Icon::Info, "Keyboard shortcuts", None).clicked() {
+            choice = Some(Choice::Help);
+            mui.close();
+        }
         if widgets::menu_item(mui, &p, Icon::LogOut, "Sign out", None).clicked() {
             choice = Some(Choice::SignOut);
             mui.close();
@@ -369,6 +476,7 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response) {
             app.forget_account_data();
         }
         Some(Choice::Settings) => app.navigate(Route::Settings),
+        Some(Choice::Help) => app.help_open = true,
         Some(Choice::SignOut) => app.backend.sign_out(),
         None => {}
     }

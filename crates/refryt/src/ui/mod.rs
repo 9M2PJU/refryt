@@ -4,7 +4,9 @@
 pub mod album;
 pub mod artist;
 pub mod charts;
+pub mod crash;
 pub mod explore;
+pub mod help;
 pub mod history;
 pub mod home;
 pub mod library;
@@ -19,6 +21,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod topbar;
 pub mod upnext;
+pub mod video;
 
 use std::sync::Arc;
 
@@ -45,6 +48,16 @@ pub(crate) const PAGE_ART_SIZE: f32 = 192.0;
 /// How wide a card is in a grid; its cover is inset by 8pt on each side.
 pub(crate) const CARD_W: f32 = 132.0;
 pub(crate) const CARD_ART_PT: f32 = CARD_W - 16.0;
+
+/// Everything a shelf's album/playlist cards need for their right-click menu: your playlists, and
+/// the caches that hold a release's tracks once prefetched. Looked up by id, so a card can offer
+/// the same queueing and saving items the page ··· menu does — filling in as the fetch lands.
+pub(crate) struct ReleaseCtx<'a> {
+    pub playlists: &'a [crate::model::PlaylistRef],
+    pub signed_in: bool,
+    pub rail: &'a std::collections::HashMap<String, crate::model::Playlist>,
+    pub albums: &'a std::collections::HashMap<String, crate::model::Album>,
+}
 
 /// Rows kept on either side of the visible range, so a fast scroll never shows a gap.
 const OVERSCAN: usize = 2;
@@ -106,18 +119,45 @@ pub(crate) fn art_texture_wide<'a>(
 ///
 /// Split out from [`virtual_rows`] because it is the part that can be wrong, and it needs no egui
 /// context to check. `top` is where the list starts and `clip_top`/`clip_h` are the viewport, both
-/// in the same (screen) coordinate space — scrolling moves `top`, not the clip.
+/// in the same (screen) coordinate space — scrolling moves `top`, not the clip. `pitch` is the
+/// distance between row starts: the row height *plus* the item spacing egui inserts after each
+/// one (see [`row_pitch`]), not the height alone.
 fn visible_range(
     top: f32,
     clip_top: f32,
     clip_h: f32,
-    row_h: f32,
+    pitch: f32,
     count: usize,
 ) -> std::ops::Range<usize> {
-    let first = (((clip_top - top) / row_h).floor().max(0.0) as usize).saturating_sub(OVERSCAN);
+    let first = (((clip_top - top) / pitch).floor().max(0.0) as usize).saturating_sub(OVERSCAN);
     let first = first.min(count);
-    let visible = (clip_h / row_h).ceil() as usize + OVERSCAN * 2 + 1;
+    let visible = (clip_h / pitch).ceil() as usize + OVERSCAN * 2 + 1;
     first..(first + visible).min(count)
+}
+
+/// The distance between the tops of two consecutive rows.
+///
+/// A row allocates its own height, but egui then advances the cursor by `item_spacing` before the
+/// next one, so the true pitch is `row_h + spacing`. Every part of the virtual layout — the index
+/// math and both spacers — has to use this same number, or the computed extent changes with how
+/// many rows happen to be visible. That mismatch is what made lists jitter and overshoot at the
+/// bottom: the spacers reserved `row_h` per skipped row while the drawn rows each paid `spacing`.
+fn row_pitch(row_h: f32, item_spacing: f32) -> f32 {
+    row_h + item_spacing
+}
+
+/// The pair of spacers a virtual list reserves around the drawn slice, `[first, last)`.
+///
+/// Both are in pitch units, so the total the scroll area sees is always `count * pitch` — the
+/// full list, irrespective of the viewport. Pure, so that invariant is testable.
+fn virtual_spacers(first: usize, last: usize, count: usize, pitch: f32) -> (f32, f32) {
+    let top = first as f32 * pitch;
+    let bottom = if last < count {
+        (count - last) as f32 * pitch
+    } else {
+        0.0
+    };
+    (top, bottom)
 }
 
 /// Draw a long list without paying for the rows nobody can see.
@@ -139,19 +179,22 @@ pub(crate) fn virtual_rows(
     if count == 0 {
         return 0..0;
     }
+    // The gap egui adds after each row is part of the layout, not decoration: see `row_pitch`.
+    let pitch = row_pitch(row_h, ui.spacing().item_spacing.y);
     let clip = ui.clip_rect();
     let top = ui.cursor().top();
-    let range = visible_range(top, clip.top(), clip.height(), row_h, count);
+    let range = visible_range(top, clip.top(), clip.height(), pitch, count);
     let (first, last) = (range.start, range.end);
 
-    if first > 0 {
-        ui.add_space(first as f32 * row_h);
+    let (top_space, bottom_space) = virtual_spacers(first, last, count, pitch);
+    if top_space > 0.0 {
+        ui.add_space(top_space);
     }
     for i in first..last {
         row(ui, i);
     }
-    if last < count {
-        ui.add_space((count - last) as f32 * row_h);
+    if bottom_space > 0.0 {
+        ui.add_space(bottom_space);
     }
     first..last
 }
@@ -273,6 +316,15 @@ pub(crate) enum RowAction {
         name: String,
     },
     StartMix(String),
+    /// A page header's mix, seeded by the whole playlist/album (`RDAMPL` + its id) rather than
+    /// by its first song.
+    StartMixPlaylist(String),
+    /// Save a song to `~/Music/refryt`.
+    Download(Track),
+    /// Save a whole page's tracks.
+    DownloadMany(Vec<Track>),
+    /// Delete a downloaded file by video id.
+    RemoveDownload(String),
     PlayNext(Track),
     AddToQueue(Track),
     GoToAlbum(String),
@@ -415,7 +467,7 @@ pub(crate) fn spec_rows<'d>(
         // A link wins over the row: clicking the artist name must not also start the track.
         if let Some(link) = hit.link {
             clicked = Some(ListClick::Link(link_route(link)));
-        } else if hit.response.clicked() {
+        } else if hit.activate {
             clicked = Some(ListClick::Row(i));
         }
         if action.is_none() {
@@ -458,70 +510,8 @@ pub(crate) fn spec_rows<'d>(
     }
 }
 
-/// [`spec_rows`], but wraps into `cols` side-by-side columns instead of one full-width row per
-/// item — for a shelf with no sequential order to preserve (see [`track_shelf_rows`]). Bands,
-/// not rows, are what gets virtualised: each band is one `ROW_HEIGHT`-tall slice holding up to
-/// `cols` items, so the vertical math — and so scrolling/overscan — is unchanged from a plain
-/// `spec_rows` list of `count.div_ceil(cols)` bands. Each cell paints through its own child
-/// `Ui`, the same "explicit sub-rect, caller reserves the space" split `page_header` already
-/// uses for its control row — `track_row` itself needs no changes, since a ~300-400pt column
-/// is exactly what its existing narrow-row mode (built for the queue panel) already handles.
-#[allow(clippy::too_many_arguments)]
-fn spec_rows_grid<'d>(
-    ui: &mut egui::Ui,
-    palette: &theme::Palette,
-    images: &mut Images,
-    backend: &Backend,
-    stats: &mut crate::stats::Stats,
-    count: usize,
-    cols: usize,
-    spec: impl Fn(usize) -> RowSpec<'d>,
-) -> ListOutcome {
-    let mut clicked = None;
-    let mut action = None;
-    let gap = 12.0;
-    let col_w = (ui.available_width() - gap * cols.saturating_sub(1) as f32) / cols as f32;
-    let bands = count.div_ceil(cols);
-    let drawn_bands = virtual_rows(ui, theme::ROW_HEIGHT, bands, |ui, band| {
-        let top_left = ui.cursor().min;
-        for c in 0..cols {
-            let i = band * cols + c;
-            if i >= count {
-                break;
-            }
-            let x = top_left.x + c as f32 * (col_w + gap);
-            let cell_rect = egui::Rect::from_min_size(
-                egui::pos2(x, top_left.y),
-                egui::vec2(col_w, theme::ROW_HEIGHT),
-            );
-            let (click, act) = paint_grid_cell(ui, palette, images, backend, cell_rect, i, spec(i));
-            if click.is_some() {
-                clicked = click;
-            }
-            if action.is_none() {
-                action = act;
-            }
-        }
-        // The cells painted through their own absolute-rect child `Ui`s and never touched this
-        // one's cursor, so the band's own height has to be reserved here — otherwise the next
-        // band, and whatever follows the shelf, would stack right on top of this one.
-        ui.add_space(theme::ROW_HEIGHT);
-    });
-    let first = (drawn_bands.start * cols).min(count);
-    let last = (drawn_bands.end * cols).min(count);
-    stats.rows(last - first, count);
-    ListOutcome {
-        click: clicked,
-        action,
-        at_end: count == 0 || last + PREFETCH_ROWS >= count,
-        // A wrapped shelf grid is never an editable playlist's own track list.
-        reorder: None,
-    }
-}
-
 /// One cell of a track grid: its own child `Ui` at an explicit rect, the same split
-/// `page_header` uses for its control row. Shared by the virtualised wrap (`spec_rows_grid`)
-/// and the paged view (`track_shelf_pages`), so the two layouts' rows cannot drift apart.
+/// `page_header` uses for its control row. Used by the paged view (`track_shelf_pages`).
 fn paint_grid_cell<'d>(
     ui: &mut egui::Ui,
     palette: &theme::Palette,
@@ -556,12 +546,9 @@ fn paint_grid_cell<'d>(
             rank: s.rank,
             trend: s.trend,
             title: s.title,
-            // Unlike a full-width row, a card is narrow enough that the title's link hit box
-            // (sized to the rendered text, not the column) can cover most of its clickable
-            // surface — turning "click the card to play it" into "click the card to go to its
-            // album" almost every time. Cards keep "Go to album" in their own right-click menu
-            // instead.
-            album_id: None,
+            // The title links to its album here too: a song you cannot open from the shelf it
+            // is shown on is a dead end, and the album is one click away everywhere else.
+            album_id: s.album_id,
             subtitle: s.subtitle,
             duration: s.duration,
             plays: s.plays,
@@ -580,7 +567,7 @@ fn paint_grid_cell<'d>(
     // A link wins over the row: clicking the artist name must not also start the track.
     let click = if let Some(link) = hit.link {
         Some(ListClick::Link(link_route(link)))
-    } else if hit.response.clicked() {
+    } else if hit.activate {
         Some(ListClick::Row(i))
     } else {
         None
@@ -589,7 +576,7 @@ fn paint_grid_cell<'d>(
 }
 
 /// A short, bounded track list — Top Songs — capped to 5 rows with ‹ › arrows to page through
-/// the rest, rather than `spec_rows_grid`'s open-ended wrap: at 3 columns the full 15 already
+/// the rest, rather than one open-ended wrap: at 3 columns the full 15 already
 /// fits in those 5 rows with nothing left to page through; the arrows only earn their keep on a
 /// narrower window, where fewer columns fit and 5 rows is not enough to show all 15 at once.
 /// Not virtualised — bounded lists like this are cheap enough to lay out in full every frame —
@@ -743,12 +730,9 @@ pub(crate) fn track_rows(
             active: is_active(now, &t.video_id),
             playing: is_active(now, &t.video_id) && !now.paused,
             badge: None,
-            // A video still is 16:9 and gets the wide slot; everything else is a square cover.
-            shape: if t.wide {
-                widgets::ArtShape::Wide
-            } else {
-                widgets::ArtShape::Square
-            },
+            // Square, always: `t.wide` marks a music video for playback, but the art in a
+            // track list is the album/playlist cover and a 16:9 slot only crops it.
+            shape: widgets::ArtShape::Square,
             thumbnail: t.thumbnail.as_ref(),
             menu: Some(widgets::RowMenu {
                 track: t,
@@ -763,75 +747,12 @@ pub(crate) fn track_rows(
     })
 }
 
-/// [`track_rows`] for a shelf with no sequential order to preserve — Home's "Quick picks", an
-/// artist's "Top songs" — wrapped into 2-3 columns when the window is wide enough instead of
-/// one full-width row per track. Always unnumbered and always the shelf's own tracks (no open
-/// playlist to save into), matching what both call sites already passed to `track_rows`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn track_shelf_rows(
-    ui: &mut egui::Ui,
-    palette: &theme::Palette,
-    images: &mut Images,
-    backend: &Backend,
-    stats: &mut crate::stats::Stats,
-    now: &crate::player::NowPlaying,
-    tracks: &[crate::model::Track],
-    playlists: &[PlaylistRef],
-    signed_in: bool,
-) -> ListOutcome {
-    // The same shape `mood_chips` already picks its column count with (`mod.rs` above): a
-    // target width, clamped to a sane range. 1 keeps a narrow window — or the queue open next
-    // to it — a plain list; 3 is the ceiling asked for.
-    let cols = ((ui.available_width() / 400.0).floor() as usize).clamp(1, 3);
-    spec_rows_grid(
-        ui,
-        palette,
-        images,
-        backend,
-        stats,
-        tracks.len(),
-        cols,
-        |i| {
-            let t = &tracks[i];
-            RowSpec {
-                number: None,
-                rank: t.rank.as_deref(),
-                trend: t.trend,
-                title: &t.title,
-                album_id: t.album_id.as_deref(),
-                subtitle: track_subtitle_inner(t, false),
-                duration: t.duration,
-                plays: t.plays.as_deref(),
-                explicit: t.explicit,
-                active: is_active(now, &t.video_id),
-                playing: is_active(now, &t.video_id) && !now.paused,
-                badge: None,
-                shape: if t.wide {
-                    widgets::ArtShape::Wide
-                } else {
-                    widgets::ArtShape::Square
-                },
-                thumbnail: t.thumbnail.as_ref(),
-                menu: Some(widgets::RowMenu {
-                    track: t,
-                    playlist_id: None,
-                    playlists,
-                    signed_in,
-                    queue_index: None,
-                }),
-                like: t.like,
-                show_rating: true,
-            }
-        },
-    )
-}
-
-/// [`track_shelf_rows`], but paged instead of wrapped — for a short, bounded list where
-/// growing indefinitely tall would be worse than paging: an artist's Top Songs, expanded past
-/// the 5 the page embeds up to a cap of 15 (see `App`'s handling of `Event::PlaylistLoaded` for
-/// the artist's own auto-generated playlist — 15 is enough, so there is no "show all" beyond
-/// it). `id_salt` resets the page to 0 per list — the artist id, so paging through one artist's
-/// songs does not leave a later one's opened mid-page.
+/// Paged instead of wrapped — for a short, bounded list where growing indefinitely tall would be
+/// worse than paging: an artist's Top Songs, expanded past the 5 the page embeds up to a cap of
+/// 15 (see `App`'s handling of `Event::PlaylistLoaded` for the artist's own auto-generated
+/// playlist — 15 is enough, so there is no "show all" beyond it). `id_salt` resets the page to 0
+/// per list — the artist id, so paging through one artist's songs does not leave a later one's
+/// opened mid-page.
 ///
 /// 3 columns × 5 rows is the target: wide enough for that and the full 15 shows at once with no
 /// arrows at all. Only a narrower window — fewer columns fitting — needs them.
@@ -875,11 +796,10 @@ pub(crate) fn track_shelf_pages(
                 active: is_active(now, &t.video_id),
                 playing: is_active(now, &t.video_id) && !now.paused,
                 badge: None,
-                shape: if t.wide {
-                    widgets::ArtShape::Wide
-                } else {
-                    widgets::ArtShape::Square
-                },
+                // Square, always: `t.wide` marks a music video for playback (the resolver
+                // swaps in an audio-only id), but the cover art in a song list is the
+                // album/playlist art and a 16:9 slot only crops it.
+                shape: widgets::ArtShape::Square,
                 thumbnail: t.thumbnail.as_ref(),
                 menu: Some(widgets::RowMenu {
                     track: t,
@@ -908,19 +828,20 @@ pub(crate) fn entry_grid(
     backend: &Backend,
     now: &crate::player::NowPlaying,
     items: &[Entry],
-    playlists: &[crate::model::PlaylistRef],
-    signed_in: bool,
+    ctx: &ReleaseCtx<'_>,
 ) -> GridOutcome {
     let mut clicked = None;
     let mut played = None;
+    let mut link = None;
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
         for (i, item) in items.iter().enumerate() {
-            let card = grid_card(
-                ui, palette, images, backend, now, item, playlists, signed_in,
-            );
+            let card = grid_card(ui, palette, images, backend, now, item, ctx);
             if action.is_none() {
                 action = card.action;
+            }
+            if link.is_none() {
+                link = card.link;
             }
             if card.play {
                 played = Some(i);
@@ -932,6 +853,7 @@ pub(crate) fn entry_grid(
     GridOutcome {
         clicked,
         played,
+        link,
         action,
         more: false,
     }
@@ -947,8 +869,7 @@ fn grid_card(
     backend: &Backend,
     now: &crate::player::NowPlaying,
     item: &Entry,
-    playlists: &[crate::model::PlaylistRef],
-    signed_in: bool,
+    ctx: &ReleaseCtx<'_>,
 ) -> CardOutcome {
     // A video still is 16:9: it gets the wide card and a server-side 16:9 crop, so it
     // looks like a video instead of a squashed square.
@@ -1007,25 +928,64 @@ fn grid_card(
         Entry::Song(t) | Entry::Video(t) => Some(widgets::CardMenu::Track(widgets::RowMenu {
             track: t,
             playlist_id: None,
-            playlists,
-            signed_in,
+            playlists: ctx.playlists,
+            signed_in: ctx.signed_in,
             queue_index: None,
         })),
         Entry::Artist(a) => Some(widgets::CardMenu::Artist(a)),
-        Entry::Album(a) => Some(widgets::CardMenu::Release {
-            title: &a.title,
-            share_id: &a.id,
-        }),
-        Entry::Playlist(p) => Some(widgets::CardMenu::Release {
-            title: &p.title,
-            share_id: &p.id,
-        }),
+        // A release card builds the page menu from what it knows; the tracks fill in once the
+        // right-click prefetch below lands them in the caches.
+        Entry::Album(a) => {
+            let cached = ctx.albums.get(&a.id);
+            Some(widgets::CardMenu::Release(widgets::ReleaseMenu {
+                page_id: &a.id,
+                tracks: cached.map(|al| al.tracks.as_slice()).unwrap_or_default(),
+                radio_id: cached.and_then(|al| al.like_id.as_deref()),
+                artist_id: None,
+                playlists: ctx.playlists,
+                signed_in: ctx.signed_in,
+                share_url: crate::model::album_url(&a.id),
+                manage: false,
+                remove_from_library: false,
+            }))
+        }
+        Entry::Playlist(p) => {
+            let cached = ctx.rail.get(&p.id);
+            Some(widgets::CardMenu::Release(widgets::ReleaseMenu {
+                page_id: &p.id,
+                tracks: cached
+                    .map(|pl| pl.tracks.items.as_slice())
+                    .unwrap_or_default(),
+                radio_id: matches!(p.source, crate::model::PlaylistSource::YouTube)
+                    .then_some(p.id.as_str()),
+                artist_id: p.author_id.as_deref(),
+                playlists: ctx.playlists,
+                signed_in: ctx.signed_in,
+                share_url: crate::model::playlist_url(&p.id),
+                manage: p.editable,
+                remove_from_library: false,
+            }))
+        }
         Entry::Mood(_) => None,
     };
     let subtitle = if visible {
         item.subtitle()
     } else {
         String::new()
+    };
+    // A song/video card body obeys double-click-to-play: a single click selects, a double click
+    // plays. Album, playlist and artist cards always open on a single click — navigation is not
+    // playback — and every card's corner play button stays a single click.
+    let track_id = match item {
+        Entry::Song(t) | Entry::Video(t) => Some(t.video_id.as_str()),
+        _ => None,
+    };
+    let selected = track_id.is_some_and(|id| widgets::is_selected(ui.ctx(), id));
+    // The album a song card opens. The card body is the target now, so the title carries no
+    // separate link of its own.
+    let album_id = match item {
+        Entry::Song(t) | Entry::Video(t) => t.album_id.as_deref(),
+        _ => None,
     };
     let hit = widgets::art_card(
         ui,
@@ -1037,10 +997,45 @@ fn grid_card(
         shape,
         menu,
         playing,
+        selected,
     );
+    // A song card opens the album (or single) it belongs to, the same way an album, playlist or
+    // artist card opens its page: the body click navigates and the corner play button is what
+    // plays it in place. Only a song with no album id — rare now that the menu fills them in —
+    // keeps the old play/select click, because it has no page to open. Videos carry no album id,
+    // so their behaviour is unchanged.
+    let navigated = album_id.is_some() && hit.response.clicked();
+    let link = if navigated {
+        album_id.map(|id| Route::Album(id.to_owned()))
+    } else {
+        None
+    };
+    let clicked = if navigated {
+        false
+    } else {
+        match track_id {
+            Some(id) => widgets::activate(ui.ctx(), &hit.response, id),
+            None => hit.response.clicked(),
+        }
+    };
+    // Right-clicking a release opens its menu; fetch its tracks once so the mix, queue and save
+    // items can appear without leaving the card — the same fill-in the rail's menu does.
+    if hit.response.secondary_clicked() {
+        match item {
+            Entry::Album(a) if !ctx.albums.contains_key(&a.id) => backend.fetch_album(a.id.clone()),
+            Entry::Playlist(p)
+                if matches!(p.source, crate::model::PlaylistSource::YouTube)
+                    && !ctx.rail.contains_key(&p.id) =>
+            {
+                backend.fetch_playlist(p.id.clone());
+            }
+            _ => {}
+        }
+    }
     CardOutcome {
-        clicked: hit.response.clicked(),
+        clicked,
         play: hit.play,
+        link,
         action: hit.action,
     }
 }
@@ -1050,6 +1045,8 @@ struct CardOutcome {
     clicked: bool,
     /// See `widgets::CardClick::play` — wins over `clicked`.
     play: bool,
+    /// The card's title link was clicked: navigate here. Wins over `clicked`.
+    link: Option<Route>,
     action: Option<RowAction>,
 }
 
@@ -1059,6 +1056,8 @@ pub(crate) struct GridOutcome {
     /// The card whose corner play button specifically was clicked — wins over `clicked`, the
     /// same way a row's title link wins over its own click.
     pub played: Option<usize>,
+    /// A card's title link was clicked: navigate here. Wins over `played` and `clicked`.
+    pub link: Option<Route>,
     pub action: Option<RowAction>,
     /// The carousel's More pill was pressed. Grids have no More pill, so theirs is `false`.
     pub more: bool,
@@ -1086,12 +1085,12 @@ pub(crate) fn carousel(
     title: &str,
     salt: impl std::hash::Hash + std::fmt::Debug + Copy,
     items: &[Entry],
-    playlists: &[crate::model::PlaylistRef],
-    signed_in: bool,
+    ctx: &ReleaseCtx<'_>,
     more: Option<Route>,
 ) -> GridOutcome {
     let mut clicked = None;
     let mut played = None;
+    let mut link = None;
     let mut action = None;
     let mut more_pressed = false;
 
@@ -1145,11 +1144,12 @@ pub(crate) fn carousel(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for (i, item) in items.iter().enumerate() {
-                let card = grid_card(
-                    ui, palette, images, backend, now, item, playlists, signed_in,
-                );
+                let card = grid_card(ui, palette, images, backend, now, item, ctx);
                 if action.is_none() {
                     action = card.action;
+                }
+                if link.is_none() {
+                    link = card.link;
                 }
                 if card.play {
                     played = Some(i);
@@ -1164,6 +1164,7 @@ pub(crate) fn carousel(
     GridOutcome {
         clicked,
         played,
+        link,
         action,
         more: more_pressed,
     }
@@ -1274,11 +1275,6 @@ pub(crate) fn shelf(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf)
         return;
     }
 
-    if shelf.is_track_list() {
-        shelf_tracks(app, ui, shelf);
-        return;
-    }
-
     let signed_in = app.signed_in();
     let grid = {
         let crate::app::App {
@@ -1287,18 +1283,17 @@ pub(crate) fn shelf(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf)
             backend,
             now,
             library,
+            rail_cache,
+            album_cache,
             ..
         } = app;
-        entry_grid(
-            ui,
-            palette,
-            images,
-            backend,
-            now,
-            &shelf.items,
-            &library.playlists.items,
+        let ctx = ReleaseCtx {
+            playlists: &library.playlists.items,
             signed_in,
-        )
+            rail: rail_cache,
+            albums: album_cache,
+        };
+        entry_grid(ui, palette, images, backend, now, &shelf.items, &ctx)
     };
     finish_grid(app, shelf, grid);
 }
@@ -1325,11 +1320,6 @@ pub(crate) fn shelf_carousel(
         }
         return;
     }
-    if shelf.is_track_list() {
-        // Ranked or not, a list of songs is rows — the carousel is for cards.
-        shelf_tracks(app, ui, shelf);
-        return;
-    }
 
     let signed_in = app.signed_in();
     let grid = {
@@ -1339,8 +1329,16 @@ pub(crate) fn shelf_carousel(
             backend,
             now,
             library,
+            rail_cache,
+            album_cache,
             ..
         } = app;
+        let ctx = ReleaseCtx {
+            playlists: &library.playlists.items,
+            signed_in,
+            rail: rail_cache,
+            albums: album_cache,
+        };
         carousel(
             ui,
             palette,
@@ -1352,8 +1350,7 @@ pub(crate) fn shelf_carousel(
             // per-shelf-per-frame `format!` a joined string needed.
             (page_salt, shelf.title.as_str()),
             &shelf.items,
-            &library.playlists.items,
-            signed_in,
+            &ctx,
             more.clone(),
         )
     };
@@ -1466,18 +1463,17 @@ fn draw_shelf_grid(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) 
             backend,
             now,
             library,
+            rail_cache,
+            album_cache,
             ..
         } = app;
-        entry_grid(
-            ui,
-            palette,
-            images,
-            backend,
-            now,
-            &shelf.items,
-            &library.playlists.items,
+        let ctx = ReleaseCtx {
+            playlists: &library.playlists.items,
             signed_in,
-        )
+            rail: rail_cache,
+            albums: album_cache,
+        };
+        entry_grid(ui, palette, images, backend, now, &shelf.items, &ctx)
     };
     finish_grid(app, shelf, grid);
 }
@@ -1983,63 +1979,102 @@ pub(crate) fn info_popup(app: &mut crate::app::App, ui: &mut egui::Ui) {
     let Some(text) = app.page_info.clone() else {
         return;
     };
-    let mut open = true;
-    egui::Window::new("Info")
-        .collapsible(false)
-        .resizable(false)
-        .max_width(520.0)
-        .open(&mut open)
-        .show(ui.ctx(), |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(420.0)
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(text)
-                            .font(theme::regular(13.0))
-                            .color(app.palette.secondary),
-                    );
-                });
-        });
-    if !open {
-        app.page_info = None;
-    }
-}
-
-/// A shelf that is all songs, as track rows — shared by the wrapped and carousel layouts,
-///
-/// which is why a ranked "Top songs" shelf plays the same wherever it appears.
-fn shelf_tracks(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) {
-    let tracks = shelf.tracks();
-    let signed_in = app.signed_in();
-    let clicked = {
-        let crate::app::App {
-            palette,
-            images,
-            backend,
-            stats,
-            now,
-            library,
-            ..
-        } = app;
-        track_shelf_rows(
-            ui,
-            palette,
-            images,
-            backend,
-            stats,
-            now,
-            &tracks,
-            &library.playlists.items,
-            signed_in,
-        )
+    let Some(screen) = ui.ctx().input(|i| i.raw.screen_rect) else {
+        return;
     };
-    match clicked.click {
-        Some(ListClick::Row(i)) => app.start_from(tracks, i),
-        Some(ListClick::Link(route)) => app.navigate(route),
-        None => {}
-    }
-    if let Some(action) = clicked.action {
-        app.row_action(action);
+    let palette = app.palette;
+
+    // Size the card to the text, within bounds: a one-line bio gets a small card, a long one
+    // scrolls instead of growing past the screen. Measured here, at the width the body will
+    // actually wrap at, rather than guessed.
+    let width = 480.0_f32.min(screen.width() - 40.0);
+    let text_h = ui
+        .fonts_mut(|f| {
+            f.layout(
+                text.clone(),
+                theme::regular(13.0),
+                palette.secondary,
+                width - 32.0,
+            )
+        })
+        .size()
+        .y;
+    let height = (text_h + 96.0).clamp(150.0, (screen.height() - 80.0).min(460.0));
+
+    let mut dismissed = false;
+    let mut close = false;
+    egui::Area::new(egui::Id::new("ytm-info-modal"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .interactable(true)
+        .show(ui.ctx(), |ui| {
+            let (full, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            ui.painter()
+                .rect_filled(full, 0.0, egui::Color32::from_black_alpha(150));
+            if response.clicked() {
+                dismissed = true;
+            }
+
+            // Centered, a hair above true centre so it clears the player bar — the same modal
+            // shape the new-playlist card uses, so the two cannot drift apart.
+            let card = egui::Rect::from_center_size(
+                full.center() - egui::vec2(0.0, 12.0),
+                egui::vec2(width, height),
+            );
+            let mut card_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(card)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            {
+                let painter = card_ui.painter();
+                // The theme's soft shadow, stepped: three expanding translucent rects read as
+                // one blur at these alphas.
+                for (grow, alpha) in [(14.0, 24), (7.0, 40), (2.0, 60)] {
+                    painter.rect_filled(
+                        card.expand(grow),
+                        egui::CornerRadius::same(theme::RADIUS + 2 + grow as u8),
+                        egui::Color32::from_black_alpha(alpha),
+                    );
+                }
+                painter.rect_filled(
+                    card,
+                    egui::CornerRadius::same(theme::RADIUS + 2),
+                    palette.overlay,
+                );
+
+                let mut body = card_ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(card.shrink(16.0))
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                body.label(
+                    egui::RichText::new("Info")
+                        .font(theme::semibold(15.0))
+                        .color(palette.text),
+                );
+                body.add_space(6.0);
+                let scroll_h = (card.height() - 90.0).max(60.0);
+                egui::ScrollArea::vertical()
+                    .max_height(scroll_h)
+                    .show(&mut body, |ui| {
+                        ui.label(
+                            egui::RichText::new(text)
+                                .font(theme::regular(13.0))
+                                .color(palette.secondary),
+                        );
+                    });
+                body.allocate_ui(egui::vec2(body.available_width(), 30.0), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if widgets::chip(ui, &palette, "Close", true).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            }
+        });
+    if dismissed || close || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.page_info = None;
     }
 }
 
@@ -2149,7 +2184,7 @@ pub(crate) fn entry_row_spec<'a>(
 
 /// Every entry kind rendered as one plain full-width row list, never cards — History's dated
 /// shelves want this even for a shelf that is entirely songs, unlike Home/Explore's shelves,
-/// which wrap song shelves into a card grid instead (`shelf_tracks`/`track_shelf_rows`).
+/// which render every kind as cards.
 pub(crate) fn entry_rows(app: &mut crate::app::App, ui: &mut egui::Ui, items: &[Entry]) {
     let signed_in = app.signed_in();
     let clicked = {
@@ -2191,9 +2226,17 @@ fn finish_grid(app: &mut crate::app::App, shelf: &Shelf, grid: GridOutcome) {
     if let Some(action) = grid.action {
         app.row_action(action);
     }
+    // A song card's title link wins over everything else: the listener asked for the album.
+    if let Some(route) = grid.link {
+        app.navigate(route);
+        return;
+    }
     // The corner play button specifically: an album/playlist plays directly instead of opening
-    // its page, matching what the button visually promises. Any other kind (a mood chip has no
-    // play button to press) falls through to the ordinary click below, unaffected.
+    // its page, matching what the button visually promises. A song/video card has no page to
+    // open, so it queues the shelf at its own index — the same thing its body click does below,
+    // which is why the button must be handled here rather than falling through: `played` wins
+    // over `clicked` in `entry_grid`/`carousel`, so for a song there is no clicked click left
+    // to fall back on. Any other kind (a mood chip has no play button to press) falls through.
     if let Some(i) = grid.played
         && let Some(item) = shelf.items.get(i)
     {
@@ -2204,6 +2247,13 @@ fn finish_grid(app: &mut crate::app::App, shelf: &Shelf, grid: GridOutcome) {
             }
             Entry::Playlist(p) => {
                 app.play_playlist(p.id.clone());
+                return;
+            }
+            Entry::Song(_) | Entry::Video(_) => {
+                let tracks = shelf.tracks();
+                if let Some(index) = shelf.track_index(i) {
+                    app.start_from(tracks, index);
+                }
                 return;
             }
             _ => {}
@@ -2404,6 +2454,25 @@ mod tests {
     #[test]
     fn an_empty_list_has_an_empty_range() {
         assert!(visible_range(0.0, 0.0, 560.0, ROW, 0).is_empty());
+    }
+
+    /// The scroll extent must be the whole list no matter which slice is drawn — the mismatch
+    /// between the spacers (`row_h` per skipped row) and the drawn rows (each paying an extra
+    /// `item_spacing`) is what made the sidebar and queue jitter and overshoot at the bottom.
+    #[test]
+    fn the_scroll_extent_does_not_depend_on_the_drawn_slice() {
+        let pitch = row_pitch(ROW, 6.0);
+        let count = 5000;
+        let whole = count as f32 * pitch;
+        for (first, last) in [(0, 12), (98, 112), (100, 116), (4988, 5000), (0, 5000)] {
+            let (top, bottom) = virtual_spacers(first, last, count, pitch);
+            let drawn = (last - first) as f32 * pitch;
+            let total = top + drawn + bottom;
+            assert!(
+                (total - whole).abs() < 0.01,
+                "{first}..{last}: extent {total} != {whole}"
+            );
+        }
     }
 
     /// Carousel paging never leaves its rails: a step past either end clamps, and a view

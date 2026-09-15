@@ -192,6 +192,8 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                 manage: false,
                 remove_from_library: false,
                 context_only: false,
+                // The page has its own Mix button; a menu mix would be a second one.
+                radio_id: None,
                 save_as_new: None,
             },
         );

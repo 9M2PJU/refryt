@@ -68,9 +68,24 @@ impl Player {
             // miss just re-reads from the network, which the forward cache already does past
             // its own edge. 4 MiB is a few minutes of Opus — plenty for a scrub-back.
             init.set_property("demuxer-max-back-bytes", "4MiB")?;
-            // We resolve stream URLs ourselves via refryt-resolve; mpv must not invoke yt-dlp.
-            init.set_property("ytdl", "no")?;
+            // We resolve stream URLs ourselves via refryt-resolve, so mpv must not invoke
+            // yt-dlp for them — direct `googlevideo.com` URLs never match ytdl_hook's
+            // `youtube.com` patterns, so enabling the hook costs nothing there. The in-app
+            // music video *does* need it, and mpv reads `ytdl` and the hook's own path only
+            // here, at init: setting them later is silently ignored, which is exactly why the
+            // video view never started until the hook was armed once, up front.
+            init.set_property("ytdl", "yes")?;
+            init.set_property(
+                "script-opts",
+                format!("ytdl_hook-ytdl_path={}", crate::backend::yt_dlp_program()),
+            )?;
             init.set_property("terminal", "no")?;
+            // Diagnostic hatch for the video path, whose failures mpv reports only in its own
+            // log: point `REFRYT_MPV_LOG` at a file to capture it.
+            if let Ok(path) = std::env::var("REFRYT_MPV_LOG") {
+                let _ = init.set_property("log-file", path);
+                let _ = init.set_property("msg-level", "all=v");
+            }
             Ok(())
         })
         .context("could not initialise libmpv")
@@ -161,8 +176,26 @@ pub fn load(
     };
     let _ = mpv.set_property("volume", (volume * gain).clamp(0.0, 130.0));
     let _ = mpv.set_property("pause", false);
+    // Audio-only again, in case the video view just handed playback back. `vo` stays `libmpv`
+    // from the video path, but with `vid=no` there is no video for it to initialise.
+    let _ = mpv.set_property("vid", "no");
     mpv.command("loadfile", &[url, "replace"])
         .context("mpv refused the stream URL")
+}
+
+/// Load a music video. Unlike [`load`], mpv fetches it itself through its yt-dlp hook — armed
+/// once in [`Player::init`], since mpv ignores `ytdl` set any later. The app's resolver only
+/// returns audio-only streams, so the video has to come from the hook.
+pub fn load_video(mpv: &Mpv, watch_url: &str, volume: f64) -> Result<()> {
+    // The software render context was created before this call, and `libmpv` is the vo that
+    // hands frames to it. Without this the file plays into nothing and every frame is black.
+    let _ = mpv.set_property("vo", "libmpv");
+    let _ = mpv.set_property("vid", "auto");
+    let _ = mpv.set_property("audio-display", "no");
+    let _ = mpv.set_property("volume", volume.clamp(0.0, 130.0));
+    let _ = mpv.set_property("pause", false);
+    mpv.command("loadfile", &[watch_url, "replace"])
+        .context("mpv refused the video URL")
 }
 
 /// What the player bar shows about the track currently loaded.

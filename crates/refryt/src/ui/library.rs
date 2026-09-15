@@ -46,6 +46,11 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             local_folder_browser(app, ui);
             return;
         }
+        // Downloads are on disk, so they need neither sign-in nor a server round trip either.
+        if app.rail_filter == RailFilter::Downloads {
+            downloads_list(app, ui);
+            return;
+        }
 
         match &app.auth {
             AuthState::SignedIn { .. } => content(app, ui),
@@ -68,7 +73,7 @@ fn skeletons(app: &App, ui: &mut egui::Ui) {
         }
         // Local never shows this: it has its own loading state (`app.local_scanning`), since
         // it isn't gated by `library_loading`/`library_loaded` at all.
-        RailFilter::Local => widgets::skeleton_rows(ui, &app.palette, 8),
+        RailFilter::Local | RailFilter::Downloads => widgets::skeleton_rows(ui, &app.palette, 8),
     }
 }
 
@@ -148,6 +153,57 @@ fn content(app: &mut App, ui: &mut egui::Ui) {
         // `page()` never calls `content()` for `Local` — handled by `local_folder_browser`
         // before the auth check `content()` sits behind, since Local needs neither.
         RailFilter::Local => unreachable!("Local is intercepted in page() before content()"),
+        RailFilter::Downloads => {
+            unreachable!("Downloads is intercepted in page() before content()")
+        }
+    }
+}
+
+/// The Library's Downloads tab: the songs saved to `~/Music/refryt`, played from disk. A row's
+/// own ••• menu offers Remove download (the menu reads the downloaded set published each frame).
+fn downloads_list(app: &mut App, ui: &mut egui::Ui) {
+    if app.downloads.entries.is_empty() {
+        centered(
+            app,
+            ui,
+            "Nothing downloaded yet. Use a song's ••• menu to save it for offline listening.",
+        );
+        return;
+    }
+    let tracks = app.downloads.tracks();
+    let signed_in = app.signed_in();
+    let out = {
+        let App {
+            palette,
+            images,
+            backend,
+            now,
+            library,
+            stats,
+            ..
+        } = app;
+        crate::ui::track_rows(
+            ui,
+            palette,
+            images,
+            backend,
+            stats,
+            now,
+            &tracks,
+            false,
+            None,
+            &library.playlists.items,
+            signed_in,
+            false,
+        )
+    };
+    if let Some(action) = out.action {
+        app.row_action(action);
+    }
+    match out.click {
+        Some(crate::ui::ListClick::Row(i)) => app.start_from(tracks, i),
+        Some(crate::ui::ListClick::Link(route)) => app.navigate(route),
+        None => {}
     }
 }
 
@@ -272,6 +328,7 @@ fn artist_grid(app: &mut App, ui: &mut egui::Ui) {
                 widgets::ArtShape::Circle,
                 None,
                 false,
+                false,
             )
             .response
             .clicked()
@@ -293,6 +350,7 @@ fn artist_grid(app: &mut App, ui: &mut egui::Ui) {
 
 fn album_grid(app: &mut App, ui: &mut egui::Ui) {
     let mut clicked = None;
+    let mut played = None;
     let mut last_visible = false;
     ui.horizontal_wrapped(|ui| {
         let count = app.library.albums.len();
@@ -324,7 +382,7 @@ fn album_grid(app: &mut App, ui: &mut egui::Ui) {
                 .as_ref()
                 .is_some_and(|t| t.album_id.as_deref() == Some(al.id.as_str()))
                 && !app.now.paused;
-            if widgets::art_card(
+            let card = widgets::art_card(
                 ui,
                 &app.palette,
                 CARD_W,
@@ -334,16 +392,24 @@ fn album_grid(app: &mut App, ui: &mut egui::Ui) {
                 widgets::ArtShape::Square,
                 None,
                 playing,
-            )
-            .response
-            .clicked()
-            {
+                false,
+            );
+            // The corner button plays the album; a click anywhere else opens it.
+            if card.play {
+                played = Some(i);
+            } else if card.response.clicked() {
                 clicked = Some(i);
             }
         }
     });
     if last_visible {
         app.load_more_library(LibrarySection::Albums);
+    }
+    if let Some(i) = played
+        && let Some(album) = app.library.albums.items.get(i)
+    {
+        let id = album.id.clone();
+        app.play_album(id);
     }
     if let Some(i) = clicked
         && let Some(album) = app.library.albums.items.get(i)
@@ -355,6 +421,7 @@ fn album_grid(app: &mut App, ui: &mut egui::Ui) {
 
 fn playlist_grid(app: &mut App, ui: &mut egui::Ui) {
     let mut clicked = None;
+    let mut played = None;
     let mut last_visible = false;
     ui.horizontal_wrapped(|ui| {
         let count = app.library.playlists.len();
@@ -378,7 +445,7 @@ fn playlist_grid(app: &mut App, ui: &mut egui::Ui) {
             // Name only. These are all your own playlists, so the line underneath was either
             // your own account name or a track count — the same shape under all 25 cards, and
             // nothing you pick a playlist by.
-            if widgets::art_card(
+            let card = widgets::art_card(
                 ui,
                 &app.palette,
                 CARD_W,
@@ -388,16 +455,24 @@ fn playlist_grid(app: &mut App, ui: &mut egui::Ui) {
                 widgets::ArtShape::Square,
                 None,
                 false,
-            )
-            .response
-            .clicked()
-            {
+                false,
+            );
+            // The corner button plays the playlist; a click anywhere else opens it.
+            if card.play {
+                played = Some(i);
+            } else if card.response.clicked() {
                 clicked = Some(i);
             }
         }
     });
     if last_visible {
         app.load_more_library(LibrarySection::Playlists);
+    }
+    if let Some(i) = played
+        && let Some(pl) = app.library.playlists.items.get(i)
+    {
+        let id = pl.id.clone();
+        app.play_playlist(id);
     }
     if let Some(i) = clicked
         && let Some(pl) = app.library.playlists.items.get(i)
@@ -553,6 +628,8 @@ fn local_folder_grid(
                 manage: false,
                 remove_from_library: false,
                 context_only: true,
+                // A folder of local files has no YouTube radio id.
+                radio_id: None,
                 save_as_new: Some(name.as_str()),
             };
             let click = widgets::folder_card(ui, &app.palette, CARD_W, name, tracks.len(), menu);

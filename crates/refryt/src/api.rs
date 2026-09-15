@@ -405,6 +405,27 @@ impl Api {
         self.search_filtered(query).await
     }
 
+    /// Autocomplete suggestions for the search field. Works signed out. `ytmapi-rs` already wraps
+    /// `music/get_search_suggestions`; this just flattens its formatted runs back to plain text.
+    pub async fn suggestions(&self, query: &str) -> Result<Vec<String>> {
+        let client = self.client_ref().await?;
+        let items = match client {
+            ClientRef::NoAuth(yt) => yt.get_search_suggestions(query).await,
+            ClientRef::Browser(yt) => yt.get_search_suggestions(query).await,
+        }
+        .with_context(|| format!("could not fetch suggestions for {query}"))?;
+        Ok(items
+            .into_iter()
+            .map(|s| {
+                s.runs
+                    .into_iter()
+                    .map(ytmapi_rs::common::TextRun::take_text)
+                    .collect::<String>()
+            })
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
     /// A dedicated, category-specific search — never called for [`model::SearchScope::All`],
     /// which stays the one cross-type ranked request `search` already makes (see that type's
     /// own doc comment for why the two are not the same request with the results split up
@@ -1072,6 +1093,9 @@ impl Api {
             ClientRef::NoAuth(_) => anyhow::bail!("sign in to subscribe"),
             ClientRef::Browser(yt) => yt.json_query(query).await,
         };
+        if let Err(e) = &json {
+            note_write_failure("subscribe", channel_id, e);
+        }
         json.map(|_| ())
             .with_context(|| format!("could not update the subscription to {channel_id}"))
     }
@@ -1240,6 +1264,22 @@ impl Api {
         Ok(queue)
     }
 
+    /// Radio for a playlist or album — the playlist-based counterpart of [`mix`]. Same `next`
+    /// call and same queue shape; only the id prefix differs (`RDAMPL`). Works signed out.
+    pub async fn mix_playlist(&self, playlist_id: &str) -> Result<innertube::WatchQueue> {
+        let query = NextQuery::playlist_radio(playlist_id);
+        let json = match self.client_ref().await? {
+            ClientRef::NoAuth(yt) => run_next_json(&yt, query).await,
+            ClientRef::Browser(yt) => run_next_json(&yt, query).await,
+        }?;
+        dump("REFRYT_DUMP_NEXT", &json);
+        let queue = innertube::parse_watch_queue(&json);
+        if queue.tracks.is_empty() {
+            anyhow::bail!("YouTube returned an empty watch queue for {playlist_id}");
+        }
+        Ok(queue)
+    }
+
     /// The next ~50 tracks of a radio river, following a `nextRadioContinuationData` token.
     /// Works signed out.
     pub async fn mix_more(&self, token: &str) -> Result<innertube::WatchQueue> {
@@ -1297,6 +1337,9 @@ impl Api {
             ClientRef::NoAuth(_) => anyhow::bail!("sign in to like songs"),
             ClientRef::Browser(yt) => yt.json_query(query).await,
         };
+        if let Err(e) = &json {
+            note_write_failure("rate", video_id, e);
+        }
         json.map(|_| ())
             .with_context(|| format!("could not rate {video_id}"))
     }
@@ -1312,9 +1355,13 @@ impl Api {
         let json = match self.client_ref().await? {
             ClientRef::NoAuth(_) => anyhow::bail!("sign in to save albums"),
             ClientRef::Browser(yt) => yt.json_query(query).await,
+        };
+        if let Err(e) = &json {
+            note_write_failure("save", playlist_id, e);
         }
-        .map(ytmapi_rs::json::Json::into_inner)
-        .with_context(|| format!("could not update the playlist {playlist_id}"))?;
+        let json = json
+            .map(ytmapi_rs::json::Json::into_inner)
+            .with_context(|| format!("could not update the playlist {playlist_id}"))?;
         dump("REFRYT_DUMP_RATE", &json);
         Ok(())
     }
@@ -1330,6 +1377,9 @@ impl Api {
             ClientRef::NoAuth(_) => anyhow::bail!("sign in to save songs"),
             ClientRef::Browser(yt) => yt.json_query(query).await,
         };
+        if let Err(e) = &json {
+            note_write_failure("library", token, e);
+        }
         json.map(|_| ())
             .with_context(|| "could not update the library".to_owned())
     }
@@ -1579,6 +1629,23 @@ impl NextQuery {
         Self {
             video_id: Some(video_id.to_owned()),
             playlist_id: Some(format!("RDAMVM{video_id}")),
+            params: Some("wAEB".to_owned()),
+            continuation: None,
+        }
+    }
+
+    /// Radio for a playlist or album: the playlist-based counterpart of `mix_for`, `RDAMPL` +
+    /// the bare playlist id, with `wAEB` asking `next` to randomise it (the same convention
+    /// YouTube Music's own "Start radio" follows, and what ytmusicapi calls radio). The id must
+    /// be bare — no `VL` — and for an album it is the play button's `audioPlaylistId`, not the
+    /// `MPREb_` browse id.
+    fn playlist_radio(playlist_id: &str) -> Self {
+        Self {
+            video_id: None,
+            playlist_id: Some(format!(
+                "RDAMPL{}",
+                crate::model::bare_playlist_id(playlist_id)
+            )),
             params: Some("wAEB".to_owned()),
             continuation: None,
         }
@@ -2058,6 +2125,37 @@ fn dump(var: &str, json: &serde_json::Value) {
     }
 }
 
+/// Record a refused write, so the server's own words survive.
+///
+/// The writes — rate, save-to-library, save-to-playlist, subscribe — are the paths that fail
+/// with only a generic toast, and the reason (a rotated session, an endpoint YouTube no longer
+/// accepts, a wrong id) lives in `ytmapi-rs`'s error, which carries InnerTube's `code` and
+/// `message`. This prints the whole chain at `error` (no `RUST_LOG` tuning needed) and, when
+/// `REFRYT_DUMP_WRITE` names a directory, writes one JSON file per operation to hand back.
+fn note_write_failure(op: &str, id: &str, error: &(dyn std::error::Error + 'static)) {
+    let mut chain = Vec::new();
+    let mut current = Some(error);
+    while let Some(e) = current {
+        chain.push(e.to_string());
+        current = e.source();
+    }
+    let full = chain.join(": ");
+    tracing::error!(op, id, error = %full, "write refused by YouTube");
+    let Ok(dir) = std::env::var("REFRYT_DUMP_WRITE") else {
+        return;
+    };
+    let payload = serde_json::json!({ "op": op, "id": id, "error": full, "causes": chain });
+    let path = std::path::Path::new(&dir).join(format!("refryt-write-{op}.json"));
+    match serde_json::to_vec_pretty(&payload) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                tracing::warn!(error = %e, path = %path.display(), "could not write the failure dump");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not encode the failure dump"),
+    }
+}
+
 /// The raw JSON for a search, so [`crate::innertube`] can read the shape `ytmapi-rs` cannot.
 async fn run_search_json<A: AuthToken>(yt: &YtMusic<A>, query: &str) -> Result<serde_json::Value> {
     let sq: SearchQuery<'_, BasicSearch> = query.into();
@@ -2221,10 +2319,10 @@ fn map_song(s: SearchResultSong) -> Track {
         video_id: s.video_id.get_raw().to_owned(),
         title: s.title,
         artists: vec![model::ArtistLink::plain(s.artist)],
-        album: s.album.map(|a| a.name),
-        // The filtered-search parser drops the album's browse id, so this row's album is not a
-        // link. It is a fallback path; the ranked one supplies both.
-        album_id: None,
+        album: s.album.as_ref().map(|a| a.name.clone()),
+        // The typed album carries its browse id too, so even this fallback path's title links to
+        // the album.
+        album_id: s.album.as_ref().map(|a| a.id.get_raw().to_owned()),
         duration: parse_duration(&s.duration),
         plays: non_empty(s.plays),
         explicit: is_explicit(&s.explicit),
@@ -2349,7 +2447,7 @@ fn map_artist(a: GetArtist) -> model::Artist {
                     // ArtistSong carries no duration; none is better than a fake one.
                     duration: None,
                     album: Some(song.album.name),
-                    album_id: None,
+                    album_id: Some(song.album.id.get_raw().to_owned()),
                     plays: non_empty(song.plays),
                     explicit: is_explicit(&song.explicit),
                     like: model::LikeStatus::Indifferent,
@@ -2496,7 +2594,8 @@ fn map_playlist_song(s: PlaylistSong) -> Track {
         title: s.title,
         artists: artist_links(&s.artists),
         album: Some(s.album.name),
-        album_id: None,
+        // The typed album carries its browse id, so a playlist row's title links too.
+        album_id: Some(s.album.id.get_raw().to_owned()),
         duration: parse_duration(&s.duration),
         plays: None,
         explicit: is_explicit(&s.explicit),
@@ -2623,5 +2722,28 @@ mod tests {
             assert!(headers.get("x-goog-pageid").is_none());
             assert!(headers.get("x-goog-authuser").is_none());
         }
+    }
+
+    /// A page "Start mix" seeds from the playlist, so its id is `RDAMPL` + the *bare* id (never
+    /// the `VL`-prefixed browse id) with `wAEB` asking `next` to randomise it — the same shape
+    /// `mix_for` uses for a song, and the convention YouTube Music's own radio follows.
+    #[test]
+    fn playlist_radio_uses_the_bare_id_and_wants_a_random_mix() {
+        let vl = NextQuery::playlist_radio("VLPLabc");
+        let body = ytmapi_rs::query::PostQuery::header(&vl);
+        assert_eq!(
+            body.get("playlistId").and_then(|v| v.as_str()),
+            Some("RDAMPLPLabc")
+        );
+        assert_eq!(body.get("params").and_then(|v| v.as_str()), Some("wAEB"));
+        assert!(body.get("videoId").is_none());
+
+        // An album is seeded by its audio playlist id, which passes through untouched.
+        let album = NextQuery::playlist_radio("OLAK5uy_x");
+        let body = ytmapi_rs::query::PostQuery::header(&album);
+        assert_eq!(
+            body.get("playlistId").and_then(|v| v.as_str()),
+            Some("RDAMPLOLAK5uy_x")
+        );
     }
 }

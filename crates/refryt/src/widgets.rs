@@ -67,6 +67,73 @@ fn state_fill(ui: &Ui, palette: &Palette, response: &egui::Response) -> Option<C
     (t > 0.001).then(|| palette.surface_hover.gamma_multiply(t))
 }
 
+/// The id the double-click-to-play flag is kept under in egui's memory.
+const DOUBLE_CLICK_KEY: &str = "ytm-double-click-play";
+
+/// The id the selected row/card's video id is kept under. Purely visual: a single click in
+/// double-click mode marks the row, and nothing else reads it.
+fn selection_key() -> egui::Id {
+    egui::Id::new("ytm-selection")
+}
+
+/// Publish the Settings toggle to egui's memory once a frame, so the row and card widgets can
+/// read it without every caller threading another bool through.
+pub(crate) fn set_double_click_play(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(DOUBLE_CLICK_KEY), on));
+}
+
+fn double_click_play(ctx: &egui::Context) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<bool>(egui::Id::new(DOUBLE_CLICK_KEY))
+            .unwrap_or(false)
+    })
+}
+
+fn selected(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|d| d.get_temp::<Option<String>>(selection_key()).flatten())
+}
+
+pub(crate) fn set_selected(ctx: &egui::Context, id: Option<String>) {
+    ctx.data_mut(|d| d.insert_temp(selection_key(), id));
+}
+
+/// Whether a row/card body click should play `id`, applying the double-click-to-play setting.
+///
+/// Off: any primary click plays, exactly as before. On: a single click just selects (marks the
+/// row, writes the selection) and a double click plays — so a stray click cannot start music.
+/// egui fires `clicked()` on the *first* click of a double too, which is why the double is
+/// tested before the single, and why callers must use this rather than `response.clicked()`.
+pub(crate) fn activate(ctx: &egui::Context, response: &egui::Response, id: &str) -> bool {
+    if !double_click_play(ctx) {
+        return response.clicked();
+    }
+    if response.double_clicked() {
+        return true;
+    }
+    if response.clicked() {
+        set_selected(ctx, Some(id.to_owned()));
+    }
+    false
+}
+
+/// Whether `id` is the row/card the listener last single-clicked (double-click-to-play mode).
+pub(crate) fn is_selected(ctx: &egui::Context, id: &str) -> bool {
+    double_click_play(ctx) && selected(ctx).as_deref() == Some(id)
+}
+
+/// The set of downloaded video ids, published once a frame by `App::ui` so the row menu can
+/// offer Download or Remove download without every caller threading the index through.
+pub(crate) fn set_downloaded(ctx: &egui::Context, ids: std::collections::HashSet<String>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ytm-downloaded"), ids));
+}
+
+fn is_downloaded(ctx: &egui::Context, id: &str) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<std::collections::HashSet<String>>(egui::Id::new("ytm-downloaded"))
+            .is_some_and(|ids| ids.contains(id))
+    })
+}
+
 /// A square icon button that lights up under the pointer and sinks when pressed.
 ///
 /// `active` is for toggles that have a persistent on state — the queue's list button is the
@@ -417,6 +484,10 @@ pub fn plain_subtitle(text: &str) -> Subtitle<'_> {
 pub struct RowClick<'a> {
     pub response: egui::Response,
     pub link: Option<LinkTarget<'a>>,
+    /// Whether the row's own body was activated to play — the double-click-to-play setting
+    /// applied. Callers must use this rather than `response.clicked()`, which is also true on
+    /// the single click of a double.
+    pub activate: bool,
     pub(crate) action: Option<super::ui::RowAction>,
 }
 
@@ -1354,8 +1425,23 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
     // flag, which would blink the highlight out as the pointer crosses them.
     let over = response.contains_pointer();
     let t = fade(ui, response.id.with("row"), over);
+    // Double-click-to-play: the row's own track is the id to select or play. A row without a
+    // menu (the queue's current row) is not a selectable list item, so it keeps the plain click.
+    let activate = match menu.as_ref() {
+        Some(m) => activate(ui.ctx(), &response, m.track.video_id.as_str()),
+        None => response.clicked(),
+    };
+    let selected = menu
+        .as_ref()
+        .is_some_and(|m| is_selected(ui.ctx(), m.track.video_id.as_str()));
     if ui.is_rect_visible(rect) {
         let radius = CornerRadius::same(theme::RADIUS);
+        // The selection (a single click in double-click mode) sits under the hover fill, so the
+        // marked row reads at rest and the pointer still lights it.
+        if selected {
+            ui.painter()
+                .rect_filled(rect, radius, palette.surface_active.gamma_multiply(0.55));
+        }
         if t > 0.001 {
             ui.painter()
                 .rect_filled(rect, radius, palette.surface_hover.gamma_multiply(t));
@@ -1575,6 +1661,7 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
     RowClick {
         response,
         link,
+        activate,
         action,
     }
 }
@@ -1685,6 +1772,35 @@ pub(crate) fn row_menu(
                 choice = Some(RowAction::ToggleLibrary(t.clone()));
                 mui.close();
             }
+            // Offline: a downloaded song offers removal, any other offers saving to disk. A
+            // user's own local file is already on disk, so neither applies.
+            if t.local_path.is_none() {
+                let downloaded = is_downloaded(mui.ctx(), &t.video_id);
+                if menu_item(
+                    mui,
+                    palette,
+                    if downloaded {
+                        Icon::Trash2
+                    } else {
+                        Icon::Download
+                    },
+                    if downloaded {
+                        "Remove download"
+                    } else {
+                        "Download"
+                    },
+                    None,
+                )
+                .clicked()
+                {
+                    choice = Some(if downloaded {
+                        RowAction::RemoveDownload(t.video_id.clone())
+                    } else {
+                        RowAction::Download(t.clone())
+                    });
+                    mui.close();
+                }
+            }
             if !targets.is_empty()
                 && let Some(playlist_id) = sub_menu(
                     mui,
@@ -1699,9 +1815,7 @@ pub(crate) fn row_menu(
                             .max_height(320.0)
                             .show(sui, |sui| {
                                 for pl in targets {
-                                    if menu_item(sui, palette, Icon::ListMusic, &pl.title, None)
-                                        .clicked()
-                                    {
+                                    if menu_item_plain(sui, palette, &pl.title, None).clicked() {
                                         picked = Some(pl.id.clone());
                                     }
                                 }
@@ -1783,6 +1897,10 @@ pub struct PageMenu<'a> {
     /// Opened from a right-click (the sidebar rail) rather than a ••• button: only a secondary
     /// click opens it, and a left click (which navigates) closes it instead of toggling.
     pub context_only: bool,
+    /// The playlist/album id to seed a page "Start mix" from (`RDAMPL`), when the page has one.
+    /// For an album this is its `audioPlaylistId`, not the browse id. `None` falls back to the
+    /// old first-song mix, which is all a page without a real playlist id (a folder) can do.
+    pub radio_id: Option<&'a str>,
     /// Offers "Save as playlist" first, above everything else, seeded with the whole page and
     /// defaulting to this name — the Local tab's folder cards, which aren't playlists until
     /// this is actually chosen. `None` everywhere else; the existing "Save to playlist"
@@ -1803,7 +1921,7 @@ pub(crate) fn page_menu(
     menu: PageMenu<'_>,
 ) -> Option<super::ui::RowAction> {
     use super::ui::RowAction;
-    let popup = egui::Popup::new(
+    let mut popup = egui::Popup::new(
         ui.id().with(("ytm-page-menu", menu.page_id)),
         ui.ctx().clone(),
         response,
@@ -1812,23 +1930,25 @@ pub(crate) fn page_menu(
     .kind(egui::PopupKind::Menu)
     .layout(egui::Layout::top_down_justified(egui::Align::Min))
     .width(MENU_WIDTH)
-    .gap(0.0)
-    // Toggle on primary click: this opens from a ••• button, not from a right-click like
-    // the row menus. Anchored to the button (not `at_pointer_fixed`): `Toggle` flips the
-    // open flag but records no pointer position, and a pointer-anchored popup with no
-    // recorded position never renders — the menu opened invisibly. The context-menu
-    // pattern (primary closes) would force it shut on the opening click instead.
-    .open_memory(if response.secondary_clicked() {
-        Some(egui::SetOpenCommand::Bool(true))
-    } else if menu.context_only {
-        // A rail context menu: the left click navigates, so it only closes the menu.
-        response
-            .clicked()
-            .then_some(egui::SetOpenCommand::Bool(false))
-    } else {
-        response.clicked().then_some(egui::SetOpenCommand::Toggle)
-    });
+    .gap(0.0);
+    // A right-click menu belongs at the pointer, like every row menu; a ••• button keeps the
+    // popup anchored to itself. `context_only` is exactly "opened from a right-click".
+    if menu.context_only {
+        popup = popup.at_pointer_fixed();
+    }
+    // Toggle on primary click: a ••• button opens on a primary click, so its popup cannot use
+    // the context-menu pattern (primary closes), which would force it shut on the opening click.
     popup
+        .open_memory(if response.secondary_clicked() {
+            Some(egui::SetOpenCommand::Bool(true))
+        } else if menu.context_only {
+            // A context menu: the left click navigates (or selects), so it only closes the menu.
+            response
+                .clicked()
+                .then_some(egui::SetOpenCommand::Bool(false))
+        } else {
+            response.clicked().then_some(egui::SetOpenCommand::Toggle)
+        })
         .show(|mui| {
             let mut choice = None;
             // Cloned on pick, not per frame: the menu borrows the page's tracks.
@@ -1844,7 +1964,14 @@ pub(crate) fn page_menu(
                 });
                 mui.close();
             }
-            if let Some(first) = menu.tracks.first()
+            // A page with a playlist/album id starts a mix of the whole thing; only a page
+            // without one (a folder) falls back to seeding from the first song.
+            if let Some(radio) = menu.radio_id {
+                if menu_item(mui, palette, Icon::Radio, "Start mix", None).clicked() {
+                    choice = Some(RowAction::StartMixPlaylist(radio.to_owned()));
+                    mui.close();
+                }
+            } else if let Some(first) = menu.tracks.first()
                 && menu_item(mui, palette, Icon::Radio, "Start mix", None).clicked()
             {
                 choice = Some(RowAction::StartMix(first.video_id.clone()));
@@ -1863,6 +1990,14 @@ pub(crate) fn page_menu(
                 }
                 if menu_item(mui, palette, Icon::ListPlus, "Add to queue", None).clicked() {
                     choice = Some(RowAction::PageQueue(tracks()));
+                    mui.close();
+                }
+                // Offline: save the whole page to disk. Only for YouTube tracks — a folder of
+                // local files is already on disk.
+                if menu.tracks.iter().all(|t| t.local_path.is_none())
+                    && menu_item(mui, palette, Icon::Download, "Download all", None).clicked()
+                {
+                    choice = Some(RowAction::DownloadMany(tracks()));
                     mui.close();
                 }
             }
@@ -1894,9 +2029,7 @@ pub(crate) fn page_menu(
                             .max_height(320.0)
                             .show(sui, |sui| {
                                 for pl in targets {
-                                    if menu_item(sui, palette, Icon::ListMusic, &pl.title, None)
-                                        .clicked()
-                                    {
+                                    if menu_item_plain(sui, palette, &pl.title, None).clicked() {
                                         picked = Some((pl.id.clone(), pl.title.clone()));
                                     }
                                 }
@@ -2105,6 +2238,8 @@ pub fn art_card(
     // The caller's own to compute (it has the entry `art_card` itself is never given) — see
     // `crate::ui::grid_card`'s own doc comment for how much of this it can actually tell today.
     playing: bool,
+    // The card the listener last single-clicked in double-click-to-play mode. Purely visual.
+    selected: bool,
 ) -> CardClick {
     let size = card_size(width, shape);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -2117,6 +2252,11 @@ pub fn art_card(
         // the whole card — button included — out from directly under the pointer. See `fade`'s
         // own doc comment; this is exactly the case it warns about.
         let t = fade(ui, response.id.with("lit"), response.contains_pointer());
+        // The single-click selection sits under the hover lift, same as a row's.
+        if selected {
+            ui.painter()
+                .rect_filled(rect, radius, palette.surface_active.gamma_multiply(0.55));
+        }
         if t > 0.001 {
             // Lifts: a fill plus a shadow underneath, both fading with the hover.
             ui.painter().add(egui::epaint::RectShape::filled(
@@ -2266,12 +2406,29 @@ pub enum CardMenu<'a> {
     Track(RowMenu<'a>),
     /// An artist card: what the artist's own menu on the site offers.
     Artist(&'a crate::model::ArtistRef),
-    /// An album or playlist card: what can be done with a whole release.
-    Release {
-        /// A name for the toast, and the id the menu shares.
-        title: &'a str,
-        share_id: &'a str,
-    },
+    /// An album or playlist card: the same menu the sidebar rail gives a playlist — mix,
+    /// queueing, saving, navigation and share.
+    Release(ReleaseMenu<'a>),
+}
+
+/// What an album/playlist card's menu is built from.
+///
+/// The page ··· menu and this share [`page_menu`]; the card simply knows less until the release
+/// is fetched. `tracks` starts empty and fills from the prefetch, at which point the queueing and
+/// save items appear — the same fill-in the rail's own context menu does.
+pub struct ReleaseMenu<'a> {
+    pub page_id: &'a str,
+    pub tracks: &'a [crate::model::Track],
+    /// The playlist/album id a "Start mix" seeds from (`RDAMPL`). `None` for an album whose
+    /// audio playlist id is not known yet.
+    pub radio_id: Option<&'a str>,
+    pub artist_id: Option<&'a str>,
+    pub playlists: &'a [crate::model::PlaylistRef],
+    pub signed_in: bool,
+    pub share_url: String,
+    /// An owned playlist: enables Edit/Delete.
+    pub manage: bool,
+    pub remove_from_library: bool,
 }
 
 /// A card's right-click menu, dispatched by what the card is.
@@ -2346,19 +2503,25 @@ fn card_menu(
                 })
                 .and_then(|r| r.inner)
         }
-        CardMenu::Release { title: _, share_id } => {
-            let popup = card_popup(ui, response, ("ytm-release-menu", share_id));
-            popup
-                .show(|mui| {
-                    let mut choice = None;
-                    if menu_item(mui, palette, Icon::Share2, "Share", None).clicked() {
-                        choice = Some(RowAction::Share(share_id.to_owned()));
-                        mui.close();
-                    }
-                    choice
-                })
-                .and_then(|r| r.inner)
-        }
+        CardMenu::Release(menu) => page_menu(
+            ui,
+            palette,
+            response,
+            PageMenu {
+                page_id: menu.page_id,
+                tracks: menu.tracks,
+                artist_id: menu.artist_id,
+                playlists: menu.playlists,
+                signed_in: menu.signed_in,
+                share_url: menu.share_url,
+                has_info: false,
+                manage: menu.manage,
+                remove_from_library: menu.remove_from_library,
+                context_only: true,
+                radio_id: menu.radio_id,
+                save_as_new: None,
+            },
+        ),
     }
 }
 
@@ -2466,10 +2629,14 @@ pub fn swatch_chip(
     chevron: bool,
 ) -> egui::Response {
     let font = theme::semibold(13.0);
+    // A long option name would otherwise size the trigger to the raw text and push it out of
+    // its row; ellipsise at a fixed maximum so the pill stays put.
+    const MAX_CHIP_LABEL: f32 = 180.0;
+    let label = truncate_to(ui, label, font.clone(), MAX_CHIP_LABEL);
     // See `pill`'s own comment: a galley laid out with a real colour ignores the colour handed
     // to `painter.galley`, which is how a selected chip once painted its label invisibly.
     let galley =
-        ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font.clone(), Color32::PLACEHOLDER));
+        ui.fonts_mut(|f| f.layout_no_wrap(label.into_owned(), font.clone(), Color32::PLACEHOLDER));
     const DOT: f32 = 9.0;
     // A chevron rides 20pt past the label's last letter and needs its own room — a dropdown
     // whose arrow lands on its label is not a dropdown, it is a smudge.
@@ -2597,7 +2764,12 @@ fn dropdown_row(
         crate::emoji::paint_line(
             ui,
             rect.left_center() + vec2(32.0, 0.0) + nudge,
-            label,
+            &truncate_to(
+                ui,
+                label,
+                theme::medium(13.0),
+                (rect.width() - 32.0 - 24.0).max(0.0),
+            ),
             theme::medium(13.0),
             fg,
         );
@@ -2685,7 +2857,12 @@ fn text_dropdown_row(
         crate::emoji::paint_line(
             ui,
             rect.left_center() + vec2(14.0, 0.0) + nudge,
-            label,
+            &truncate_to(
+                ui,
+                label,
+                theme::medium(13.0),
+                (rect.width() - 14.0 - 24.0).max(0.0),
+            ),
             theme::medium(13.0),
             fg,
         );
@@ -2917,6 +3094,27 @@ pub fn menu_item(
     label: &str,
     trailing: Option<&str>,
 ) -> egui::Response {
+    menu_row(ui, palette, Some(icon), label, trailing)
+}
+
+/// [`menu_item`] with no leading icon — the playlists in a "Save to playlist" picker, where the
+/// same glyph on every row says nothing the list's own heading hasn't already said.
+pub fn menu_item_plain(
+    ui: &mut Ui,
+    palette: &Palette,
+    label: &str,
+    trailing: Option<&str>,
+) -> egui::Response {
+    menu_row(ui, palette, None, label, trailing)
+}
+
+fn menu_row(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    trailing: Option<&str>,
+) -> egui::Response {
     let height = 32.0;
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
@@ -2929,17 +3127,30 @@ pub fn menu_item(
         }
         let fg = mix(palette.secondary, palette.text, t);
         let nudge = press_offset(&response);
-        icon.image(fg, 15.0).paint_at(
-            ui,
-            Rect::from_center_size(
-                rect.left_center() + vec2(18.0, 0.0) + nudge,
-                vec2(15.0, 15.0),
-            ),
-        );
+        let label_x = if let Some(icon) = icon {
+            icon.image(fg, 15.0).paint_at(
+                ui,
+                Rect::from_center_size(
+                    rect.left_center() + vec2(18.0, 0.0) + nudge,
+                    vec2(15.0, 15.0),
+                ),
+            );
+            38.0
+        } else {
+            14.0
+        };
+        // Ellipsise rather than run under the trailing mark (or out of the popup): a long
+        // playlist name in the save picker used to overflow the fixed menu width.
+        let reserve = if trailing.is_some() { 44.0 } else { 24.0 };
         crate::emoji::paint_line(
             ui,
-            rect.left_center() + vec2(38.0, 0.0) + nudge,
-            label,
+            rect.left_center() + vec2(label_x, 0.0) + nudge,
+            &truncate_to(
+                ui,
+                label,
+                theme::medium(13.0),
+                (rect.width() - label_x - reserve).max(0.0),
+            ),
             theme::medium(13.0),
             fg,
         );
@@ -3313,6 +3524,7 @@ mod tests {
                         manage: false,
                         remove_from_library: false,
                         context_only: false,
+                        radio_id: None,
                         save_as_new: None,
                     },
                 );

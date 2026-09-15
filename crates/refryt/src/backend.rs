@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::api::Api;
 use crate::auth::{self, AuthState};
+use crate::downloads;
 use crate::images;
 use crate::model::{
     Album, Artist, Entry, Library, MoodPlaylists, Playlist, SearchResults, SearchScope, Shelf,
@@ -41,6 +42,30 @@ pub enum Event {
     ScopedSearchFailed {
         query: String,
         scope: crate::model::SearchScope,
+        error: String,
+    },
+    /// Autocomplete for the search field. `query` is the staleness guard: the app drops a reply
+    /// whose query is no longer in the box.
+    SuggestionsDone {
+        query: String,
+        items: Vec<String>,
+    },
+    SuggestionsFailed {
+        query: String,
+        error: String,
+    },
+    /// A download in progress: `percent` is 0–100.
+    DownloadProgress {
+        video_id: String,
+        percent: f32,
+    },
+    DownloadDone {
+        video_id: String,
+        path: std::path::PathBuf,
+        track: Box<Track>,
+    },
+    DownloadFailed {
+        video_id: String,
         error: String,
     },
     LocalScanDone {
@@ -521,6 +546,76 @@ pub(crate) fn yt_dlp_program() -> String {
     }
 }
 
+/// Run yt-dlp for one track, emitting progress as it goes, and return the file it produced.
+async fn run_download(
+    track: &Track,
+    format: &str,
+    tx: &Sender<Event>,
+    ctx: &egui::Context,
+) -> anyhow::Result<std::path::PathBuf> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let dir = crate::downloads::dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let args = crate::downloads::yt_dlp_args(track, format, &dir);
+    let mut child = tokio::process::Command::new(yt_dlp_program())
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("could not start yt-dlp: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("yt-dlp gave no output"))?;
+    let mut lines = BufReader::new(stdout).lines();
+    let mut path: Option<std::path::PathBuf> = None;
+    while let Some(line) = lines.next_line().await? {
+        if let Some(percent) = parse_progress(&line) {
+            Backend::emit(
+                tx,
+                ctx,
+                Event::DownloadProgress {
+                    video_id: track.video_id.clone(),
+                    percent,
+                },
+            );
+        } else if line.starts_with('/') {
+            // `--print after_move:filepath` — the final path, printed once when the move is done.
+            path = Some(std::path::PathBuf::from(line.trim()));
+        }
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| anyhow::anyhow!("yt-dlp did not finish: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("yt-dlp exited with {status}");
+    }
+    path.ok_or_else(|| anyhow::anyhow!("yt-dlp did not report an output file"))
+}
+
+/// A `[download]  42.3% of ...` line as a number, or `None` for any other line.
+fn parse_progress(line: &str) -> Option<f32> {
+    let before = line.split('%').next()?;
+    if before.len() == line.len() {
+        return None;
+    }
+    before.split_whitespace().last()?.parse::<f32>().ok()
+}
+
+/// The track's cover art bytes, for embedding. Best-effort.
+async fn cover_bytes(http: &reqwest::Client, track: &Track) -> Option<Vec<u8>> {
+    let url = track.thumbnail.as_deref()?;
+    let response = http.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    Some(response.bytes().await.ok()?.to_vec())
+}
+
 pub struct Backend {
     rt: tokio::runtime::Runtime,
     /// One client, reused for every cover, so connections stay pooled.
@@ -533,6 +628,9 @@ pub struct Backend {
     /// Bumped on every `play`, so a superseded track's scrobble task stops itself instead of
     /// beaconing a song mpv has already left.
     scrobble_generation: Arc<AtomicU64>,
+    /// Video id → downloaded file. `App` owns `downloads.json` and pushes the map here; the
+    /// backend only reads it, to play a downloaded track from disk instead of resolving.
+    downloads: Arc<std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>>,
 }
 
 impl Backend {
@@ -567,7 +665,87 @@ impl Backend {
             rx,
             ctx,
             scrobble_generation: Arc::new(AtomicU64::new(0)),
+            downloads: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
+    }
+
+    /// Replace the backend's view of what is downloaded, after the index loads or changes.
+    pub fn set_downloads(&self, paths: std::collections::HashMap<String, std::path::PathBuf>) {
+        if let Ok(mut guard) = self.downloads.lock() {
+            *guard = paths;
+        }
+    }
+
+    /// Download one track to `~/Music/refryt`, reporting progress, then write its tags and cover.
+    /// Completion carries the `Track` back so the app can add it to the index.
+    pub fn download_track(&self, track: Track, format: &'static str) {
+        let (tx, ctx, http) = (self.tx.clone(), self.ctx.clone(), self.http.clone());
+        self.rt.spawn(async move {
+            let video_id = track.video_id.clone();
+            match run_download(&track, format, &tx, &ctx).await {
+                Ok(path) => {
+                    downloads::embed_tags(
+                        &path,
+                        &track,
+                        cover_bytes(&http, &track).await.as_deref(),
+                    );
+                    Self::emit(
+                        &tx,
+                        &ctx,
+                        Event::DownloadDone {
+                            video_id,
+                            path,
+                            track: Box::new(track),
+                        },
+                    );
+                }
+                Err(e) => Self::emit(
+                    &tx,
+                    &ctx,
+                    Event::DownloadFailed {
+                        video_id,
+                        error: format!("{e:#}"),
+                    },
+                ),
+            }
+        });
+    }
+
+    /// Download several tracks one at a time — an album or playlist header's "Download all". One
+    /// task, so a fifty-track album does not launch fifty yt-dlp processes at once.
+    pub fn download_many(&self, tracks: Vec<Track>, format: &'static str) {
+        let (tx, ctx, http) = (self.tx.clone(), self.ctx.clone(), self.http.clone());
+        self.rt.spawn(async move {
+            for track in tracks {
+                let video_id = track.video_id.clone();
+                match run_download(&track, format, &tx, &ctx).await {
+                    Ok(path) => {
+                        downloads::embed_tags(
+                            &path,
+                            &track,
+                            cover_bytes(&http, &track).await.as_deref(),
+                        );
+                        Self::emit(
+                            &tx,
+                            &ctx,
+                            Event::DownloadDone {
+                                video_id,
+                                path,
+                                track: Box::new(track),
+                            },
+                        );
+                    }
+                    Err(e) => Self::emit(
+                        &tx,
+                        &ctx,
+                        Event::DownloadFailed {
+                            video_id,
+                            error: format!("{e:#}"),
+                        },
+                    ),
+                }
+            }
+        });
     }
 
     fn emit(tx: &Sender<Event>, ctx: &egui::Context, event: Event) {
@@ -596,6 +774,22 @@ impl Backend {
             let event = match api.search(&query).await {
                 Ok(results) => Event::SearchDone { query, results },
                 Err(e) => Event::SearchFailed {
+                    query,
+                    error: format!("{e:#}"),
+                },
+            };
+            Self::emit(&tx, &ctx, event);
+        });
+    }
+
+    /// Autocomplete for the search field. Failure is silent — the field simply shows nothing — so
+    /// only a debug line marks it.
+    pub fn fetch_suggestions(&self, query: String) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let event = match api.suggestions(&query).await {
+                Ok(items) => Event::SuggestionsDone { query, items },
+                Err(e) => Event::SuggestionsFailed {
                     query,
                     error: format!("{e:#}"),
                 },
@@ -1016,6 +1210,25 @@ impl Backend {
         });
     }
 
+    /// Radio for a playlist or album: the same `next` watch queue as [`start_mix`], seeded by
+    /// the playlist rather than a song.
+    pub fn start_playlist_mix(&self, playlist_id: String) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let event = match api.mix_playlist(&playlist_id).await {
+                Ok(queue) => Event::MixLoaded {
+                    seed: playlist_id,
+                    queue,
+                },
+                Err(e) => Event::MixFailed {
+                    seed: playlist_id,
+                    error: format!("{e:#}"),
+                },
+            };
+            Self::emit(&tx, &ctx, event);
+        });
+    }
+
     /// The first page of a hand-picked queue's autoplay tail: radio for its last track,
     /// appended rather than replacing what is playing. The same `next` call as `start_mix`,
     /// with a landing the app can tell apart.
@@ -1389,6 +1602,7 @@ impl Backend {
     }
 
     pub fn play(&self, track: Track, mpv: Arc<Mpv>, volume: f64, normalise: bool) {
+        let downloads = Arc::clone(&self.downloads);
         let (resolver, api, tx, ctx) = (
             Arc::clone(&self.resolver),
             Arc::clone(&self.api),
@@ -1405,6 +1619,28 @@ impl Backend {
         Self::emit(&self.tx, &self.ctx, Event::Resolving(track.clone()));
 
         self.rt.spawn(async move {
+            // A downloaded track plays from disk without the resolver — offline, and without the
+            // yt-dlp latency. Unlike a local file it is still a real YouTube play, so it goes
+            // through the same scrobble tail below.
+            let downloaded = downloads
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(&track.video_id).cloned());
+            if let Some(path) = downloaded {
+                let event =
+                    match player::load(&mpv, &path.to_string_lossy(), volume, None, normalise) {
+                        Ok(()) => Event::Playing(track),
+                        Err(e) => Event::PlaybackFailed {
+                            track,
+                            error: format!("{e:#}"),
+                        },
+                    };
+                if let Event::Playing(ref track) = event {
+                    scrobble.maybe_start(track.clone(), Arc::clone(&mpv), generation);
+                }
+                Self::emit(&tx, &ctx, event);
+                return;
+            }
             // A local file bypasses the resolver entirely — mpv's `loadfile` takes a plain
             // filesystem path exactly as it takes a URL, and there is nothing to scrobble
             // (YouTube's watch-history endpoint has no idea what this path is).
@@ -1480,11 +1716,38 @@ impl Backend {
         });
     }
 
+    /// Play a music video. Unlike `play`, mpv fetches the video itself through its yt-dlp hook —
+    /// the resolver only returns audio-only streams. `track` is `wide`, so its id is the video's.
+    pub fn play_video(&self, track: Track, mpv: Arc<Mpv>, volume: f64) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let url = crate::model::track_url(&track.video_id);
+            let event = match player::load_video(&mpv, &url, volume) {
+                Ok(()) => Event::Playing(track),
+                Err(e) => Event::PlaybackFailed {
+                    track,
+                    error: format!("{e:#}"),
+                },
+            };
+            Self::emit(&tx, &ctx, event);
+        });
+    }
+
     /// Resolve a track without playing it, so the URL is cached before it is needed.
     ///
     /// With yt-dlp at ~2-3s per resolve this is what makes the *next* track start instantly, and
     /// it is a prerequisite for gapless: mpv needs the next URL before the current track ends.
     pub fn prefetch(&self, track: Track) {
+        // On disk already: there is nothing to resolve, and with no yt-dlp that futile call is
+        // the only thing it would log.
+        if self
+            .downloads
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.contains_key(&track.video_id))
+        {
+            return;
+        }
         let resolver = Arc::clone(&self.resolver);
         self.rt.spawn(async move {
             if let Ok(id) = VideoId::new(track.video_id) {
@@ -1729,6 +1992,24 @@ fn scrobble_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// yt-dlp's progress lines, and only those, read as a percentage.
+    #[test]
+    fn download_progress_lines_parse() {
+        assert_eq!(
+            parse_progress("[download]  42.3% of 3.20MiB at 1.00MiB/s"),
+            Some(42.3)
+        );
+        assert_eq!(
+            parse_progress("[download] 100% of 3.20MiB in 00:03"),
+            Some(100.0)
+        );
+        assert_eq!(parse_progress("[download] Destination: /x/y.webm"), None);
+        assert_eq!(
+            parse_progress("/home/user/Music/refryt/Creep [id].webm"),
+            None
+        );
+    }
 
     /// LRC stamps: two-digit fractions are hundredths, three are milliseconds, and a malformed
     /// stamp is skipped rather than dropping the whole lyric set.

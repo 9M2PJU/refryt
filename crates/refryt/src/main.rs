@@ -11,6 +11,8 @@ fn main() -> eframe::Result {
     mark_start();
 
     refryt::init_tracing("warn,refryt=info");
+    // Record a panic before the abort so the next launch can offer it.
+    refryt::crash::install_hook();
 
     // Frameless is the default look, but it is the first thing to fail on an unusual setup:
     // X11 without a compositor paints the rounded corners black, and some tiling WMs ignore

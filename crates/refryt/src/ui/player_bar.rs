@@ -285,16 +285,37 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         egui::pos2(rect.center().x, rect.center().y + 16.0),
         vec2(bar_w, 4.0),
     );
-    let fraction = if state.duration > 0.0 {
-        (state.position / state.duration).clamp(0.0, 1.0)
+    // A restored, not-yet-loaded track still shows its saved position and length: mpv has no
+    // state until play, so `resume` stands in, and scrubbing updates it rather than the player.
+    let restored = (!app.playback_started)
+        .then_some(app.resume)
+        .flatten()
+        .filter(|(i, _)| Some(*i) == app.current);
+    let position = restored.map(|(_, p)| p).unwrap_or(state.position);
+    let duration = if state.duration > 0.0 {
+        state.duration
+    } else {
+        app.now
+            .track
+            .as_ref()
+            .and_then(|t| t.duration)
+            .map(|d| d as f64)
+            .unwrap_or(0.0)
+    };
+    let fraction = if duration > 0.0 {
+        (position / duration).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    if let Some(seek_to) =
-        widgets::seek_bar(ui, &p, bar, fraction as f32, state.duration, state.position)
-        && let Some(pl) = &app.player
-    {
-        pl.seek(seek_to);
+    if let Some(seek_to) = widgets::seek_bar(ui, &p, bar, fraction as f32, duration, position) {
+        if app.playback_started {
+            if let Some(pl) = &app.player {
+                pl.seek(seek_to);
+            }
+        } else if let Some(index) = app.current {
+            // Scrubbing before play just moves the restored position.
+            app.resume = Some((index, seek_to));
+        }
     }
 
     // Volume.
@@ -310,13 +331,13 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     // `vui` packs right-to-left, so whatever is added first ends up closest to the window's
     // edge: the volume slider goes first to sit rightmost, with Queue and Lyrics to its left.
     vui.add_space(14.0);
-    let volume = app.player.as_ref().map(|pl| pl.volume()).unwrap_or(0.0);
+    // The user's volume, not `player.volume()`: a crossfade may be holding the live value down.
+    let volume = if app.muted { 0.0 } else { app.last_volume };
     if let Some(v) = widgets::volume_slider(&mut vui, &p, volume, app.last_volume)
         && let Some(pl) = &mut app.player
     {
-        if v > 0.5 {
-            app.last_volume = v;
-        }
+        app.last_volume = v;
+        app.muted = v <= 0.0;
         pl.set_volume(v);
     }
     vui.add_space(8.0);
@@ -326,6 +347,13 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     vui.add_space(8.0);
     if widgets::icon_button(&mut vui, &p, Icon::MicVocal, 16.0, app.lyrics_open).clicked() {
         app.toggle_lyrics();
+    }
+    // The video view, further left still, and only when the track actually has one.
+    if app.now.track.as_ref().is_some_and(|t| t.wide) {
+        vui.add_space(8.0);
+        if widgets::icon_button(&mut vui, &p, Icon::Video, 16.0, app.video_open).clicked() {
+            app.toggle_video();
+        }
     }
 
     // The now-playing song's menu, last: painting is done, and the choices route through the

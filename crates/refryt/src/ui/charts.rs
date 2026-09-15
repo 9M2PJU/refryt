@@ -68,9 +68,19 @@ fn ranked(app: &mut App, ui: &mut egui::Ui, section: &ChartSection) {
                 continue;
             };
             let (rect, response) = ui.allocate_exact_size(vec2(cell_w, cell_h), Sense::click());
+            // Double-click-to-play applies here too: a single click marks the cell, a double
+            // click plays it — `activate` is the flag, not `response.clicked()`.
+            let activate = widgets::activate(ui.ctx(), &response, track.video_id.as_str());
             if ui.is_rect_visible(rect) {
                 let p = app.palette;
                 let t = widgets::lit(ui, &response);
+                if widgets::is_selected(ui.ctx(), track.video_id.as_str()) {
+                    ui.painter().rect_filled(
+                        rect,
+                        egui::CornerRadius::same(theme::RADIUS_SMALL),
+                        p.surface_active.gamma_multiply(0.55),
+                    );
+                }
                 if t > 0.001 {
                     ui.painter().rect_filled(
                         rect,
@@ -141,7 +151,7 @@ fn ranked(app: &mut App, ui: &mut egui::Ui, section: &ChartSection) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
             }
-            if response.clicked() {
+            if activate {
                 play = Some(track.video_id.clone());
             }
         }

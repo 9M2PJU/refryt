@@ -45,6 +45,11 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             }
             _ => sign_in(app, ui),
         }
+        ui.add_space(22.0);
+        heading(app, ui, "Help");
+        if widgets::pill_button(ui, &app.palette, "Keyboard shortcuts").clicked() {
+            app.help_open = true;
+        }
         ui.add_space(28.0);
         branding(app, ui);
     });
@@ -340,12 +345,34 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
         &mut scrobble,
     );
 
+    let mut double_click = app.settings.double_click_to_play;
+    toggle_row(
+        app,
+        ui,
+        "setting-double-click",
+        "Double-click to play",
+        "A single click selects a song, a double click plays it — the way Spotify works.",
+        &mut double_click,
+    );
+
+    let mut crossfade = app.settings.crossfade;
+    toggle_row(
+        app,
+        ui,
+        "setting-crossfade",
+        "Crossfade between tracks",
+        "Dips the volume down at the end of a track and back up as the next begins.",
+        &mut crossfade,
+    );
+
     let ctx = ui.ctx().clone();
     app.update_settings(&ctx, |s| {
         s.quality = quality;
         s.autoplay = autoplay;
         s.normalise_volume = normalise;
         s.scrobble = scrobble;
+        s.double_click_to_play = double_click;
+        s.crossfade = crossfade;
     });
 }
 

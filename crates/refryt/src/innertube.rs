@@ -372,6 +372,28 @@ fn linked_album(segs: &[Segment]) -> Option<&Segment> {
         .find(|s| matches!(&s.target, Some(Target::Browse { page, .. }) if page == PAGE_ALBUM))
 }
 
+/// The album browse id out of an item's own action menu.
+///
+/// The byline is not the only place YouTube attaches the album. "Your daily discover" and the
+/// radio feeds credit just the artist and a play count, yet still offer "Go to album" among the
+/// card's menu actions — so the album is on the item the whole time, one level down, and without
+/// this the song's title had nowhere to go. Matched on the locale-independent `pageType`, never
+/// the English label, so it survives a non-English `hl`.
+fn menu_album_id(item: &Value) -> Option<String> {
+    item.pointer("/menu/menuRenderer/items")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|entry| {
+            let endpoint = entry
+                .pointer("/menuNavigationItemRenderer/navigationEndpoint")
+                .or_else(|| entry.pointer("/menuServiceItemRenderer/serviceEndpoint"))?;
+            match endpoint_target(endpoint)? {
+                Target::Browse { id, page } if page == PAGE_ALBUM => Some(id),
+                _ => None,
+            }
+        })
+}
+
 /// `"4:16"` and friends, but never a year: `"1999"` has no colon.
 fn duration_segment(segs: &[Segment]) -> Option<u64> {
     segs.iter()
@@ -864,7 +886,9 @@ fn parse_search_row(row: &Value) -> Option<Entry> {
                 title,
                 artists: artist_links(&segs),
                 album: linked_album(&segs).map(|s| s.text.clone()),
-                album_id: linked_album(&segs).and_then(album_id_of),
+                album_id: linked_album(&segs)
+                    .and_then(album_id_of)
+                    .or_else(|| menu_album_id(row)),
                 duration: fixed_duration(row).or_else(|| duration_segment(&segs)),
                 plays: plays_segment(&segs),
                 explicit: is_explicit(row),
@@ -1538,7 +1562,7 @@ fn parse_watch_row(row: &Value) -> Option<Track> {
         title,
         artists: artist_links(&segs),
         album: album.map(|s| s.text.clone()),
-        album_id: album.and_then(album_id_of),
+        album_id: album.and_then(album_id_of).or_else(|| menu_album_id(row)),
         duration: row
             .get("lengthText")
             .map(text)
@@ -1862,7 +1886,9 @@ fn parse_artist_songs(shelf: &Value, artist_name: &str, artist_id: &str) -> Vec<
                 },
                 plays: plays_segment(&segs),
                 album: linked_album(&segs).map(|s| s.text.clone()),
-                album_id: linked_album(&segs).and_then(album_id_of),
+                album_id: linked_album(&segs)
+                    .and_then(album_id_of)
+                    .or_else(|| menu_album_id(row)),
                 duration: fixed_duration(row).or_else(|| duration_segment(&segs)),
                 explicit: is_explicit(row),
                 like: like_status(row),
@@ -2058,7 +2084,9 @@ fn parse_card(item: &Value) -> Option<Entry> {
                         .unwrap_or_default(),
                 },
                 album: linked_album(&segs).map(|s| s.text.clone()),
-                album_id: linked_album(&segs).and_then(album_id_of),
+                album_id: linked_album(&segs)
+                    .and_then(album_id_of)
+                    .or_else(|| menu_album_id(card)),
                 duration: None,
                 plays: fields.get(1).map(|f| (*f).to_owned()),
                 explicit: false,
@@ -2675,6 +2703,53 @@ mod tests {
         };
         assert_eq!(t.album.as_deref(), Some("Some Album"));
         assert_eq!(t.album_id.as_deref(), Some("MPREb_album123"));
+    }
+
+    /// "Your daily discover" and the radio feeds never name the album in the byline — the
+    /// subtitle is only "artist • plays" — yet the card still carries "Go to album" as a menu
+    /// action. That menu is where the album id has to come from, or the title is a dead end.
+    #[test]
+    fn a_card_without_an_album_byline_reads_it_from_the_menu() {
+        let card = serde_json::json!({"musicTwoRowItemRenderer": {
+            "title": {"runs": [{"text": "Some Song"}]},
+            "subtitle": {"runs": [
+                {"text": "Some Artist", "navigationEndpoint": {"browseEndpoint": {
+                    "browseId": "UCartist",
+                    "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                        "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                    }}
+                }}},
+                {"text": " • "},
+                {"text": "64M plays"}
+            ]},
+            "menu": {"menuRenderer": {"items": [
+                {"menuNavigationItemRenderer": {
+                    "icon": {"iconType": "ALBUM"},
+                    "navigationEndpoint": {"browseEndpoint": {
+                        "browseId": "MPREb_frommenu",
+                        "params": "ggMEgAKcDQ%3D%3D",
+                        "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                        }}
+                    }},
+                    "text": {"runs": [{"text": "Go to album"}]}
+                }}
+            ]}},
+            "navigationEndpoint": {"watchEndpoint": {
+                "videoId": "vid4",
+                "watchEndpointMusicSupportedConfigs": {"watchEndpointMusicConfig": {
+                    "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+                }}
+            }},
+            "thumbnailRenderer": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [
+                {"url": "https://x/y=w60-h60"}
+            ]}}}
+        }});
+        let entry = parse_card(&card).expect("a song card parsed");
+        let Entry::Song(t) = entry else {
+            panic!("an ATV card should be a song, got {entry:?}");
+        };
+        assert_eq!(t.album_id.as_deref(), Some("MPREb_frommenu"));
     }
 
     /// A video's byline links its channel, not an artist page — and that id must survive the

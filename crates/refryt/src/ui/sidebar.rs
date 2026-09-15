@@ -351,6 +351,8 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui) {
                         manage: p.editable,
                         remove_from_library: !p.editable && !crate::model::is_liked_auto(&p.id),
                         context_only: true,
+                        // A local playlist has no YouTube radio to start.
+                        radio_id: (!is_local).then_some(p.id.as_str()),
                         save_as_new: None,
                     },
                 ) {

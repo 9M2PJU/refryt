@@ -20,9 +20,37 @@ use crate::theme::{self, Palette};
 use crate::ui;
 use crate::widgets;
 
-/// How long the search box must be quiet before we hit the network. Long enough to avoid a
-/// request per keystroke, short enough that it still feels like live search.
-const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+/// Autocomplete is cheap and wants to feel immediate; search itself is never triggered by typing,
+/// only by an explicit submit — see `App::submit_search`.
+const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(120);
+
+/// How long the crossfade ramps, at each end.
+const CROSSFADE_SECS: f64 = 5.0;
+
+/// The crossfade volume factor: 1.0 at full volume, dipping to 0 at the very end of a track and
+/// ramping from 0 at the start of the next; the lower of the two wins. Pure, so the curve is
+/// testable without a player.
+fn crossfade_factor(
+    active: bool,
+    position: f64,
+    duration: f64,
+    fade_in_elapsed: Option<f64>,
+) -> f64 {
+    let out = if active && duration > 0.0 {
+        let remaining = duration - position;
+        if remaining < CROSSFADE_SECS {
+            (remaining / CROSSFADE_SECS).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    } else {
+        1.0
+    };
+    let inn = fade_in_elapsed
+        .map(|e| (e / CROSSFADE_SECS).clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+    out.min(inn)
+}
 
 /// While audio is playing the progress bar needs to move. Four times a second is enough to look
 /// continuous and is two orders of magnitude cheaper than repainting every frame.
@@ -248,15 +276,19 @@ pub enum RailFilter {
     /// Folders scanned from `settings.local_folders`, browsed as a tree rather than paged from
     /// the server like the other four.
     Local,
+    /// Songs saved to `~/Music/refryt` — local, but still real YouTube tracks, so unlike `Local`
+    /// they play through the resolver's download shortcut and scrobble.
+    Downloads,
 }
 
 impl RailFilter {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Playlists,
         Self::Songs,
         Self::Albums,
         Self::Artists,
         Self::Local,
+        Self::Downloads,
     ];
 
     pub fn label(self) -> &'static str {
@@ -266,6 +298,7 @@ impl RailFilter {
             Self::Albums => "Albums",
             Self::Artists => "Artists",
             Self::Local => "Local",
+            Self::Downloads => "Downloads",
         }
     }
 }
@@ -780,6 +813,17 @@ pub struct App {
     pub(crate) query: String,
     /// When the query last changed, for debouncing.
     pub(crate) query_changed_at: Option<Instant>,
+    /// Autocomplete for the search field: the items, the query they belong to (a staleness guard
+    /// like `searched`), and where the keyboard cursor sits among them.
+    pub(crate) suggestions: Vec<String>,
+    pub(crate) suggestions_for: Option<String>,
+    pub(crate) suggestion_cursor: usize,
+    /// Set once the arrow keys have moved the suggestion highlight, so Enter accepts that
+    /// suggestion; untouched, Enter searches exactly what was typed.
+    pub(crate) suggestion_navigated: bool,
+    /// A search waiting for `poll_search` to fire it. Search is submit-driven — Enter, a chosen
+    /// suggestion, or the `--search` CLI — never a keystroke.
+    pending_search: bool,
     pub(crate) searched: String,
     pub(crate) searching: bool,
     pub(crate) results: SearchResults,
@@ -929,6 +973,9 @@ pub struct App {
     /// Playlists fetched for the sidebar's context menu, so it can offer the page's track
     /// actions (shuffle, mix, queue, save) without opening the page. Bounded.
     pub(crate) rail_cache: std::collections::HashMap<String, crate::model::Playlist>,
+    /// The same idea for albums: kept so an album card's context menu can seed its mix, queue
+    /// and save items once the right-click prefetch lands. Bounded like the rail cache.
+    pub(crate) album_cache: std::collections::HashMap<String, crate::model::Album>,
     /// Which library section the Library page shows.
     pub(crate) rail_filter: RailFilter,
     /// The name being typed into the rail's new-playlist field, while it is open.
@@ -957,6 +1004,19 @@ pub struct App {
     pub(crate) history_error: Option<String>,
     /// The volume to restore on unmute. Updated whenever you set a nonzero volume.
     pub(crate) last_volume: f64,
+    /// A restored position to seek to once the track loads: `(queue index, seconds)`. Consumed
+    /// the first time that track is actually playing, and dropped if the queue moves elsewhere.
+    pub(crate) resume: Option<(usize, f64)>,
+    /// When the playback state was last written, so the periodic save is throttled.
+    last_playback_save: Instant,
+    /// Muted by the button versus turned down to zero. `last_volume` remembers what to come back
+    /// to; this says whether the crossfade may write the volume at all.
+    pub(crate) muted: bool,
+    /// When the current track started, for the crossfade's ramp-in. `None` when not fading in.
+    fade_in: Option<Instant>,
+    /// Whether the crossfade is currently holding the volume down, so it can put it back once
+    /// the setting is switched off mid-track.
+    fade_active: bool,
     /// A confirmation bubble above the player bar, if one is live.
     toast: Option<Toast>,
     /// Play the first result as soon as a search lands (`--autoplay`).
@@ -991,6 +1051,16 @@ pub struct App {
     /// A page's description, while its Info popup is open. Set by the header ••• menu's Info
     /// item; cleared by the popup's Close button.
     pub(crate) page_info: Option<String>,
+    /// The keyboard-shortcut cheatsheet is open. Opened by `?`/F1 and the account menu, closed by
+    /// the modal itself.
+    pub(crate) help_open: bool,
+    /// A crash the previous run left behind, offered once on this launch and then cleared.
+    pub(crate) crash_report: Option<crate::crash::Crash>,
+    /// What is downloaded to `~/Music/refryt`, indexed by video id. Pushed into the backend so a
+    /// downloaded track plays from disk.
+    pub(crate) downloads: crate::downloads::Index,
+    /// In-flight download progress, by video id (0–100).
+    pub(crate) download_progress: std::collections::HashMap<String, f32>,
 
     /// The content card's inner rect this frame: what the page is drawn into, before the
     /// card's own margin. Pages that paint to the card's edges read it rather than guessing
@@ -1001,6 +1071,31 @@ pub struct App {
     /// non-Linux build — and the Settings row for it disables itself off that rather than
     /// offering a switch that does nothing.
     pub(crate) blur: crate::blur::Blur,
+    /// OS media controls and media keys, when the platform offers them. `None` on a session with
+    /// no media service (e.g. no D-Bus session bus); the app runs the same without it.
+    pub(crate) media: Option<crate::media::Media>,
+    /// Kept for the video view, which creates its mpv render context lazily.
+    ctx: egui::Context,
+    /// Whether the in-app music video is showing in the content card.
+    pub(crate) video_open: bool,
+    /// The software render surface, created the first time a video is opened.
+    pub(crate) video: Option<crate::video::Video>,
+}
+
+/// The window's native handle for the OS media service — SMTC attaches to a window on Windows.
+/// `None` everywhere else, where `playwire` needs no handle.
+#[cfg(target_os = "windows")]
+fn window_hwnd(cc: &eframe::CreationContext<'_>) -> Option<u64> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn window_hwnd(_: &eframe::CreationContext<'_>) -> Option<u64> {
+    None
 }
 
 impl App {
@@ -1047,6 +1142,8 @@ impl App {
 
         let backend = Backend::new(cc.egui_ctx.clone())?;
         backend.set_audio_quality(settings.quality.format());
+        // One handle per process; a failure just means running without OS media controls.
+        let media = crate::media::Media::new(cc.egui_ctx.clone(), window_hwnd(cc));
         // libmpv is initialised on the first play, not here — see `Player`.
         let player = Some(Player::new());
         // A stored session is only a claim until YouTube confirms it — cookies expire between
@@ -1081,7 +1178,12 @@ impl App {
             player,
             player_error: None,
             query: search.clone().unwrap_or_default(),
-            query_changed_at: search.is_some().then(Instant::now),
+            query_changed_at: None,
+            suggestions: Vec::new(),
+            suggestions_for: None,
+            suggestion_cursor: 0,
+            suggestion_navigated: false,
+            pending_search: search.is_some(),
             searched: String::new(),
             searching: false,
             results: SearchResults::default(),
@@ -1148,6 +1250,7 @@ impl App {
             edit_on_load: None,
             edit_revert: None,
             rail_cache: std::collections::HashMap::new(),
+            album_cache: std::collections::HashMap::new(),
             rail_filter: RailFilter::default(),
             new_playlist: None,
             new_playlist_kind: NewPlaylistKind::default(),
@@ -1169,6 +1272,11 @@ impl App {
             history_loading: false,
             history_error: None,
             last_volume: 70.0,
+            resume: None,
+            last_playback_save: Instant::now(),
+            muted: false,
+            fade_in: None,
+            fade_active: false,
             toast: None,
             autoplay,
             images: Images::new(),
@@ -1180,10 +1288,18 @@ impl App {
             lyrics_scroll_reset: false,
             lyrics_active: None,
             page_info: None,
+            help_open: false,
+            crash_report: crate::crash::last(),
+            downloads: crate::downloads::Index::default(),
+            download_progress: std::collections::HashMap::new(),
             stats: Stats::new(stats),
             stats_after,
             content_rect: egui::Rect::NOTHING,
             blur,
+            media,
+            ctx: cc.egui_ctx.clone(),
+            video_open: false,
+            video: None,
             local_tracks: Vec::new(),
             local_scanning: false,
             local_scan_error: None,
@@ -1197,6 +1313,9 @@ impl App {
                 .scan_local_folders(app.settings.local_folders.clone());
         }
         app.load_sidebar_playlists();
+        app.downloads = crate::downloads::load();
+        app.push_downloads_to_backend();
+        app.restore_playback();
         Ok(app)
     }
 
@@ -1234,6 +1353,15 @@ impl App {
             i.modifiers.command && (i.key_pressed(egui::Key::K) || i.key_pressed(egui::Key::L))
         }) {
             ctx.memory_mut(|m| m.request_focus(crate::ui::topbar::search_id()));
+        }
+        // The cheatsheet. `?` arrives as `Questionmark` on layouts that produce it and as
+        // Shift+/ elsewhere, so both are accepted; F1 for keyboards without a `?`.
+        if ctx.input(|i| {
+            i.key_pressed(egui::Key::F1)
+                || i.key_pressed(egui::Key::Questionmark)
+                || (i.modifiers.shift && i.key_pressed(egui::Key::Slash))
+        }) {
+            self.help_open = true;
         }
     }
 
@@ -1378,6 +1506,332 @@ impl App {
             // animating — so without this, a tray click asking to show it again would sit
             // unnoticed until some unrelated event happened to schedule a repaint.
             ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    /// Drain and act on whatever the OS media service sent — a media key, the shell widget, or
+    /// another MPRIS client. Events arrive on a backend thread and are queued by `media.rs`.
+    fn poll_media(&mut self, ctx: &egui::Context) {
+        let events = match self.media.as_ref() {
+            Some(media) => media.drain(),
+            None => return,
+        };
+        for event in events {
+            match event {
+                playwire::Event::Play => {
+                    if !self.playback_started || self.now.paused {
+                        self.toggle_playback();
+                    }
+                }
+                playwire::Event::Pause => {
+                    if self.playback_started && !self.now.paused {
+                        self.toggle_playback();
+                    }
+                }
+                playwire::Event::PlayPause => self.toggle_playback(),
+                playwire::Event::Stop => {
+                    if self.playback_started && !self.now.paused {
+                        self.toggle_playback();
+                    }
+                    if let Some(player) = self.player.as_ref() {
+                        player.seek(0.0);
+                    }
+                }
+                playwire::Event::Next => self.skip(1),
+                playwire::Event::Previous => self.skip(-1),
+                playwire::Event::SeekTo(position) => {
+                    if let Some(player) = self.player.as_ref() {
+                        player.seek(position.as_secs_f64());
+                    }
+                }
+                playwire::Event::SeekBy(offset) => {
+                    if let Some(player) = self.player.as_ref() {
+                        let to = (player.state().position + offset).max(0.0);
+                        player.seek(to);
+                    }
+                }
+                playwire::Event::SetVolume(v) => {
+                    let volume = (v * 100.0).clamp(0.0, 100.0);
+                    self.last_volume = volume;
+                    self.muted = volume <= 0.0;
+                    if let Some(player) = self.player.as_mut() {
+                        player.set_volume(volume);
+                    }
+                }
+                playwire::Event::SetShuffle(on) => self.shuffle = on,
+                playwire::Event::SetRepeat(repeat) => {
+                    self.repeat = match repeat {
+                        playwire::Repeat::Off => RepeatMode::Off,
+                        playwire::Repeat::One => RepeatMode::One,
+                        playwire::Repeat::All => RepeatMode::All,
+                    };
+                }
+                playwire::Event::Raise => {
+                    self.hidden = false;
+                    ctx.send_viewport_cmd(hide_command(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                playwire::Event::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                // `OpenUri`, and anything a future backend adds: nothing to do.
+                _ => {}
+            }
+        }
+    }
+
+    /// Publish the transport to the OS widget. Once a frame is fine — `playwire` diffs, so an
+    /// unchanged snapshot costs almost nothing.
+    fn publish_media(&mut self) {
+        let state = self.player.as_ref().map(|p| p.state()).unwrap_or_default();
+        // A restored track is not loaded yet, so mpv's position is 0; show the saved one so the
+        // OS scrubber matches the bar.
+        let position = if self.playback_started {
+            state.position
+        } else {
+            self.resume
+                .filter(|(i, _)| Some(*i) == self.current)
+                .map(|(_, p)| p)
+                .unwrap_or(state.position)
+        };
+        let snapshot = crate::media::playback_state(
+            self.now.track.as_ref(),
+            self.playback_started && !state.paused,
+            position,
+            state.duration,
+            if self.muted {
+                0.0
+            } else {
+                (self.last_volume / 100.0).clamp(0.0, 1.0)
+            },
+            self.repeat,
+            self.shuffle,
+            self.current.is_some_and(|c| c > 0),
+            !self.queue.is_empty(),
+        );
+        if let Some(media) = self.media.as_mut() {
+            media.set_state(&snapshot);
+        }
+    }
+
+    /// Bring back the last queue, track and transport from `playback.json`. The track is shown
+    /// paused; pressing play loads it and seeks to `resume`. Nothing is fetched or scrobbled
+    /// here — a restore is not a play.
+    fn restore_playback(&mut self) {
+        let Some(store) = crate::playback::load() else {
+            return;
+        };
+        if store.queue.is_empty() {
+            return;
+        }
+        self.queue = store.queue.into_iter().map(|t| t.into_track()).collect();
+        self.current = store.current.filter(|i| *i < self.queue.len());
+        self.now.track = self.current.and_then(|i| self.queue.get(i).cloned());
+        self.repeat = store.repeat.map(Into::into).unwrap_or(RepeatMode::Off);
+        self.shuffle = store.shuffle;
+        if store.volume > 0.5 {
+            self.last_volume = store.volume;
+        }
+        // Anything past a couple of seconds is worth resuming; the very start is not.
+        self.resume = (store.position > 1.0)
+            .then(|| self.current.map(|i| (i, store.position)))
+            .flatten();
+    }
+
+    /// Write the queue and transport. Throttled by the caller; best-effort (a failure is only a
+    /// debug line — losing the queue is not worth a toast).
+    fn save_playback(&self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let position = if self.playback_started {
+            self.player
+                .as_ref()
+                .map(|p| p.state().position)
+                .unwrap_or(0.0)
+        } else {
+            self.resume.map(|(_, p)| p).unwrap_or(0.0)
+        };
+        let store = crate::playback::Store {
+            version: 1,
+            queue: self
+                .queue
+                .iter()
+                .map(crate::playback::PersistedTrack::from_track)
+                .collect(),
+            current: self.current,
+            position,
+            repeat: Some(self.repeat.into()),
+            shuffle: self.shuffle,
+            volume: self.last_volume,
+        };
+        if let Err(e) = crate::playback::save(&store) {
+            tracing::debug!(error = %format!("{e:#}"), "could not save the playback state");
+        }
+    }
+
+    /// Act on a restored position once its track is actually playing, and save the transport
+    /// every few seconds so a crash or a kill loses little.
+    fn poll_playback(&mut self, state: &crate::player::PlayerState) {
+        if let Some((index, position)) = self.resume {
+            if self.current != Some(index) {
+                // The queue moved on; the saved position belongs to a track no longer loaded.
+                self.resume = None;
+            } else if self.playback_started && state.duration > 0.0 {
+                if let Some(player) = self.player.as_ref() {
+                    player.seek(position);
+                }
+                self.resume = None;
+            }
+        }
+        if self.last_playback_save.elapsed() >= Duration::from_secs(5) {
+            self.last_playback_save = Instant::now();
+            self.save_playback();
+        }
+    }
+
+    /// The single-instance crossfade: dip to silence over the last few seconds and back up as the
+    /// next track begins. mpv has no crossfade of its own and nothing is appended to its
+    /// playlist, so a real overlap would need two players; this is the cheap approximation the
+    /// setting offers. Only touches the volume while a ramp is actually in progress.
+    fn apply_crossfade(&mut self, state: &crate::player::PlayerState) {
+        let base = if self.muted { 0.0 } else { self.last_volume };
+        if !self.settings.crossfade {
+            // Switched off mid-fade: put the true volume back once.
+            if self.fade_active {
+                if let Some(player) = self.player.as_mut() {
+                    player.set_volume(base);
+                }
+                self.fade_active = false;
+            }
+            return;
+        }
+        let active = self.playback_started && !state.paused && state.duration > 0.0;
+        let elapsed = self.fade_in.map(|started| started.elapsed().as_secs_f64());
+        if elapsed.is_some_and(|e| e >= CROSSFADE_SECS) {
+            self.fade_in = None;
+        }
+        let factor = crossfade_factor(active, state.position, state.duration, elapsed);
+        if factor < 1.0 {
+            self.fade_active = true;
+            if let Some(player) = self.player.as_mut() {
+                player.set_volume(base * factor);
+            }
+        } else if self.fade_active {
+            self.fade_active = false;
+            if let Some(player) = self.player.as_mut() {
+                player.set_volume(base);
+            }
+        }
+    }
+
+    /// Tell the backend which video ids are on disk, so `play` uses the file.
+    fn push_downloads_to_backend(&self) {
+        let map = self
+            .downloads
+            .entries
+            .iter()
+            .map(|(id, r)| (id.clone(), std::path::PathBuf::from(&r.path)))
+            .collect();
+        self.backend.set_downloads(map);
+    }
+
+    fn start_download(&mut self, track: Track) {
+        if self.downloads.entries.contains_key(&track.video_id) {
+            self.toast("Already downloaded");
+            return;
+        }
+        self.download_progress.insert(track.video_id.clone(), 0.0);
+        self.backend
+            .download_track(track, self.settings.quality.format());
+        self.toast("Downloading…");
+    }
+
+    fn start_download_many(&mut self, tracks: Vec<Track>) {
+        let pending: Vec<Track> = tracks
+            .into_iter()
+            .filter(|t| !self.downloads.entries.contains_key(&t.video_id))
+            .collect();
+        if pending.is_empty() {
+            self.toast("Already downloaded");
+            return;
+        }
+        for track in &pending {
+            self.download_progress.insert(track.video_id.clone(), 0.0);
+        }
+        let count = pending.len();
+        self.backend
+            .download_many(pending, self.settings.quality.format());
+        self.toast(&format!("Downloading {count} tracks…"));
+    }
+
+    fn remove_download(&mut self, video_id: &str) {
+        if let Some(record) = self.downloads.entries.remove(video_id) {
+            let _ = std::fs::remove_file(&record.path);
+            if let Err(e) = crate::downloads::save(&self.downloads) {
+                tracing::warn!(error = %format!("{e:#}"), "could not save the download index");
+            }
+            self.push_downloads_to_backend();
+            self.toast("Removed download");
+        }
+    }
+
+    /// Show or hide the in-app music video. Opening creates the software render surface (once)
+    /// and reloads the current track as video through mpv's yt-dlp hook; closing hands playback
+    /// back to the audio resolver — both at the current position.
+    pub(crate) fn toggle_video(&mut self) {
+        if self.video_open {
+            self.video_open = false;
+            self.reload_current();
+            return;
+        }
+        if !self.now.track.as_ref().is_some_and(|t| t.wide) {
+            return;
+        }
+        if self.video.is_none()
+            && let Some(player) = self.player.as_mut()
+            && let Some(handle) = player.handle()
+        {
+            self.video = crate::video::Video::new(&handle, self.ctx.clone());
+        }
+        self.video_open = self.video.is_some();
+        if self.video_open {
+            self.reload_current();
+        }
+    }
+
+    /// Reload the current track in the mode the video toggle is now in, keeping the position.
+    fn reload_current(&mut self) {
+        let Some(index) = self.current else { return };
+        let Some(track) = self.queue.get(index).cloned() else {
+            return;
+        };
+        let position = self
+            .player
+            .as_ref()
+            .map(|p| p.state().position)
+            .unwrap_or(0.0);
+        let volume = if self.muted { 0.0 } else { self.last_volume };
+        let Some(player) = self.player.as_mut() else {
+            return;
+        };
+        let Some(handle) = player.handle() else {
+            return;
+        };
+        // The old file is still loaded for an instant; without clearing this, `poll_playback`
+        // would seek the *outgoing* file to the saved position and consume `resume` before the
+        // new one starts — which is why handing playback back restarted from zero. Same guard
+        // `play_index_restore` uses: wait for the new file to actually report playing.
+        self.playback_started = false;
+        if self.video_open {
+            self.backend.play_video(track, handle, volume);
+        } else {
+            self.backend
+                .play(track, handle, volume, self.settings.normalise_volume);
+        }
+        if position > 1.0 {
+            self.resume = Some((index, position));
         }
     }
 
@@ -1862,30 +2316,74 @@ impl App {
     // Search
     // ------------------------------------------------------------------------------------------
 
-    /// Fire a search once typing has settled. Returns how long until the next check is due, so
-    /// the caller can schedule exactly one repaint rather than spinning.
-    fn poll_search(&mut self) -> Option<Duration> {
-        let changed_at = self.query_changed_at?;
+    /// Run the typed query. Search is submit-driven, not live: typing only refreshes the
+    /// autocomplete list, so the results change on Enter, on a chosen suggestion, or from the
+    /// `--search` CLI — never mid-keystroke. This is what keeps a network round trip from firing
+    /// for every character and what lets the listener finish typing before the page moves.
+    pub(crate) fn submit_search(&mut self) {
+        if !matches!(self.current_route(), Route::Search) {
+            self.navigate(Route::Search);
+        }
+        // Mark autocomplete as already fetched for this exact text so the field does not
+        // immediately re-open its suggestion list for the query that was just submitted.
+        self.suggestions_for = Some(self.query.trim().to_owned());
+        self.pending_search = true;
+    }
+
+    /// Drop the autocomplete list and its cursor state.
+    pub(crate) fn clear_suggestions(&mut self) {
+        self.suggestions.clear();
+        self.suggestions_for = None;
+        self.suggestion_cursor = 0;
+        self.suggestion_navigated = false;
+    }
+
+    /// Fire a submitted search. Returns how long until the next check is due, so the caller can
+    /// schedule exactly one repaint rather than spinning.
+    fn poll_search(&mut self) {
+        if !std::mem::take(&mut self.pending_search) {
+            return;
+        }
         let query = self.query.trim().to_owned();
-
         if query.is_empty() || query == self.searched {
-            self.query_changed_at = None;
-            return None;
+            return;
         }
 
-        let waited = changed_at.elapsed();
-        if waited < SEARCH_DEBOUNCE {
-            return Some(SEARCH_DEBOUNCE - waited);
-        }
-
-        self.query_changed_at = None;
         self.searched = query.clone();
         self.searching = true;
         self.status = None;
+        // Drop the previous query's rows so the page shows its skeleton instead of results that
+        // no longer answer what was asked.
+        self.results = SearchResults::default();
         self.backend.search(query);
         if self.search_scope != SearchScope::All {
             self.fetch_scoped_search(self.search_scope);
         }
+    }
+
+    /// Fetch autocomplete once per settled query, and only while the field has focus — a hidden
+    /// field needs none. The guard is `suggestions_for`, so re-typing the same text does not
+    /// refetch. Returns a repaint delay while the debounce is still running. This is the *only*
+    /// thing typing triggers; the search itself waits for a submit.
+    fn poll_suggestions(&mut self, ctx: &egui::Context) -> Option<Duration> {
+        if self.query.trim().is_empty() {
+            self.suggestions.clear();
+            self.suggestions_for = None;
+            self.suggestion_cursor = 0;
+            return None;
+        }
+        if !ctx.memory(|m| m.has_focus(crate::ui::topbar::search_id())) {
+            return None;
+        }
+        if self.suggestions_for.as_deref() == Some(self.query.as_str()) {
+            return None;
+        }
+        let waited = self.query_changed_at?.elapsed();
+        if waited < SUGGEST_DEBOUNCE {
+            return Some(SUGGEST_DEBOUNCE - waited);
+        }
+        self.suggestions_for = Some(self.query.clone());
+        self.backend.fetch_suggestions(self.query.clone());
         None
     }
 
@@ -1971,6 +2469,47 @@ impl App {
                 }
                 Event::ScopedSearchDone { .. } | Event::ScopedSearchFailed { .. } => {}
 
+                // A reply for a query no longer in the box is dropped, the same staleness guard
+                // `scoped_for` uses: typing on must not flash the previous suggestions back up.
+                Event::SuggestionsDone { query, items } => {
+                    if self.query == query {
+                        self.suggestions = items;
+                        self.suggestions_for = Some(query);
+                        self.suggestion_cursor = 0;
+                    }
+                }
+                Event::SuggestionsFailed { query, error } => {
+                    tracing::debug!(%query, %error, "suggestions failed");
+                }
+
+                Event::DownloadProgress { video_id, percent } => {
+                    self.download_progress.insert(video_id, percent);
+                }
+                Event::DownloadDone {
+                    video_id,
+                    path,
+                    track,
+                } => {
+                    self.download_progress.remove(&video_id);
+                    self.downloads.entries.insert(
+                        video_id,
+                        crate::downloads::Record {
+                            path: path.to_string_lossy().into_owned(),
+                            track: crate::playback::PersistedTrack::from_track(&track),
+                        },
+                    );
+                    if let Err(e) = crate::downloads::save(&self.downloads) {
+                        tracing::warn!(error = %format!("{e:#}"), "could not save the download index");
+                    }
+                    self.push_downloads_to_backend();
+                    self.toast(&format!("Downloaded “{}”", track.title));
+                }
+                Event::DownloadFailed { video_id, error } => {
+                    self.download_progress.remove(&video_id);
+                    tracing::warn!(%video_id, %error, "download failed");
+                    self.toast_error("Could not download that track");
+                }
+
                 Event::LocalScanDone { tracks } => {
                     self.local_scanning = false;
                     self.local_scan_error = None;
@@ -2004,13 +2543,16 @@ impl App {
 
                 Event::AlbumLoaded { id, album } if self.album_is_for(&id) => {
                     self.album_loading = false;
+                    self.cache_album(&id, &album);
                     self.album = Some(album);
                 }
                 Event::AlbumFailed { id, error } if self.album_is_for(&id) => {
                     self.album_loading = false;
                     self.album_error = Some(error);
                 }
-                Event::AlbumLoaded { .. } | Event::AlbumFailed { .. } => {}
+                // A release card's right-click prefetch, not a page view.
+                Event::AlbumLoaded { id, album } => self.cache_album(&id, &album),
+                Event::AlbumFailed { .. } => {}
 
                 // An album/playlist card's play button, not a page view — see
                 // `Event::CardTracksReady`'s own doc comment for why this isn't folded into
@@ -2413,6 +2955,7 @@ impl App {
                 Event::Playing(mut track) => {
                     self.reconcile_state(&mut track);
                     let video_id = track.video_id.clone();
+                    let wide = track.wide;
                     self.now = NowPlaying {
                         track: Some(track),
                         resolving: false,
@@ -2421,6 +2964,12 @@ impl App {
                         playlist_playing: self.now.playlist_playing.clone(),
                     };
                     self.playback_started = true;
+                    // A track with no video cannot keep the video view up.
+                    if self.video_open && !wide {
+                        self.video_open = false;
+                    }
+                    // A fresh track begins the crossfade's ramp-in (a no-op when it is off).
+                    self.fade_in = Some(Instant::now());
                     self.prefetch_next();
                     // Lyrics follow the track while the panel is open; a song change starts a
                     // fresh request, and the guard drops it if the track changes again.
@@ -2764,8 +3313,10 @@ impl App {
     /// Start the queue item at `index`, remembering the track we are leaving for `Previous`.
     pub(crate) fn play_index(&mut self, index: usize) {
         // Already the loaded track: pause/resume it rather than restarting from the top — the
-        // same convention `start_from` follows for the same reason.
-        if self.current == Some(index) {
+        // same convention `start_from` follows for the same reason. `playback_started` matters:
+        // a restored queue arrives with `current` set but nothing loaded, and that case must
+        // fall through and actually load the track rather than toggle (which would recurse).
+        if self.current == Some(index) && self.playback_started {
             self.toggle_playback();
             return;
         }
@@ -2782,7 +3333,9 @@ impl App {
             return;
         };
         let handle = player.handle();
-        let volume = player.volume();
+        // The user's volume, not `player.volume()`: a crossfade may have faded the live value
+        // down, and the next track must not inherit that.
+        let volume = if self.muted { 0.0 } else { self.last_volume };
         let init_error = player.init_error().map(str::to_owned);
         let Some(handle) = handle else {
             // libmpv could not be brought up — surface it now, the same message an eager
@@ -2843,14 +3396,10 @@ impl App {
     /// back" the volume slider itself uses (`player_bar.rs` only overwrites `last_volume` when
     /// the new value is above silent, so muting from here never clobbers it with 0).
     pub(crate) fn toggle_mute(&mut self) {
-        let Some(player) = self.player.as_mut() else {
-            return;
-        };
-        if player.volume() > 0.0 {
-            self.last_volume = player.volume();
-            player.set_volume(0.0);
-        } else {
-            player.set_volume(self.last_volume);
+        self.muted = !self.muted;
+        let volume = if self.muted { 0.0 } else { self.last_volume };
+        if let Some(player) = self.player.as_mut() {
+            player.set_volume(volume);
         }
     }
 
@@ -3063,6 +3612,13 @@ impl App {
                 self.upnext_open = true;
                 self.backend.start_mix(id);
             }
+            RowAction::StartMixPlaylist(id) => {
+                self.upnext_open = true;
+                self.backend.start_playlist_mix(id);
+            }
+            RowAction::Download(track) => self.start_download(track),
+            RowAction::DownloadMany(tracks) => self.start_download_many(tracks),
+            RowAction::RemoveDownload(video_id) => self.remove_download(&video_id),
             RowAction::PlayNext(track) => {
                 self.play_next(track);
                 self.toast("Song will play next");
@@ -3632,6 +4188,18 @@ impl App {
         self.rail_cache.insert(id.to_owned(), playlist.clone());
     }
 
+    /// Keep a fetched album for a release card's context menu, bounded like the rail cache.
+    fn cache_album(&mut self, id: &str, album: &crate::model::Album) {
+        const ALBUM_CACHE: usize = 8;
+        if self.album_cache.len() >= ALBUM_CACHE && !self.album_cache.contains_key(id) {
+            // Drop an arbitrary other entry; the cache is a convenience, not a source of truth.
+            if let Some(key) = self.album_cache.keys().next().cloned() {
+                self.album_cache.remove(&key);
+            }
+        }
+        self.album_cache.insert(id.to_owned(), album.clone());
+    }
+
     /// Show a confirmation bubble above the player bar for a few seconds.
     fn toast(&mut self, text: &str) {
         self.toast = Some(Toast {
@@ -4008,6 +4576,12 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// eframe calls this periodically and on exit, so the queue survives a normal close as well
+    /// as the five-second periodic save.
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.save_playback();
+    }
+
     /// Transparent so the rounded corners show the desktop through them.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         Color32::TRANSPARENT.to_normalized_gamma_f32()
@@ -4022,6 +4596,11 @@ impl eframe::App for App {
         }
         self.handle_events(&ctx);
         self.poll_tray(&ctx);
+        self.poll_media(&ctx);
+        // Publish the playback click model for the row and card widgets this frame, so no page
+        // has to thread the setting through.
+        crate::widgets::set_double_click_play(&ctx, self.settings.double_click_to_play);
+        crate::widgets::set_downloaded(&ctx, self.downloads.entries.keys().cloned().collect());
 
         let maximized = Self::is_maximized(&ctx);
         let rounded = !self.decorated && !maximized;
@@ -4202,6 +4781,12 @@ impl eframe::App for App {
                 // the right.
                 let top = ui.available_rect_before_wrap();
                 self.content_rect = top;
+                // The video view takes the content card; the page it was opened from is still
+                // behind it, one toggle away.
+                if self.video_open {
+                    ui::video::panel(self, ui);
+                    return;
+                }
                 match route {
                     Route::Search => ui::search::page(self, ui),
                     Route::Explore => ui::explore::page(self, ui),
@@ -4227,6 +4812,8 @@ impl eframe::App for App {
 
         // The playlist management modals, over everything and on every route.
         ui::playlist::modals(self, ui);
+        ui::help::modal(self, ui);
+        ui::crash::modal(self, ui);
 
         if !self.decorated && !maximized {
             chrome::resize_handles(ui);
@@ -4242,6 +4829,9 @@ impl eframe::App for App {
         // the single source of truth for this, and every row/card's play-vs-pause glyph reads
         // it off `now` rather than reaching for the player directly.
         self.now.paused = state.paused;
+        // Restore the saved position once its track is loaded, and keep `playback.json` fresh.
+        self.poll_playback(&state);
+        self.apply_crossfade(&state);
         if self.playback_started && state.idle && !self.now.resolving {
             self.playback_started = false;
             // Repeat One replays the track that just ended; anything else advances normally.
@@ -4279,9 +4869,16 @@ impl eframe::App for App {
             }
         }
 
+        // Hand the OS widget the current transport. After the advance/autoplay above, so a track
+        // that just changed is what the OS shows.
+        self.publish_media();
+
         // Repaint discipline. Exactly one of these, and only when something is actually moving:
-        // a pending search, or a progress bar that needs to advance.
-        if let Some(due) = self.poll_search() {
+        // a pending autocomplete debounce, or a progress bar that needs to advance. Search itself
+        // is submit-driven and fires here once, on demand.
+        let suggest_due = self.poll_suggestions(&ctx);
+        self.poll_search();
+        if let Some(due) = suggest_due {
             ctx.request_repaint_after(due);
         } else {
             // The sweep moves visibly, so a load asks for frames faster than playback
@@ -4325,14 +4922,20 @@ impl eframe::App for App {
                             .corner_radius(egui::CornerRadius::same(8))
                             .inner_margin(egui::Margin::symmetric(14, 8))
                             .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(text).font(theme::medium(13.0)).color(
-                                        if error {
-                                            self.palette.danger
-                                        } else {
-                                            self.palette.text
-                                        },
-                                    ),
+                                // One line, always: a toast is a short confirmation, and the
+                                // anchored area's width is not something to wrap a two-word
+                                // phrase against. `Extend` sizes the bubble to the text.
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(text).font(theme::medium(13.0)).color(
+                                            if error {
+                                                self.palette.danger
+                                            } else {
+                                                self.palette.text
+                                            },
+                                        ),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Extend),
                                 );
                             });
                     });
@@ -4399,6 +5002,23 @@ mod tests {
 
     fn artist(id: &str) -> Route {
         Route::Artist(id.to_owned())
+    }
+
+    /// The fade curve: nothing mid-track, a ramp over the last `CROSSFADE_SECS`, and the same at
+    /// the start; a paused player never fades out.
+    #[test]
+    fn the_crossfade_curve_dips_and_ramps() {
+        let d = 240.0;
+        assert_eq!(crossfade_factor(true, 60.0, d, None), 1.0);
+        assert_eq!(crossfade_factor(true, d - CROSSFADE_SECS, d, None), 1.0);
+        assert!((crossfade_factor(true, d - CROSSFADE_SECS / 2.0, d, None) - 0.5).abs() < 1e-9);
+        assert_eq!(crossfade_factor(true, d, d, None), 0.0);
+        assert_eq!(crossfade_factor(false, d - 1.0, d, None), 1.0);
+        assert_eq!(crossfade_factor(true, 1.0, d, Some(0.0)), 0.0);
+        assert!((crossfade_factor(true, 1.0, d, Some(CROSSFADE_SECS / 2.0)) - 0.5).abs() < 1e-9);
+        assert_eq!(crossfade_factor(true, 1.0, d, Some(CROSSFADE_SECS)), 1.0);
+        // Both ramps at once: the lower one wins (a very short track).
+        assert_eq!(crossfade_factor(true, 0.0, 2.0, Some(0.5)), 0.1);
     }
 
     #[test]

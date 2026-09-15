@@ -30,6 +30,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
     crate::ui::page_scroll(app, "mood").show(ui, |ui| {
         section(ui, &app.palette, "Playlists");
         let mut clicked = None;
+        let mut played = None;
         ui.horizontal_wrapped(|ui| {
             for (i, pl) in app
                 .mood_playlists
@@ -50,7 +51,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
                         )
                     })
                     .flatten();
-                if widgets::art_card(
+                let card = widgets::art_card(
                     ui,
                     &app.palette,
                     CARD_W,
@@ -60,14 +61,27 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
                     widgets::ArtShape::Square,
                     None,
                     false,
-                )
-                .response
-                .clicked()
-                {
+                    false,
+                );
+                // The corner play button wins over the card click, the same contract every
+                // other card grid follows: play the playlist, don't open it.
+                if card.play {
+                    played = Some(i);
+                } else if card.response.clicked() {
                     clicked = Some(i);
                 }
             }
         });
+        if let Some(i) = played {
+            let id = app
+                .mood_playlists
+                .as_ref()
+                .and_then(|m| m.playlists.get(i))
+                .map(|pl| pl.id.clone());
+            if let Some(id) = id {
+                app.play_playlist(id);
+            }
+        }
         if let Some(i) = clicked {
             let id = app
                 .mood_playlists

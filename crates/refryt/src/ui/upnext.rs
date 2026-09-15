@@ -64,11 +64,8 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                         active: is_active(now, &t.video_id),
                         playing: is_active(now, &t.video_id) && !now.paused,
                         badge: None,
-                        shape: if t.wide {
-                            ArtShape::Wide
-                        } else {
-                            ArtShape::Square
-                        },
+                        // Square: the queue shows the cover, not a cropped 16:9 still.
+                        shape: ArtShape::Square,
                         thumbnail: t.thumbnail.as_ref(),
                         menu: Some(widgets::RowMenu {
                             track: t,
@@ -161,11 +158,8 @@ fn now_playing(app: &mut App, ui: &mut egui::Ui) {
                 active: is_active(now, &track.video_id),
                 playing: is_active(now, &track.video_id) && !now.paused,
                 badge: None,
-                shape: if track.wide {
-                    ArtShape::Wide
-                } else {
-                    ArtShape::Square
-                },
+                // Square: the cover, not a cropped 16:9 still.
+                shape: ArtShape::Square,
                 thumbnail: track.thumbnail.as_ref(),
                 // No menu on the current track: everything it offers is already in the player
                 // bar, and a menu here would be the only row in the panel that could remove

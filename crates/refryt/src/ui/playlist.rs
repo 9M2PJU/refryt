@@ -225,6 +225,9 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                             manage: pl.editable,
                             remove_from_library: false,
                             context_only: false,
+                            // A local playlist has no YouTube radio to start.
+                            radio_id: matches!(pl.source, crate::model::PlaylistSource::YouTube)
+                                .then_some(pl.id.as_str()),
                             save_as_new: None,
                         },
                     )

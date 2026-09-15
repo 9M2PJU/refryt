@@ -24,11 +24,17 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "g
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+# The crash report's prefilled issue URL.
+url.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ytmapi-rs.workspace = true
 refryt-resolve.workspace = true
 libmpv2.workspace = true
+# The software render API for the in-app music video. `libmpv2`'s safe wrapper only exposes the
+# OpenGL render params, which the app cannot use on Windows (wgpu there for per-pixel alpha), so
+# the video view drives mpv's `sw` render context directly through these bindings.
+libmpv2-sys = "=4.0.1"
 # `blur.rs`'s three backends (KDE, Windows, and the do-nothing stub for everything else) all
 # read the raw window/display handles eframe exposes, so this is unconditional rather than
 # behind any one target's `cfg`.
@@ -37,6 +43,9 @@ raw-window-handle = "0.6"
 # libappindicator on Linux, the Shell_NotifyIcon API on Windows, NSStatusItem on macOS — so this
 # sits here unconditionally; only building the GTK loop it needs on Linux is target-gated below.
 tray-icon = "0.25.0"
+# OS media controls: MPRIS on Linux (via zbus), SMTC on Windows, Now Playing on macOS. This is
+# what makes desktop/lock-screen/headset media keys work.
+playwire = "1.0"
 # Local music (`local.rs`): `rfd` is the native folder-picker dialog behind Settings' "Add
 # folder" button, `walkdir` recursively finds audio files under it, and `lofty` reads their
 # title/artist/album/duration tags.

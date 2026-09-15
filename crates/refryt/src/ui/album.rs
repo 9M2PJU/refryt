@@ -137,6 +137,8 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                             manage: false,
                             remove_from_library: false,
                             context_only: false,
+                            // The album's own radio seeds from its audio playlist id.
+                            radio_id: a.like_id.as_deref(),
                             save_as_new: None,
                         },
                     )
