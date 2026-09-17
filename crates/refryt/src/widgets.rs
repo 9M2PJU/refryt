@@ -1353,6 +1353,14 @@ pub fn skeleton_header(ui: &mut Ui, palette: &Palette, size: f32, kind: Skeleton
     ui.add_space(12.0);
 }
 
+/// Whether a row's rating thumbs share the duration's corner, given the row's width and what it
+/// carries. They do only where there is no room for their own zone *and* they can actually be
+/// drawn: a ratable, signed-in row. A row with no rating (the queue) or no session has no thumbs
+/// to put there, so it keeps its duration at any width — see `track_row`'s own comment.
+fn corner_shares_duration(width: f32, show_rating: bool, has_menu: bool, signed_in: bool) -> bool {
+    width < 520.0 && show_rating && has_menu && signed_in
+}
+
 /// A single track row: number (optional), art, title with an explicit badge, artist with play
 /// count, duration.
 ///
@@ -1394,28 +1402,37 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
     // room. A full-size art and a 30pt number column left 21pt of it on a 215pt card,
     // which is one ellipsis. Decided here, because the duration slot below leans on it.
     let narrow = rect.width() < 340.0;
+    // Below this the hover thumbs stop getting a reserved zone of their own and are meant to take
+    // the duration's corner instead, the same fallback the narrow queue rows already used. A zone
+    // costs 68pt, and a row this size cannot pay it without clipping its own subtitle — the
+    // artist page's side-by-side "Popular" column is exactly this width.
+    let corner_thumbs = rect.width() < 520.0;
+    // Whether the thumbs really do share that corner. They can only where they will be drawn:
+    // a ratable, signed-in row. Where they cannot — the queue, a signed-out list — the duration
+    // is not stepping aside for anything and stays put at every width.
+    let share_corner = corner_shares_duration(
+        rect.width(),
+        show_rating,
+        menu.is_some(),
+        menu.as_ref().is_some_and(|m| m.signed_in),
+    );
     // Measured, not constant: an hour-long mix ("1:02:05") is wider than the 44pt a
     // "3:33" needs, and a fixed slot grazes the title in the narrow queue. Nothing
-    // painted, nothing reserved beyond the old minimum. On a narrow rated row the slot
-    // is the thumbs' corner — the pair spans 62pt, so the text must clear it even though
-    // the duration itself only shows when the thumbs do not.
+    // painted, nothing reserved beyond the old minimum. Where the corner is shared the slot
+    // is the thumbs' — the pair spans 62pt, so the text must clear it whether or not a thumb
+    // is showing this frame.
     let duration_w = match duration {
         Some(d) => text_width(ui, &fmt_duration(d), &theme::regular(12.0)) + 12.0,
         None => badge.map_or(0.0, |b| text_width(ui, b, &theme::semibold(9.0)) + 12.0),
     }
-    .max(if narrow && show_rating { 76.0 } else { 44.0 });
+    .max(if share_corner { 76.0 } else { 44.0 });
     // Reserved whether or not the thumbs are drawn, so a row does not re-truncate its title as
-    // the pointer crosses it — but only where they can appear at all. The queue turns rating
-    // off, and giving that panel back its 68pt is the difference between "Jigsaw Fallin…" and
-    // a readable title in a 300pt rail.
+    // the pointer crosses it — but only where they get a zone of their own. The queue turns
+    // rating off, and giving that panel back its 68pt is the difference between "Jigsaw Fallin…"
+    // and a readable title in a 300pt rail.
     // Wide enough for the pair: two 30pt buttons at offsets 50/18 span 62pt, and anything
     // narrower paints the Like button over the title's tail.
-    // ...and only where the row is wide enough to pay for the reservation. On a card squeezed
-    // by the open queue — a 750pt window leaves ~200pt — reserving 68pt for hover-only
-    // controls left the title two characters and the duration an island. Below the floor the
-    // thumbs take the duration's corner instead (see the rating block), so nothing is
-    // reserved and nothing covers the text.
-    let thumb_w = if show_rating && rect.width() >= 340.0 {
+    let thumb_w = if show_rating && !corner_thumbs {
         68.0
     } else {
         0.0
@@ -1603,32 +1620,29 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
 
         // Duration when there is one, otherwise the type badge. They occupy the same slot because
         // a row has one or the other: only songs carry a duration, only mixed lists need a badge.
-        // On a narrow row the rating thumbs live in this corner instead of beside the text, so
-        // the slot steps aside for as long as a thumb is showing — a liked row keeps its thumb
-        // here at rest, and the duration returns when the pointer moves on.
-        let rated = matches!(
-            like,
-            crate::model::LikeStatus::Like | crate::model::LikeStatus::Dislike
-        );
-        let thumb_corner = narrow && show_rating && (over || rated);
-        if let Some(d) = duration
-            && !thumb_corner
-        {
-            ui.painter().text(
-                egui::pos2(rect.right() - right_pad, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                fmt_duration(d),
-                theme::regular(12.0),
-                palette.dim,
-            );
-        } else if !thumb_corner && let Some(badge) = badge {
-            ui.painter().text(
-                egui::pos2(rect.right() - right_pad, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                badge,
-                theme::semibold(9.0),
-                palette.dim,
-            );
+        // Where the corner is shared with the rating thumbs it holds the thumb and nothing else —
+        // for *every* row, so a list never mixes rows that show a duration with rows that show a
+        // thumb. (Letting unrated rows keep the duration was exactly that inconsistency: rated
+        // rows lost it, unrated ones did not, purely by width.) With no corner to share — wide
+        // rows, the queue, signed-out lists — the duration is always painted.
+        if !share_corner {
+            if let Some(d) = duration {
+                ui.painter().text(
+                    egui::pos2(rect.right() - right_pad, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    fmt_duration(d),
+                    theme::regular(12.0),
+                    palette.dim,
+                );
+            } else if let Some(badge) = badge {
+                ui.painter().text(
+                    egui::pos2(rect.right() - right_pad, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    badge,
+                    theme::semibold(9.0),
+                    palette.dim,
+                );
+            }
         }
     }
 
@@ -1647,9 +1661,9 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         && let Some((id, true)) = ratable
     {
         // Wide rows reserve a 68pt zone left of the duration and anchor the thumbs there.
-        // Narrow rows have no zone to anchor to — the thumbs take the duration's corner
-        // instead, where the duration itself has just stepped aside for them.
-        let thumb_right = if rect.width() < 340.0 {
+        // Corner-sharing rows have no zone to anchor to — the thumbs take the duration's corner
+        // instead, where the duration itself has stepped aside for them.
+        let thumb_right = if share_corner {
             rect.right() - 17.0
         } else {
             rect.right() - right_pad - duration_w
@@ -2600,6 +2614,12 @@ pub fn pill_button(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Respons
     pill(ui, palette, label, PillStyle::Accent)
 }
 
+/// An outlined pill, the quiet sibling of [`pill_button`] — the artist page's Subscribe
+/// (a "Follow" in the reference it borrows its shape from).
+pub fn outline_button(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
+    pill(ui, palette, label, PillStyle::Outline)
+}
+
 /// A filter chip: a pill that carries a selected state.
 ///
 /// Selected inverts — the label's colour becomes the fill and the window's becomes the label —
@@ -2986,6 +3006,10 @@ enum PillStyle {
     Quiet,
     /// A selected chip.
     Selected,
+    /// No fill at rest, a real outline, the label at full brightness — the artist page's
+    /// Subscribe, mirroring the reference's outlined "Follow". Hover fills it quietly, the way
+    /// the Quiet chip already does, so it still reads as a button rather than a label.
+    Outline,
 }
 
 fn pill(ui: &mut Ui, palette: &Palette, label: &str, style: PillStyle) -> egui::Response {
@@ -3010,6 +3034,16 @@ fn pill(ui: &mut Ui, palette: &Palette, label: &str, style: PillStyle) -> egui::
                 mix(palette.secondary, palette.text, t),
             ),
             PillStyle::Selected => (mix(palette.text, Color32::WHITE, t * 0.4), palette.window),
+            PillStyle::Outline => (
+                // Spelled out rather than mixed from `TRANSPARENT`: `mix` builds opaque colours,
+                // so a zero-`t` mix comes back opaque black — a filled pill, not an outline.
+                if t <= 0.001 {
+                    Color32::TRANSPARENT
+                } else {
+                    palette.surface_hover.gamma_multiply(t)
+                },
+                mix(palette.text, Color32::WHITE, t * 0.4),
+            ),
         };
         let fill = if held(&response) {
             fill.gamma_multiply(0.85)
@@ -3017,6 +3051,14 @@ fn pill(ui: &mut Ui, palette: &Palette, label: &str, style: PillStyle) -> egui::
             fill
         };
         ui.painter().rect_filled(rect, CornerRadius::same(16), fill);
+        if matches!(style, PillStyle::Outline) {
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(16),
+                egui::Stroke::new(1.0, mix(palette.outline, palette.text, t * 0.5)),
+                egui::StrokeKind::Inside,
+            );
+        }
         ui.painter().galley(
             rect.center() - galley.size() / 2.0 + press_offset(&response),
             galley,
@@ -3557,5 +3599,24 @@ mod tests {
             ctx.read_response(id).is_some(),
             "an open page menu that never renders is the bug"
         );
+    }
+
+    /// The duration is a list-wide decision, not a per-row one. Where the rating thumbs share its
+    /// corner — a narrow, ratable, signed-in row — no row in that state paints a duration, so a
+    /// list cannot mix rows that show one with rows that do not. Everywhere else it stays.
+    #[test]
+    fn only_a_narrow_ratable_signed_in_row_shares_the_duration_corner() {
+        assert!(corner_shares_duration(400.0, true, true, true));
+        // Wide enough for the thumbs' own zone: the duration is always painted.
+        assert!(!corner_shares_duration(600.0, true, true, true));
+        // The queue turns rating off, so there are no thumbs to step aside for.
+        assert!(!corner_shares_duration(400.0, false, true, true));
+        // Signed out there is nothing to draw in the corner.
+        assert!(!corner_shares_duration(400.0, true, true, false));
+        // No menu, no rating (history's album and playlist rows).
+        assert!(!corner_shares_duration(400.0, true, false, true));
+        // Exactly at the threshold the zone still fits; sharing starts below it.
+        assert!(corner_shares_duration(519.0, true, true, true));
+        assert!(!corner_shares_duration(520.0, true, true, true));
     }
 }

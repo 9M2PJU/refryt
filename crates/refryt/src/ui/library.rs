@@ -561,9 +561,23 @@ fn local_folder_browser(app: &mut App, ui: &mut egui::Ui) {
 }
 
 /// Every local track's folder-path segments (relative to whichever configured root it sits
-/// under) paired with its position in `app.local_tracks`. Recomputed each frame rather than
-/// cached — a scan itself is already infrequent, and this is cheap next to painting the page.
-fn local_entries(app: &App) -> Option<Vec<(Vec<String>, usize)>> {
+/// under) paired with its position in `app.local_tracks`.
+///
+/// Cached against `(local_tracks_generation, local_folders)`: neither changes on most frames the
+/// Local tab is open, and re-walking every track's path into freshly allocated `String` segments
+/// every frame is a real cost once the local library holds any real number of files.
+fn local_entries(app: &mut App) -> Option<crate::app::LocalEntries> {
+    if app.settings.local_folders.is_empty() {
+        return None;
+    }
+    let generation = app.local_tracks_generation;
+    if let Some((cached_gen, cached_folders, entries)) = &app.local_entries_cache
+        && *cached_gen == generation
+        && cached_folders == &app.settings.local_folders
+    {
+        return Some(entries.clone());
+    }
+
     let roots: Vec<std::path::PathBuf> = app
         .settings
         .local_folders
@@ -573,24 +587,29 @@ fn local_entries(app: &App) -> Option<Vec<(Vec<String>, usize)>> {
     if roots.is_empty() {
         return None;
     }
-    Some(
-        app.local_tracks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| {
-                let path = t.local_path.as_ref()?;
-                let root = roots.iter().find(|r| path.starts_with(r))?;
-                let rel = path.strip_prefix(root).ok()?;
-                let mut segs: Vec<String> = rel
-                    .iter()
-                    .map(|c| c.to_string_lossy().into_owned())
-                    .collect();
-                // The filename itself is not a folder segment.
-                segs.pop();
-                Some((segs, i))
-            })
-            .collect(),
-    )
+    let entries: crate::app::LocalEntries = app
+        .local_tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let path = t.local_path.as_ref()?;
+            let root = roots.iter().find(|r| path.starts_with(r))?;
+            let rel = path.strip_prefix(root).ok()?;
+            let mut segs: Vec<String> = rel
+                .iter()
+                .map(|c| c.to_string_lossy().into_owned())
+                .collect();
+            // The filename itself is not a folder segment.
+            segs.pop();
+            Some((segs, i))
+        })
+        .collect();
+    app.local_entries_cache = Some((
+        generation,
+        app.settings.local_folders.clone(),
+        entries.clone(),
+    ));
+    Some(entries)
 }
 
 /// The current level's subfolders, as cards — a file-explorer view rather than a row of plain

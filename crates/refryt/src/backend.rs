@@ -92,6 +92,18 @@ pub enum Event {
         artist_id: String,
         error: String,
     },
+    /// One page of Liked Music, in the playlist's own (recently-saved) order, from the
+    /// background scan that builds `App::liked`.
+    LikedPage {
+        tracks: Vec<crate::model::Track>,
+        epoch: u64,
+    },
+    /// The liked scan ended. `complete` is true only when the playlist was read to its end —
+    /// an error midway stops the scan without marking the partial list authoritative.
+    LikedScanDone {
+        complete: bool,
+        epoch: u64,
+    },
     AlbumLoaded {
         id: String,
         album: Album,
@@ -125,8 +137,11 @@ pub enum Event {
         id: String,
         tracks: Vec<Track>,
     },
+    /// `epoch` is the account epoch this fetch was issued under — see `App::account_epoch`'s own
+    /// doc comment for why a reply whose epoch has since moved on must be dropped.
     LibraryLoaded {
         library: Library,
+        epoch: u64,
     },
     LibraryMore {
         section: crate::api::LibrarySection,
@@ -143,12 +158,15 @@ pub enum Event {
     /// and the rail listed all 31 of them twice.
     SidebarPlaylists {
         page: crate::innertube::Page,
+        epoch: u64,
     },
     SidebarPlaylistsFailed {
         error: String,
+        epoch: u64,
     },
     LibraryFailed {
         error: String,
+        epoch: u64,
     },
     SubscriptionChanged {
         channel_id: String,
@@ -188,9 +206,12 @@ pub enum Event {
     },
     HistoryLoaded {
         shelves: Vec<Shelf>,
+        /// The visit this was fetched for; a reply for a superseded visit is stale.
+        epoch: u64,
     },
     HistoryFailed {
         error: String,
+        epoch: u64,
     },
     PlaylistCreated {
         title: String,
@@ -203,10 +224,13 @@ pub enum Event {
         filter: Option<String>,
         shelves: Vec<Shelf>,
         chips: Vec<crate::model::HomeChip>,
+        /// See `LibraryLoaded::epoch`'s own doc comment.
+        epoch: u64,
     },
     HomeFailed {
         filter: Option<String>,
         error: String,
+        epoch: u64,
     },
     MoodPlaylistsLoaded {
         params: String,
@@ -352,17 +376,22 @@ pub enum Event {
     AuthChanged(AuthState),
     AccountsLoaded {
         accounts: Vec<crate::model::Account>,
+        epoch: u64,
     },
     /// A sign-in *attempt* failed. Deliberately distinct from `AuthChanged`: a refused attempt
     /// must not disturb a session that is already working.
     SignInFailed {
         error: String,
     },
-    Resolving(Track),
-    Playing(Track),
+    /// `generation` is the value `Backend::play`/`play_video` returned when this attempt was
+    /// started — see `App::play_generation`'s own doc comment for why every one of these three
+    /// carries it.
+    Resolving(Track, u64),
+    Playing(Track, u64),
     PlaybackFailed {
         track: Track,
         error: String,
+        generation: u64,
     },
     /// Cover art finished decoding on a worker; the UI thread uploads it as a texture.
     ImageReady(Box<images::Loaded>),
@@ -684,11 +713,15 @@ impl Backend {
             let video_id = track.video_id.clone();
             match run_download(&track, format, &tx, &ctx).await {
                 Ok(path) => {
-                    downloads::embed_tags(
-                        &path,
-                        &track,
-                        cover_bytes(&http, &track).await.as_deref(),
-                    );
+                    let cover = cover_bytes(&http, &track).await;
+                    let (tag_path, tag_track) = (path.clone(), track.clone());
+                    // Blocking `lofty` file I/O off the runtime's own worker threads (only 2 of
+                    // them — see `Self::new`) so a slow tag-embed can't stall unrelated async
+                    // work sharing the runtime.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        downloads::embed_tags(&tag_path, &tag_track, cover.as_deref());
+                    })
+                    .await;
                     Self::emit(
                         &tx,
                         &ctx,
@@ -720,11 +753,12 @@ impl Backend {
                 let video_id = track.video_id.clone();
                 match run_download(&track, format, &tx, &ctx).await {
                     Ok(path) => {
-                        downloads::embed_tags(
-                            &path,
-                            &track,
-                            cover_bytes(&http, &track).await.as_deref(),
-                        );
+                        let cover = cover_bytes(&http, &track).await;
+                        let (tag_path, tag_track) = (path.clone(), track.clone());
+                        let _ = tokio::task::spawn_blocking(move || {
+                            downloads::embed_tags(&tag_path, &tag_track, cover.as_deref());
+                        })
+                        .await;
                         Self::emit(
                             &tx,
                             &ctx,
@@ -834,6 +868,21 @@ impl Backend {
         });
     }
 
+    /// Write the playback-persistence store off the render thread. `App::poll_playback` calls
+    /// this every few seconds while something plays, and the queue it serializes only grows over
+    /// a long session — doing the `serde_json` encode and the disk write synchronously on the UI
+    /// thread turned a routine periodic save into a growing frame hitch.
+    pub fn save_playback(&self, store: crate::playback::Store) {
+        self.rt.spawn(async move {
+            if let Err(e) = tokio::task::spawn_blocking(move || crate::playback::save(&store))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("playback save panicked: {e}")))
+            {
+                tracing::debug!(error = %format!("{e:#}"), "could not save the playback state");
+            }
+        });
+    }
+
     pub fn fetch_artist(&self, id: String) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
@@ -904,19 +953,98 @@ impl Backend {
         });
     }
 
-    pub fn fetch_library(&self, sort: crate::api::LibrarySortParam) {
+    pub fn fetch_library(&self, sort: crate::api::LibrarySortParam, epoch: u64) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             let event = match api.library(sort).await {
-                Ok(library) => Event::LibraryLoaded { library },
+                Ok(library) => Event::LibraryLoaded { library, epoch },
                 Err(e) => Event::LibraryFailed {
                     error: format!("{e:#}"),
+                    epoch,
                 },
             };
             Self::emit(&tx, &ctx, event);
         });
     }
 
+    /// Page Liked Music into `Event::LikedPage`s, one page per event, ending with
+    /// `Event::LikedScanDone`.
+    ///
+    /// `full` reads the playlist to its end; `false` refreshes only the first page — the newest
+    /// likes — which is what every launch does. A full scan happens only when the cache is
+    /// missing or old (see `crate::liked::MAX_AGE`), because it is dozens of continuation
+    /// requests on a large library. Continuations are retried like `fetch_playlist_more`'s: a
+    /// flaky body read halfway down a 5,000-row playlist must not end the scan.
+    pub fn fetch_liked(&self, epoch: u64, full: bool) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let mut page = match api.playlist("VLLM").await {
+                Ok(p) => p.tracks,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "liked songs could not be read");
+                    Self::emit(
+                        &tx,
+                        &ctx,
+                        Event::LikedScanDone {
+                            complete: false,
+                            epoch,
+                        },
+                    );
+                    return;
+                }
+            };
+            loop {
+                let done = page.next.is_none() || !full;
+                let complete = page.next.is_none();
+                let tracks: Vec<crate::model::Track> = std::mem::take(&mut page.items);
+                Self::emit(&tx, &ctx, Event::LikedPage { tracks, epoch });
+                if done {
+                    Self::emit(&tx, &ctx, Event::LikedScanDone { complete, epoch });
+                    return;
+                }
+                // A short breather between pages: this is background work, and the playlist is
+                // a long chain of requests that would otherwise look like a scrape.
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                let token = page.next.take().expect("checked above");
+                const ATTEMPTS: u32 = 3;
+                let mut last_err = None;
+                for attempt in 0..ATTEMPTS {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            300 * 3u64.pow(attempt - 1),
+                        ))
+                        .await;
+                    }
+                    match api.playlist_more(token.clone()).await {
+                        Ok(more) => {
+                            last_err = None;
+                            page = crate::model::Paged::new(
+                                more.items
+                                    .iter()
+                                    .filter_map(|e| e.track().cloned())
+                                    .collect(),
+                                more.next,
+                            );
+                            break;
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                if let Some(e) = last_err {
+                    tracing::warn!(error = %format!("{e:#}"), "liked songs scan stopped");
+                    Self::emit(
+                        &tx,
+                        &ctx,
+                        Event::LikedScanDone {
+                            complete: false,
+                            epoch,
+                        },
+                    );
+                    return;
+                }
+            }
+        });
+    }
     /// The next page of a playlist's tracks.
     ///
     /// Retried a couple of times on failure, unlike every other single-shot fetch in this file:
@@ -963,13 +1091,14 @@ impl Backend {
     }
 
     /// The first page of your playlists, for the sidebar.
-    pub fn fetch_library_playlists(&self) {
+    pub fn fetch_library_playlists(&self, epoch: u64) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             let event = match api.library_playlists().await {
-                Ok(page) => Event::SidebarPlaylists { page },
+                Ok(page) => Event::SidebarPlaylists { page, epoch },
                 Err(e) => Event::SidebarPlaylistsFailed {
                     error: format!("{e:#}"),
+                    epoch,
                 },
             };
             Self::emit(&tx, &ctx, event);
@@ -1008,10 +1137,12 @@ impl Backend {
     /// Expand one of an artist's shelf previews (Albums, Videos, Playlists, ...) into its full
     /// list. `browse_id` is whatever id that shelf's own "more" button carries — the artist's
     /// channel id only coincidentally, not by rule — paired with that shelf's `params`.
-    pub fn fetch_artist_albums(&self, browse_id: String, params: String) {
+    /// Expand one artist shelf, `title` naming the shelf so the response can be narrowed to its
+    /// own section — see [`crate::api::Api::artist_albums`].
+    pub fn fetch_artist_albums(&self, browse_id: String, params: String, title: String) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
-            let event = match api.artist_albums(&browse_id, &params).await {
+            let event = match api.artist_albums(&browse_id, &params, &title).await {
                 Ok(items) => Event::ArtistAlbumsLoaded {
                     artist_id: browse_id,
                     items,
@@ -1133,13 +1264,15 @@ impl Backend {
     }
 
     /// What you played, in dated shelves. Signed in only — the page gates, not the call.
-    pub fn fetch_history(&self) {
+    /// `epoch` is the visit this serves, echoed back so a superseded refresh is dropped.
+    pub fn fetch_history(&self, epoch: u64) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             let event = match api.history().await {
-                Ok(shelves) => Event::HistoryLoaded { shelves },
+                Ok(shelves) => Event::HistoryLoaded { shelves, epoch },
                 Err(e) => Event::HistoryFailed {
                     error: format!("{e:#}"),
+                    epoch,
                 },
             };
             Self::emit(&tx, &ctx, event);
@@ -1160,7 +1293,7 @@ impl Backend {
         });
     }
 
-    pub fn fetch_home(&self, filter: Option<String>) {
+    pub fn fetch_home(&self, filter: Option<String>, epoch: u64) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             let event = match api.home(filter.as_deref()).await {
@@ -1168,10 +1301,12 @@ impl Backend {
                     filter,
                     shelves: feed.shelves,
                     chips: feed.chips,
+                    epoch,
                 },
                 Err(e) => Event::HomeFailed {
                     filter,
                     error: format!("{e:#}"),
+                    epoch,
                 },
             };
             Self::emit(&tx, &ctx, event);
@@ -1579,11 +1714,13 @@ impl Backend {
     }
 
     /// The channels this account can browse as.
-    pub fn fetch_accounts(&self) {
+    pub fn fetch_accounts(&self, epoch: u64) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             match api.accounts().await {
-                Ok(accounts) => Self::emit(&tx, &ctx, Event::AccountsLoaded { accounts }),
+                Ok(accounts) => {
+                    Self::emit(&tx, &ctx, Event::AccountsLoaded { accounts, epoch })
+                }
                 // Not an error the user can act on — the chip falls back to an initial — but a
                 // silent swallow is how a chip with no picture looks exactly like a chip whose
                 // picture has not arrived yet.
@@ -1601,7 +1738,9 @@ impl Backend {
         self.resolver.clear();
     }
 
-    pub fn play(&self, track: Track, mpv: Arc<Mpv>, volume: f64, normalise: bool) {
+    /// Returns the generation this attempt was started under — see `App::play_generation`'s own
+    /// doc comment for why the caller needs it.
+    pub fn play(&self, track: Track, mpv: Arc<Mpv>, volume: f64, normalise: bool) -> u64 {
         let downloads = Arc::clone(&self.downloads);
         let (resolver, api, tx, ctx) = (
             Arc::clone(&self.resolver),
@@ -1609,14 +1748,20 @@ impl Backend {
             self.tx.clone(),
             self.ctx.clone(),
         );
-        // A new play supersedes any scrobble task still running for the old track.
+        // A new play supersedes any scrobble task still running for the old track, and — via the
+        // `generation` stamped on every event below — any `Resolving`/`Playing`/`PlaybackFailed`
+        // reply still in flight for a previous, now-superseded `play`/`play_video` call.
         let generation = self.scrobble_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let scrobble = Scrobble {
             api: Arc::clone(&self.api),
             http: self.http.clone(),
             generation: Arc::clone(&self.scrobble_generation),
         };
-        Self::emit(&self.tx, &self.ctx, Event::Resolving(track.clone()));
+        Self::emit(
+            &self.tx,
+            &self.ctx,
+            Event::Resolving(track.clone(), generation),
+        );
 
         self.rt.spawn(async move {
             // A downloaded track plays from disk without the resolver — offline, and without the
@@ -1629,13 +1774,14 @@ impl Backend {
             if let Some(path) = downloaded {
                 let event =
                     match player::load(&mpv, &path.to_string_lossy(), volume, None, normalise) {
-                        Ok(()) => Event::Playing(track),
+                        Ok(()) => Event::Playing(track, generation),
                         Err(e) => Event::PlaybackFailed {
                             track,
                             error: format!("{e:#}"),
+                            generation,
                         },
                     };
-                if let Event::Playing(ref track) = event {
+                if let Event::Playing(ref track, _) = event {
                     scrobble.maybe_start(track.clone(), Arc::clone(&mpv), generation);
                 }
                 Self::emit(&tx, &ctx, event);
@@ -1647,10 +1793,11 @@ impl Backend {
             if let Some(path) = track.local_path.clone() {
                 let event =
                     match player::load(&mpv, &path.to_string_lossy(), volume, None, normalise) {
-                        Ok(()) => Event::Playing(track),
+                        Ok(()) => Event::Playing(track, generation),
                         Err(e) => Event::PlaybackFailed {
                             track,
                             error: format!("{e:#}"),
+                            generation,
                         },
                     };
                 Self::emit(&tx, &ctx, event);
@@ -1679,6 +1826,7 @@ impl Backend {
                         Event::PlaybackFailed {
                             track,
                             error: format!("{e:#}"),
+                            generation,
                         },
                     );
                     return;
@@ -1694,10 +1842,11 @@ impl Backend {
                         stream.loudness_db,
                         normalise,
                     ) {
-                        Ok(()) => Event::Playing(track),
+                        Ok(()) => Event::Playing(track, generation),
                         Err(e) => Event::PlaybackFailed {
                             track,
                             error: format!("{e:#}"),
+                            generation,
                         },
                     }
                 }
@@ -1706,31 +1855,40 @@ impl Backend {
                     Event::PlaybackFailed {
                         track,
                         error: format!("{e:#}"),
+                        generation,
                     }
                 }
             };
-            if let Event::Playing(ref track) = event {
+            if let Event::Playing(ref track, _) = event {
                 scrobble.maybe_start(track.clone(), Arc::clone(&mpv), generation);
             }
             Self::emit(&tx, &ctx, event);
         });
+        generation
     }
 
     /// Play a music video. Unlike `play`, mpv fetches the video itself through its yt-dlp hook —
     /// the resolver only returns audio-only streams. `track` is `wide`, so its id is the video's.
-    pub fn play_video(&self, track: Track, mpv: Arc<Mpv>, volume: f64) {
+    ///
+    /// Shares `play`'s generation counter — it races the exact same "what should mpv have loaded
+    /// last" question `Event::Playing`'s staleness guard exists for (the video toggle can fire a
+    /// `play_video` right as a new track's own `play` is still resolving).
+    pub fn play_video(&self, track: Track, mpv: Arc<Mpv>, volume: f64) -> u64 {
+        let generation = self.scrobble_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             let url = crate::model::track_url(&track.video_id);
             let event = match player::load_video(&mpv, &url, volume) {
-                Ok(()) => Event::Playing(track),
+                Ok(()) => Event::Playing(track, generation),
                 Err(e) => Event::PlaybackFailed {
                     track,
                     error: format!("{e:#}"),
+                    generation,
                 },
             };
             Self::emit(&tx, &ctx, event);
         });
+        generation
     }
 
     /// Resolve a track without playing it, so the URL is cached before it is needed.

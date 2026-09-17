@@ -140,6 +140,19 @@ impl Images {
         self.texture_inner(url, px, true, sized_url_wide(url, px), &mut want)
     }
 
+    /// The artist hero variant: `px` is the *width* and the server crops to [`HERO_ASPECT`], so
+    /// the page gets a band shaped like the slot it draws rather than a square it would have to
+    /// cover-crop (and, at hero sizes, upscale) client-side. The `wide` key bit keeps it distinct
+    /// from the square texture the same URL produces as a circle avatar.
+    pub fn texture_hero(
+        &mut self,
+        url: &Arc<str>,
+        px: u32,
+        mut want: impl FnMut(Arc<str>, String, u32, bool),
+    ) -> Option<&TextureHandle> {
+        self.texture_inner(url, px, true, sized_url_hero(url, px), &mut want)
+    }
+
     fn texture_inner(
         &mut self,
         url: &Arc<str>,
@@ -285,11 +298,29 @@ pub fn sized_url(url: &str, px: u32) -> String {
     format!("{base}={}", rewritten.join("-"))
 }
 
+/// The artist hero's height per unit width. YouTube's channel art is ~2.4:1; the artist page
+/// draws slightly shorter than that (see `ui::artist`'s `HERO_MIN_H`/`HERO_MAX_H`), and the
+/// server crop this ratio asks for is the one the page usually shows, so nothing is fetched that
+/// is never drawn. Both the fetch and the layout read this one number, which is what keeps the
+/// cached texture keyed by width alone honest.
+pub const HERO_ASPECT: f32 = 0.36;
+
+/// Ask YouTube for a crop of the given width at the hero's aspect.
+pub fn sized_url_hero(url: &str, w: u32) -> String {
+    sized_url_aspect(url, w, HERO_ASPECT)
+}
+
 /// Ask YouTube for a 16:9 crop at `w` wide. Same suffix rewrite as [`sized_url`], but the
 /// height follows the width — the server crops, so a square-arriving still is never squashed
 /// into a wide slot client-side.
 pub fn sized_url_wide(url: &str, w: u32) -> String {
-    let h = (w * 9).div_ceil(16).max(1);
+    sized_url_aspect(url, w, 9.0 / 16.0)
+}
+
+/// Rewrite the `w`/`h` size suffix to the given width and aspect. The one place the two
+/// wide-shaped variants differ.
+fn sized_url_aspect(url: &str, w: u32, aspect: f32) -> String {
+    let h = (w as f32 * aspect).round().max(1.0) as u32;
     let Some(eq) = url.rfind('=') else {
         return url.to_owned();
     };
@@ -428,6 +459,19 @@ mod tests {
     fn wide_urls_without_a_size_suffix_are_left_alone() {
         let plain = "https://example.com/still.jpg";
         assert_eq!(sized_url_wide(plain, 256), plain);
+    }
+
+    /// The hero asks for a band, not a 16:9 still: 1600 wide comes back 576 tall (36%).
+    #[test]
+    fn hero_urls_get_the_hero_band() {
+        assert_eq!(
+            sized_url_hero("https://yt3.googleusercontent.com/abc=w60-h60-l90-rj", 1600),
+            "https://yt3.googleusercontent.com/abc=w1600-h576-l90-rj"
+        );
+        assert_eq!(
+            sized_url_hero("https://example.com/banner.jpg", 1600),
+            "https://example.com/banner.jpg"
+        );
     }
 
     /// The squash this exists to prevent: a 16:9 still forced through the square path used

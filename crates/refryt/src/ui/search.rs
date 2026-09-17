@@ -110,13 +110,24 @@ fn results_list(app: &mut App, ui: &mut egui::Ui) {
     let scope = app.search_scope;
     let all = scope == SearchScope::All;
     let indices: Vec<usize> = if all {
-        app.results
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| scope.matches(e))
-            .map(|(i, _)| i)
-            .collect()
+        // Cached against `results_generation`: `results.items` doesn't change between one
+        // search landing and the next, so re-filtering it every frame is wasted work.
+        let generation = app.results_generation;
+        match &app.search_all_indices {
+            Some((cached_gen, indices)) if *cached_gen == generation => indices.clone(),
+            _ => {
+                let indices: Vec<usize> = app
+                    .results
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| scope.matches(e))
+                    .map(|(i, _)| i)
+                    .collect();
+                app.search_all_indices = Some((generation, indices.clone()));
+                indices
+            }
+        }
     } else {
         (0..app.scoped_results.len()).collect()
     };

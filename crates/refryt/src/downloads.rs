@@ -79,7 +79,8 @@ pub fn save(index: &Index) -> Result<()> {
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
     let bytes = serde_json::to_vec_pretty(index).context("could not encode the download index")?;
-    std::fs::write(&path, bytes).with_context(|| format!("could not write {}", path.display()))
+    crate::persist::write_json_atomic(&path, &bytes)
+        .with_context(|| format!("could not write {}", path.display()))
 }
 
 /// The yt-dlp arguments for one track: the audio format, a per-track output template that cannot

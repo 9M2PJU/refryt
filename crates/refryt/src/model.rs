@@ -428,6 +428,24 @@ impl Shelf {
     }
 }
 
+/// Keep an expanded shelf to the kinds its own preview already showed.
+///
+/// A shelf's "Show all" can answer with a whole artist page — the captured "From your library"
+/// expansion did — and flattening every renderer then mixed albums and playlists into a shelf
+/// that was songs. The preview names the kinds this shelf is actually made of; everything else
+/// belongs to another shelf. Never empties a shelf: when nothing in the expansion matches, the
+/// unfiltered list stands rather than the shelf silently vanishing.
+pub fn shelf_expansion(items: Vec<Entry>, preview: &[Entry]) -> Vec<Entry> {
+    let wanted: std::collections::HashSet<&str> = preview.iter().map(Entry::kind).collect();
+    if wanted.is_empty() || !items.iter().any(|e| wanted.contains(e.kind())) {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|e| wanted.contains(e.kind()))
+        .collect()
+}
+
 /// A search, in YouTube's own relevance order.
 ///
 /// One ranked list rather than three parallel ones: the unfiltered response ranks every type
@@ -485,6 +503,11 @@ pub struct Artist {
     pub actions: ArtistActions,
     pub description: Option<String>,
     pub thumbnail: Option<Arc<str>>,
+    /// The wide channel-art banner (`musicImmersiveHeaderRenderer`'s own thumbnail list, ~2.4:1)
+    /// that the artist page's full-bleed hero draws. `None` on a page that only carries a square
+    /// portrait — a channel's visual header — and on the typed fallback, where the hero slot
+    /// falls back to the circle-art header this page has always had.
+    pub hero: Option<Arc<str>>,
     pub top_songs: Vec<Track>,
     /// The id of the "Top songs" shelf's own auto-generated playlist — its "Show all" target.
     /// YouTube embeds only 5 songs directly in the artist page; the rest live here, one playlist
@@ -493,7 +516,10 @@ pub struct Artist {
     /// The page's shelves, with YouTube's own titles and order: Albums, Singles & EPs, Videos,
     /// Live performances, Featured on, Playlists, Fans might also like. Flattening these into one
     /// list is what made albums and singles indistinguishable and lost the rest.
-    pub shelves: Vec<Shelf>,
+    ///
+    /// `Arc`-wrapped like every sibling feed (`home`/`explore`/`releases`/`moods`/
+    /// `history_shelves`) so a per-frame snapshot is a refcount bump, not a deep clone.
+    pub shelves: Arc<Vec<Shelf>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -560,6 +586,23 @@ pub struct Playlist {
     pub source: PlaylistSource,
 }
 
+impl Playlist {
+    /// YouTube's own auto-generated mixes/radios ("My Mix", "Supermix", and the rest) open
+    /// through the same `Route::Playlist`/`Api::playlist` path as a real playlist, but their id
+    /// wraps a radio id — `VLRDCLAK5uy_…` rather than a real `VLPL…`/`VLOLAK…` playlist id — and
+    /// unlike a real playlist they are an unbounded algorithmic river with no fixed track list to
+    /// sort.
+    pub fn is_expanding(&self) -> bool {
+        is_expanding_playlist_id(&self.id)
+    }
+}
+
+/// `Playlist::is_expanding`'s own check, free of the struct so it's testable without building one.
+/// `bare_playlist_id` already strips the browse-only `VL` prefix this needs.
+fn is_expanding_playlist_id(id: &str) -> bool {
+    bare_playlist_id(id).starts_with("RD")
+}
+
 /// Lyrics for a track: either time-synced or plain text.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Lyrics {
@@ -610,6 +653,14 @@ pub fn artist_url(artist_id: &str) -> String {
 /// Whether an id is the Liked-Music auto playlist, which no edit endpoint accepts.
 pub fn is_liked_auto(id: &str) -> bool {
     bare_playlist_id(id) == "LM"
+}
+
+/// Whether an id is the "Episodes for later" auto playlist — the personal `SE` list, which is
+/// podcasts wearing a playlist's id. The app has no episode page and no podcast playback, so it
+/// is dropped wherever playlists are parsed rather than listed unopenable, the same way Liked
+/// Music is special-cased where an edit endpoint would refuse it.
+pub fn is_episodes_for_later(id: &str) -> bool {
+    bare_playlist_id(id) == "SE"
 }
 
 /// A list that arrives a page at a time.
@@ -832,6 +883,45 @@ mod tests {
         })
     }
 
+    fn album(id: &str) -> Entry {
+        Entry::Album(AlbumRef {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            artist: String::new(),
+            year: None,
+            kind: None,
+            thumbnail: None,
+        })
+    }
+
+    /// An expansion that came back as a whole artist page must not mix other shelves' content
+    /// into the one that was expanded — and must never empty the shelf either.
+    #[test]
+    fn an_expansion_keeps_only_the_kinds_its_preview_showed() {
+        let mixed = vec![song("s1"), album("a1"), artist("x")];
+        let kept = shelf_expansion(mixed.clone(), &[song("s1")]);
+        assert_eq!(kept, vec![song("s1")]);
+
+        let kept = shelf_expansion(mixed.clone(), &[artist("x")]);
+        assert_eq!(kept, vec![artist("x")]);
+
+        // Nothing of the preview's kind in the expansion: the list stands rather than the
+        // shelf emptying itself.
+        let kept = shelf_expansion(
+            mixed.clone(),
+            &[Entry::Mood(MoodRef {
+                title: "Chill".to_owned(),
+                params: "p".to_owned(),
+                colour: None,
+            })],
+        );
+        assert_eq!(kept, mixed);
+
+        // No preview at all: nothing to narrow to.
+        let kept = shelf_expansion(mixed.clone(), &[]);
+        assert_eq!(kept, mixed);
+    }
+
     /// Playing the third row of a mixed list must start the third *playable* item, not the third
     /// row — otherwise clicking a song after two artists plays the wrong track.
     #[test]
@@ -881,6 +971,13 @@ mod tests {
         assert!(is_liked_auto("VLLM"));
         assert!(is_liked_auto("LM"));
         assert!(!is_liked_auto("VLPLabc"));
+        assert!(is_episodes_for_later("VLSE"));
+        assert!(is_episodes_for_later("SE"));
+        assert!(!is_episodes_for_later("VLPLabc"));
+        assert!(is_expanding_playlist_id("VLRDCLAK5uy_khy"));
+        assert!(is_expanding_playlist_id("RDCLAK5uy_khy"));
+        assert!(!is_expanding_playlist_id("VLPLabc"));
+        assert!(!is_expanding_playlist_id("VLLM"));
     }
 
     /// The rail's second line: your own lists show how much is in them — as does Liked Music,

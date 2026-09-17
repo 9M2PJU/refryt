@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use crate::model::{
     AlbumRef, Artist, ArtistActions, ArtistRef, Entry, HomeChip, LikeStatus, MoodPlaylists,
-    MoodRef, PlaylistRef, SearchResults, Shelf, Track,
+    MoodRef, PlaylistRef, SearchResults, Shelf, Track, is_episodes_for_later,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -83,6 +83,36 @@ fn thumbnail(v: &Value) -> Option<Arc<str>> {
                 .and_then(Value::as_str)
         {
             return Some(Arc::from(url));
+        }
+    }
+    None
+}
+
+/// The widest thumbnail under `v` — the artist page's hero banner.
+///
+/// An artist page's `musicImmersiveHeaderRenderer` carries letterboxed channel art (live:
+/// 540×225, 816×340, 1078×449, all ~2.4:1) in the same `thumbnail` slot a channel page fills
+/// with a square profile photo. [`thumbnail`] takes the largest of *any* aspect, which is right
+/// for an avatar but would letterbox a hero slot; this refuses anything narrower than it is wide
+/// by more than half width, so a channel page simply gets no hero and keeps its circle header.
+fn wide_thumbnail(v: &Value) -> Option<Arc<str>> {
+    for path in [
+        "/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails",
+        "/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails",
+        "/thumbnail/thumbnails",
+    ] {
+        if let Some(list) = v.pointer(path).and_then(Value::as_array) {
+            let widest = list
+                .iter()
+                .filter(|t| {
+                    let w = t.get("width").and_then(Value::as_f64).unwrap_or(0.0);
+                    let h = t.get("height").and_then(Value::as_f64).unwrap_or(0.0);
+                    h > 0.0 && w / h >= 1.6
+                })
+                .max_by_key(|t| t.get("width").and_then(Value::as_u64).unwrap_or(0));
+            if let Some(url) = widest.and_then(|t| t.get("url")).and_then(Value::as_str) {
+                return Some(Arc::from(url));
+            }
         }
     }
     None
@@ -543,6 +573,50 @@ fn like_status(row: &Value) -> LikeStatus {
     }
 }
 
+/// A card's rating, from the liked-songs toggle in its own menu.
+///
+/// A signed-in watch-target card carries a menu, but not the `likeButtonRenderer` a row has:
+/// its like lives in a `toggleMenuServiceItemRenderer` whose *default* side describes the
+/// action currently on offer — "Remove from liked songs" (`defaultIcon: UNFAVORITE`, setting
+/// `INDIFFERENT`) when the song is liked, "Add to liked songs" (`FAVORITE`, setting `LIKE`)
+/// when it is not. Verified against a live signed-in Home feed on 2026-09-16, every card
+/// carrying one.
+///
+/// Read by icon, never by label: labels localise (this account's UI is in Greek) while the
+/// icon does not. A card with no menu — every signed-out card — simply has no rating, which is
+/// `Indifferent`, never an error.
+fn card_like_status(card: &Value) -> LikeStatus {
+    let Some(items) = card
+        .pointer("/menu/menuRenderer/items")
+        .and_then(Value::as_array)
+    else {
+        return LikeStatus::Indifferent;
+    };
+    for item in items {
+        let Some(toggle) = item.get("toggleMenuServiceItemRenderer") else {
+            continue;
+        };
+        // The like toggle is the one whose endpoints run through `likeEndpoint`; the pin
+        // (`KEEP`/`KEEP_OFF`) and save-to-playlist items do not. Albums and playlists also
+        // save through `likeEndpoint`, but their icon is the bookmark — never matched here,
+        // because this is only ever called on a watch-target card.
+        let has_like = ["defaultServiceEndpoint", "toggledServiceEndpoint"]
+            .iter()
+            .any(|key| toggle.pointer(&format!("/{key}/likeEndpoint")).is_some());
+        if !has_like {
+            continue;
+        }
+        return match toggle
+            .pointer("/defaultIcon/iconType")
+            .and_then(Value::as_str)
+        {
+            Some("UNFAVORITE") => LikeStatus::Like,
+            _ => LikeStatus::Indifferent,
+        };
+    }
+    LikeStatus::Indifferent
+}
+
 /// The now-playing song's rating, from the player overlay.
 ///
 /// Watch/`next` rows carry no like button — only `playerOverlays` does, at
@@ -854,7 +928,7 @@ fn parse_search_row(row: &Value) -> Option<Entry> {
             kind: None,
             thumbnail: thumb,
         })),
-        Target::Browse { id, page } if page == PAGE_PLAYLIST => {
+        Target::Browse { id, page } if page == PAGE_PLAYLIST && !is_episodes_for_later(&id) => {
             Some(Entry::Playlist(PlaylistRef {
                 id,
                 title,
@@ -1077,6 +1151,12 @@ fn parse_home_chip(chip: &Value) -> Option<HomeChip> {
     // Note: `text`, not `title` — the one field in this renderer not called what the shelf
     // header calls it, and exactly the kind of near-miss this parser exists to survive.
     let title = non_empty(text(chip.get("text").unwrap_or(&Value::Null)))?;
+    // The app has no podcast pages, so this chip can only lead to shelves of things it cannot
+    // open. It carries no type of its own — only its browse params, which YouTube rebuilds per
+    // feed — so, like `ytmapi-rs`'s own library filter, it is matched by its title.
+    if title.eq_ignore_ascii_case("podcasts") {
+        return None;
+    }
     let params = chip
         .pointer("/navigationEndpoint/browseEndpoint/params")
         .and_then(Value::as_str)
@@ -1234,14 +1314,57 @@ pub fn parse_library_section(root: &Value) -> Vec<Entry> {
 /// Scan every section for every renderer the artist pages use instead, and skip what is not
 /// recognised; an expansion that finds nothing is empty, not an error.
 pub fn parse_artist_albums(root: &Value) -> Vec<Entry> {
+    parse_artist_sections(root)
+        .into_iter()
+        .flat_map(|section| section.items)
+        .collect()
+}
+
+/// One section of an artist expansion, with the heading YouTube gave it.
+///
+/// A shelf's "Show all" can answer with far more than the shelf itself: the captured
+/// "From your library" expansion (`MPLA…` + `ggMCCAI=`) came back as the *whole artist page* —
+/// Top songs, every carousel, the description. Flattening that is what mixed albums and
+/// playlists into a songs shelf, so the caller can pick the section whose heading matches the
+/// shelf it asked about; the flat view remains the fallback for responses with no headings.
+pub struct ArtistSection {
+    /// The section's own heading, `None` for the untitled continuation shape and for sections
+    /// whose renderer carries no header.
+    pub title: Option<String>,
+    pub items: Vec<Entry>,
+}
+
+pub fn parse_artist_sections(root: &Value) -> Vec<ArtistSection> {
     let Some(sections) = find_section_list(root) else {
-        return continuation_items(root);
+        return vec![ArtistSection {
+            title: None,
+            items: continuation_items(root),
+        }];
     };
-    let mut out = Vec::new();
-    for section in sections {
-        collect_artist_items(section, &mut out);
-    }
-    out
+    sections
+        .iter()
+        .map(|section| {
+            let mut items = Vec::new();
+            collect_artist_items(section, &mut items);
+            ArtistSection {
+                title: section_title(section),
+                items,
+            }
+        })
+        .collect()
+}
+
+/// A section's heading: the carousel header YouTube wraps expansions in, whichever shelf
+/// renderer it chose. Not every section has one — Top songs is a bare shelf, and an untitled
+/// continuation is titleless — which is `None`, never an error.
+fn section_title(section: &Value) -> Option<String> {
+    let header = section
+        .pointer("/musicCarouselShelfRenderer/header/musicCarouselShelfBasicHeaderRenderer")
+        .or_else(|| section.pointer("/musicShelfRenderer/header/musicShelfRendererHeaderRenderer"))
+        .or_else(|| {
+            section.pointer("/musicShelfRenderer/header/musicCarouselShelfBasicHeaderRenderer")
+        })?;
+    non_empty(text(header.get("title")?))
 }
 
 /// The entry renderers an artist expansion can hold, anywhere under `node`.
@@ -1824,7 +1947,14 @@ pub fn parse_artist(root: &Value) -> Option<Artist> {
         if let Some(carousel) = section.get("musicCarouselShelfRenderer")
             && let Some(shelf) = parse_carousel(carousel)
         {
-            shelves.push(shelf);
+            // "From your library" is *library* membership — saved albums and the odd bookmarked
+            // song, not likes (see `crate::liked`'s own doc for the measured numbers). The
+            // artist page's "You Liked" section comes from the liked index instead, so this
+            // shelf is dropped rather than drawn: its card grid would both duplicate that
+            // section and claim to be it.
+            if !is_from_library_shelf(&shelf.title) {
+                shelves.push(shelf);
+            }
         }
         if let Some(about) = section.get("musicDescriptionShelfRenderer") {
             description = description.or_else(|| {
@@ -1850,10 +1980,23 @@ pub fn parse_artist(root: &Value) -> Option<Artist> {
         actions,
         description,
         thumbnail: thumbnail(header),
+        hero: wide_thumbnail(header),
         top_songs,
         top_songs_playlist,
-        shelves,
+        shelves: std::sync::Arc::new(shelves),
     })
+}
+
+/// Whether a shelf is "From your library" — the signed-in artist page's own list of the items
+/// by this artist that are in the account's library. Dropped from the shelves, not drawn: it is
+/// library membership (saved albums, bookmarked songs), not likes, and "You Liked" is built
+/// from the liked index — see `crate::liked`'s own doc for the measured difference.
+///
+/// Matched by YouTube's own English title, as every shelf title this client receives is
+/// English (the account's menus localise, the shelf headings do not — verified live
+/// 2026-09-16: the signed-in Tommy Richman page came back with `From your library` verbatim).
+fn is_from_library_shelf(title: &str) -> bool {
+    title.trim().eq_ignore_ascii_case("from your library")
 }
 
 /// The "Top songs" shelf. Each row carries its own cover and, in the fourth column, its album.
@@ -2055,7 +2198,7 @@ fn parse_card(item: &Value) -> Option<Entry> {
             thumbnail: thumb,
             actions: artist_actions(card),
         })),
-        Target::Browse { id, page } if page == PAGE_PLAYLIST => {
+        Target::Browse { id, page } if page == PAGE_PLAYLIST && !is_episodes_for_later(&id) => {
             Some(Entry::Playlist(PlaylistRef {
                 id,
                 title,
@@ -2088,10 +2231,19 @@ fn parse_card(item: &Value) -> Option<Entry> {
                     .and_then(album_id_of)
                     .or_else(|| menu_album_id(card)),
                 duration: None,
-                plays: fields.get(1).map(|f| (*f).to_owned()),
+                // The second field is a play count only where it looks like one. A card whose
+                // byline is "Song • Artist" — the artist page's "From your library" shelf, for
+                // one — puts the artist there, and taking it blindly printed the name twice in
+                // a row (once as the credit, once as the "plays" tail).
+                plays: fields
+                    .iter()
+                    .skip(1)
+                    .find(|f| f.chars().any(|c| c.is_ascii_digit()) && !f.contains(':'))
+                    .map(|f| (*f).to_owned()),
                 explicit: false,
-                like: LikeStatus::Indifferent,
-                // Cards carry no menu, so no rating and no toggle.
+                like: card_like_status(card),
+                // Songs have no bookmark toggle — their library membership *is* the like,
+                // which is why cards only ever carried the liked-songs toggle above.
                 in_library: false,
                 library_add: None,
                 library_remove: None,
@@ -2629,6 +2781,44 @@ mod tests {
         );
     }
 
+    /// The hero is the letterboxed channel art, not the square portrait slot the avatar uses.
+    #[test]
+    fn the_artist_header_carries_its_wide_hero() {
+        let a = parse_artist(&json("artist")).expect("artist parsed");
+        let hero = a.hero.as_deref().expect("a hero banner");
+        assert!(
+            hero.contains("w2880-h1200"),
+            "the widest 2.4:1 entry is the hero: {hero:?}"
+        );
+    }
+
+    /// A header whose only art is square — a channel page's profile photo — offers no hero, so
+    /// the page falls back to its circle header rather than letterboxing a portrait.
+    #[test]
+    fn a_square_only_header_has_no_hero() {
+        let header = serde_json::json!({
+            "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [
+                {"url": "https://example.com/a=s120-c-k-c0x00ffffff-no-rj", "width": 120, "height": 120},
+                {"url": "https://example.com/a=s288-c-k-c0x00ffffff-no-rj", "width": 288, "height": 288}
+            ]}}}
+        });
+        assert!(wide_thumbnail(&header).is_none());
+
+        // And with a wide entry among squares, the widest wide one wins even though the squares
+        // are larger.
+        let mixed = serde_json::json!({
+            "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [
+                {"url": "https://example.com/square", "width": 900, "height": 900},
+                {"url": "https://example.com/small", "width": 540, "height": 225},
+                {"url": "https://example.com/wide", "width": 1078, "height": 449}
+            ]}}}
+        });
+        assert_eq!(
+            wide_thumbnail(&mixed).as_deref(),
+            Some("https://example.com/wide")
+        );
+    }
+
     /// A video card is 16:9 and a song card is square — the kind is the signal, because no
     /// captured card carries `aspectRatio` and the thumbnail URLs arrive square either way.
     #[test]
@@ -2637,7 +2827,7 @@ mod tests {
         // is the proof the kind is enough.
         let a = parse_artist(&json("artist")).expect("artist parsed");
         let mut videos = 0;
-        for shelf in &a.shelves {
+        for shelf in a.shelves.iter() {
             for item in &shelf.items {
                 if let Entry::Video(t) = item {
                     videos += 1;
@@ -2668,6 +2858,176 @@ mod tests {
             panic!("an ATV card should be a song, got {entry:?}");
         };
         assert!(!t.wide, "an ATV card should parse square");
+    }
+
+    /// A song card's menu carries the liked-songs toggle: its *default* side is the action on
+    /// offer, so "Remove from liked songs" (`UNFAVORITE`) means the song is liked and
+    /// "Add to liked songs" (`FAVORITE`) means it is not. Verified against a live signed-in
+    /// Home capture, where every watch-target card carried one.
+    #[test]
+    fn a_song_card_reads_its_like_state_from_the_menu() {
+        fn card(menu: Value) -> Value {
+            serde_json::json!({"musicTwoRowItemRenderer": {
+                "title": {"runs": [{"text": "Some Song"}]},
+                "subtitle": {"runs": [{"text": "Some Artist"}]},
+                "navigationEndpoint": {"watchEndpoint": {
+                    "videoId": "vid9",
+                    "watchEndpointMusicSupportedConfigs": {"watchEndpointMusicConfig": {
+                        "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+                    }}
+                }},
+                "menu": menu
+            }})
+        }
+        let like_item = |default_icon: &str| {
+            serde_json::json!({"toggleMenuServiceItemRenderer": {
+                "defaultIcon": {"iconType": default_icon},
+                "defaultServiceEndpoint": {"likeEndpoint": {
+                    "status": "INDIFFERENT", "target": {"videoId": "vid9"}
+                }},
+                "toggledIcon": {"iconType": "FAVORITE"},
+                "toggledServiceEndpoint": {"likeEndpoint": {
+                    "status": "LIKE", "target": {"videoId": "vid9"}
+                }}
+            }})
+        };
+        let liked = parse_card(&card(serde_json::json!({"menuRenderer": {"items": [
+            like_item("UNFAVORITE")
+        ]}})))
+        .and_then(|e| e.track().map(|t| t.like));
+        assert_eq!(liked, Some(LikeStatus::Like));
+
+        let unliked = parse_card(&card(serde_json::json!({"menuRenderer": {"items": [
+            like_item("FAVORITE")
+        ]}})))
+        .and_then(|e| e.track().map(|t| t.like));
+        assert_eq!(unliked, Some(LikeStatus::Indifferent));
+
+        // The pin toggle runs through a feedback token, not a likeEndpoint — it must not be
+        // mistaken for the rating. And a signed-out card has no menu at all.
+        let pinned = parse_card(&card(serde_json::json!({"menuRenderer": {"items": [
+            {"toggleMenuServiceItemRenderer": {
+                "defaultIcon": {"iconType": "KEEP"},
+                "defaultServiceEndpoint": {"feedbackEndpoint": {"feedbackToken": "t"}}
+            }}
+        ]}})))
+        .and_then(|e| e.track().map(|t| t.like));
+        assert_eq!(pinned, Some(LikeStatus::Indifferent));
+
+        let bare = parse_card(&serde_json::json!({"musicTwoRowItemRenderer": {
+            "title": {"runs": [{"text": "Some Song"}]},
+            "subtitle": {"runs": [{"text": "Some Artist"}]},
+            "navigationEndpoint": {"watchEndpoint": {
+                "videoId": "vid9",
+                "watchEndpointMusicSupportedConfigs": {"watchEndpointMusicConfig": {
+                    "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+                }}
+            }}
+        }}))
+        .and_then(|e| e.track().map(|t| t.like));
+        assert_eq!(bare, Some(LikeStatus::Indifferent));
+    }
+
+    /// An expansion can come back as a whole artist page; its sections keep their own headings
+    /// so the caller can pick the one it asked about instead of flattening every shelf.
+    #[test]
+    fn an_expansion_reports_one_section_per_titled_shelf() {
+        let album_card = serde_json::json!({"musicTwoRowItemRenderer": {
+            "title": {"runs": [{"text": "An Album"}]},
+            "subtitle": {"runs": [{"text": "Album"}]},
+            "navigationEndpoint": {"browseEndpoint": {
+                "browseId": "MPREb_1",
+                "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                }}
+            }}
+        }});
+        let artist_card = serde_json::json!({"musicTwoRowItemRenderer": {
+            "title": {"runs": [{"text": "An Artist"}]},
+            "subtitle": {"runs": [{"text": "Artist"}]},
+            "navigationEndpoint": {"browseEndpoint": {
+                "browseId": "UCx",
+                "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                }}
+            }}
+        }});
+        let root = serde_json::json!({"contents": {"singleColumnBrowseResultsRenderer": {
+        "tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+            {"musicCarouselShelfRenderer": {
+                "header": {"musicCarouselShelfBasicHeaderRenderer":
+                    {"title": {"runs": [{"text": "Albums"}]}}},
+                "contents": [album_card]}},
+            {"musicCarouselShelfRenderer": {
+                "header": {"musicCarouselShelfBasicHeaderRenderer":
+                    {"title": {"runs": [{"text": "Fans might also like"}]}}},
+                "contents": [artist_card]}},
+            {"musicDescriptionShelfRenderer": {"description":
+                {"runs": [{"text": "A bio."}]}}}
+        ]}}}}]}}});
+        let sections = parse_artist_sections(&root);
+        assert_eq!(
+            sections.len(),
+            3,
+            "one entry per section, description included"
+        );
+        assert_eq!(sections[0].title.as_deref(), Some("Albums"));
+        assert!(matches!(&sections[0].items[..], [Entry::Album(_)]));
+        assert_eq!(sections[1].title.as_deref(), Some("Fans might also like"));
+        assert!(matches!(&sections[1].items[..], [Entry::Artist(_)]));
+        assert_eq!(sections[2].title, None);
+        assert!(sections[2].items.is_empty());
+    }
+
+    /// "From your library" is dropped from the shelves — it is library membership, not likes,
+    /// and the page's "You Liked" section comes from the liked index — while the other shelves
+    /// stay exactly as they were.
+    #[test]
+    fn the_artist_page_drops_the_from_your_library_shelf() {
+        let song_card = serde_json::json!({"musicTwoRowItemRenderer": {
+            "title": {"runs": [{"text": "A Liked Song"}]},
+            "subtitle": {"runs": [{"text": "Some Artist"}]},
+            "navigationEndpoint": {"watchEndpoint": {
+                "videoId": "vidL",
+                "watchEndpointMusicSupportedConfigs": {"watchEndpointMusicConfig": {
+                    "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+                }}
+            }},
+            "menu": {"menuRenderer": {"items": [
+                {"toggleMenuServiceItemRenderer": {
+                    "defaultIcon": {"iconType": "UNFAVORITE"},
+                    "defaultServiceEndpoint": {"likeEndpoint": {"status": "INDIFFERENT"}},
+                    "toggledServiceEndpoint": {"likeEndpoint": {"status": "LIKE"}}
+                }}
+            ]}}
+        }});
+        let album_card = serde_json::json!({"musicTwoRowItemRenderer": {
+            "title": {"runs": [{"text": "An Album"}]},
+            "subtitle": {"runs": [{"text": "Album"}]},
+            "navigationEndpoint": {"browseEndpoint": {
+                "browseId": "MPREb_1",
+                "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                }}
+            }}
+        }});
+        let root = serde_json::json!({
+        "header": {"musicImmersiveHeaderRenderer": {
+            "title": {"runs": [{"text": "Some Artist"}]}}},
+        "contents": {"singleColumnBrowseResultsRenderer": {
+        "tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+            {"musicCarouselShelfRenderer": {
+                "header": {"musicCarouselShelfBasicHeaderRenderer":
+                    {"title": {"runs": [{"text": "From your library"}]}}},
+                "contents": [song_card]}},
+            {"musicCarouselShelfRenderer": {
+                "header": {"musicCarouselShelfBasicHeaderRenderer":
+                    {"title": {"runs": [{"text": "Albums"}]}}},
+                "contents": [album_card]}}
+        ]}}}}]}}});
+        let artist = parse_artist(&root).expect("the page parses");
+        assert_eq!(artist.shelves.len(), 1, "only Albums remains a shelf");
+        assert_eq!(artist.shelves[0].title, "Albums");
     }
 
     /// A card's subtitle can carry an album link the same way a search/artist-songs row's
@@ -2912,7 +3272,7 @@ mod tests {
             shelf("Videos").items.iter().all(|i| i.track().is_some()),
             "videos are not playable"
         );
-        for s in &a.shelves {
+        for s in a.shelves.iter() {
             assert!(
                 s.items.iter().all(|i| i.thumbnail().is_some()),
                 "{} has an item with no cover",
@@ -3450,16 +3810,24 @@ mod tests {
         assert!(parse_browse_shelves(&serde_json::json!({"contents": []})).is_empty());
     }
 
-    /// The mood bar rides the home header: 11 chips, one feed with different params each.
+    /// The mood bar rides the home header: the feed's chips, one feed with different params each.
+    /// The `Podcasts` chip is filtered out — no podcast pages exist to open — so the fixture's
+    /// eleven become ten.
     #[test]
     fn the_home_feed_carries_its_mood_bar() {
         let chips = parse_home_chips(&json("home"));
-        assert_eq!(chips.len(), 11, "the chip bar came back short");
+        assert_eq!(chips.len(), 10, "the chip bar came back short");
         assert!(
             chips
                 .iter()
                 .all(|c| !c.title.is_empty() && !c.params.is_empty()),
             "a chip cannot be shown or opened"
+        );
+        assert!(
+            chips
+                .iter()
+                .all(|c| !c.title.eq_ignore_ascii_case("podcasts")),
+            "the podcast chip leaked through"
         );
         for want in ["Workout", "Energize", "Feel good", "Relax"] {
             assert!(
@@ -3862,6 +4230,32 @@ mod tests {
         assert!(!editable(&auto));
 
         assert!(!editable(&card(serde_json::json!({}))));
+    }
+
+    /// "Episodes for later" is the `SE` podcast auto playlist wearing a playlist's id. With no
+    /// episode rows and no podcast playback, the card is dropped wherever playlists are parsed
+    /// rather than listed unopenable — and an ordinary playlist still parses beside it.
+    #[test]
+    fn the_episodes_for_later_card_is_dropped() {
+        let card = |id: &str| {
+            serde_json::json!({"musicTwoRowItemRenderer": {
+                "title": {"runs": [{"text": "Episodes for later"}]},
+                "subtitle": {"runs": [{"text": "YouTube Music"}]},
+                "menu": {"menuRenderer": {"items": []}},
+                "navigationEndpoint": {"browseEndpoint": {
+                    "browseId": id,
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_PLAYLIST"}}}}}})
+        };
+        assert!(
+            parse_card(&card("VLSE")).is_none(),
+            "the podcast list leaked through"
+        );
+        assert!(
+            matches!(parse_card(&card("VLPLabc")), Some(Entry::Playlist(_))),
+            "a real playlist was dropped with it"
+        );
     }
 
     /// A card's subtitle is shaped by what the card is: a browse card leads with its kind

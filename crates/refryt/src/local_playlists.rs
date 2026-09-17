@@ -69,7 +69,8 @@ pub fn save(playlists: &[LocalPlaylist]) -> Result<()> {
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
     let json = serde_json::to_vec_pretty(playlists).context("could not encode local playlists")?;
-    std::fs::write(&path, json).with_context(|| format!("could not write {}", path.display()))
+    crate::persist::write_json_atomic(&path, &json)
+        .with_context(|| format!("could not write {}", path.display()))
 }
 
 #[cfg(test)]

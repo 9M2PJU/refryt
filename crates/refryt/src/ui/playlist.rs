@@ -106,7 +106,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
     // Read everything the header and its ••• menu need while `app.playlist` / `app.library`
     // are borrowed: the menu takes the real track slice, not a per-frame clone of a list that
     // is 5000 rows on Liked Music. Only the outcomes cross back out to act on `app`.
-    let (out, menu_action, write, rail_ref, in_library, menu_description) = {
+    let (out, menu_action, write, rail_ref, in_library, menu_description, is_expanding) = {
         let crate::app::App {
             palette,
             images,
@@ -237,6 +237,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         let menu_description = matches!(menu_action, Some(crate::ui::RowAction::PageInfo))
             .then(|| pl.description.clone())
             .flatten();
+        let is_expanding = pl.is_expanding();
         (
             out,
             menu_action,
@@ -244,6 +245,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
             rail_ref,
             in_library,
             menu_description,
+            is_expanding,
         )
     };
 
@@ -261,7 +263,11 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
             app.start_from(tracks, 0);
         }
     }
-    if let Some(anchor) = out.controls_end {
+    // A mix/radio playlist has no fixed track list to sort — see `Playlist::is_expanding`'s
+    // own doc comment — so the control simply doesn't render for one.
+    if let Some(anchor) = out.controls_end
+        && !is_expanding
+    {
         sort_control(app, ui, anchor);
     }
     if out.save
@@ -389,13 +395,19 @@ fn edit_modal(app: &mut App, ui: &mut egui::Ui) {
             let (full, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
             ui.painter()
                 .rect_filled(full, 0.0, egui::Color32::from_black_alpha(150));
-            if response.clicked() {
-                dismissed = true;
-            }
             let card = egui::Rect::from_center_size(
                 full.center() - egui::vec2(0.0, 12.0),
                 egui::vec2(360.0, 244.0),
             );
+            // Only a click outside the card dismisses — a click in a blank gap between fields
+            // inside the card used to fall through to this backdrop and discard the edit.
+            if response.clicked()
+                && response
+                    .interact_pointer_pos()
+                    .is_some_and(|pos| !card.contains(pos))
+            {
+                dismissed = true;
+            }
             let painter = ui.painter();
             for (grow, alpha) in [(14.0, 24), (7.0, 40), (2.0, 60)] {
                 painter.rect_filled(

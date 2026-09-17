@@ -121,15 +121,22 @@ fn new_playlist_popup(app: &mut App, ui: &mut egui::Ui) {
             let (full, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
             ui.painter()
                 .rect_filled(full, 0.0, egui::Color32::from_black_alpha(150));
-            if response.clicked() {
-                dismissed = true;
-            }
 
             // Centered, a hair above true centre so it clears the player bar.
             let card = egui::Rect::from_center_size(
                 full.center() - egui::vec2(0.0, 12.0),
                 egui::vec2(320.0, 132.0),
             );
+            // Only a click outside the card dismisses — a click landing on a blank gap between
+            // fields inside the card (nothing there senses clicks) used to fall through to this
+            // backdrop and discard whatever name had already been typed.
+            if response.clicked()
+                && response
+                    .interact_pointer_pos()
+                    .is_some_and(|pos| !card.contains(pos))
+            {
+                dismissed = true;
+            }
             let mut card_ui = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(card)

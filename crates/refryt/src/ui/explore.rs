@@ -96,7 +96,7 @@ fn top_buttons(app: &mut App, ui: &mut egui::Ui) {
     let gap = 12.0;
     let card_w =
         (ui.available_width() - (cards.len().saturating_sub(1)) as f32 * gap) / cards.len() as f32;
-    let card_h = 84.0;
+    let card_h = 64.0;
     let mut go = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
@@ -112,17 +112,22 @@ fn top_buttons(app: &mut App, ui: &mut egui::Ui) {
                 );
                 let nudge = widgets::press_offset(&response);
                 let fg = widgets::mix(p.secondary, p.text, t);
+                // Icon and title sit on the card's vertical centre as one row. They used to be
+                // pinned to the top and bottom edges respectively, which left the title hanging
+                // low with a dead gap above it.
+                let center = rect.center().y;
                 icon.image(fg, 22.0).paint_at(
                     ui,
-                    Rect::from_min_size(
-                        rect.left_top() + vec2(16.0, 16.0) + nudge,
+                    Rect::from_center_size(
+                        egui::pos2(rect.left() + 16.0 + 11.0, center),
                         vec2(22.0, 22.0),
-                    ),
+                    )
+                    .translate(nudge),
                 );
                 ui.painter().text(
-                    rect.left_bottom() + vec2(16.0, -16.0) + nudge,
+                    egui::pos2(rect.left() + 16.0 + 22.0 + 12.0, center) + nudge,
                     egui::Align2::LEFT_CENTER,
-                    widgets::truncate_to(ui, title, theme::semibold(16.0), card_w - 32.0),
+                    widgets::truncate_to(ui, title, theme::semibold(16.0), card_w - 66.0),
                     theme::semibold(16.0),
                     widgets::mix(p.text, p.text, t),
                 );

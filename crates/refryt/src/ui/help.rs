@@ -51,14 +51,21 @@ pub(crate) fn modal(app: &mut App, ui: &mut egui::Ui) {
             let (full, response) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
             ui.painter()
                 .rect_filled(full, 0.0, egui::Color32::from_black_alpha(150));
-            if response.clicked() {
-                dismissed = true;
-            }
 
             let card = egui::Rect::from_center_size(
                 full.center() - egui::vec2(0.0, 12.0),
                 egui::vec2(width, height),
             );
+            // Only a click outside the card dismisses — the shortcut rows below are painted with
+            // `Sense::hover()` (they don't need clicks), so without this check a click anywhere
+            // on one of them fell through to this backdrop and closed the modal.
+            if response.clicked()
+                && response
+                    .interact_pointer_pos()
+                    .is_some_and(|pos| !card.contains(pos))
+            {
+                dismissed = true;
+            }
             let painter = ui.painter();
             for (grow, alpha) in [(14.0, 24), (7.0, 40), (2.0, 60)] {
                 painter.rect_filled(

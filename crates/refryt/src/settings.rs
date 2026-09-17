@@ -45,11 +45,12 @@ impl Theme {
 }
 
 /// How much of the desktop shows through the shell: a sheer amount, `0.0` (opaque, the
-/// default) to `1.0` (as much as the window can show through and still read).
+/// default) to [`Opacity::MAX`] (as much as the window can show through and still read).
 ///
 /// A slider rather than levels, because the composite is a continuum. The four named levels the
 /// setting shipped with still parse from an old `settings.json` or `--opacity`, and the curve
-/// passes through their exact values — an old file repaints as it did.
+/// passes through their exact values — an old file repaints as it did. The old "strong" level is
+/// simply no longer the end of the range; the slider continues past it.
 ///
 /// Each amount names what the gutter and a card should *composite* to; the card's own fill alpha
 /// is solved from the pair in [`Palette::with_opacity`], because the two are painted one over
@@ -66,8 +67,10 @@ impl Default for Opacity {
 impl Opacity {
     /// Fully opaque — what every build before opacity existed painted.
     pub const OFF: Self = Self(0.0);
-    /// As sheer as the window gets. The old "Strong" level sat here.
-    pub const MAX: f32 = 1.0;
+    /// The sheerest the window goes. The old "Strong" level sat at `1.0`, below it: the slider
+    /// used to stop where that level did, and now continues past it for the times the maximum
+    /// was not see-through enough.
+    pub const MAX: f32 = 1.25;
 
     /// A sheer amount, clamped to what the window can paint. A non-finite amount is opaque.
     pub fn new(sheer: f32) -> Self {
@@ -100,13 +103,15 @@ impl Opacity {
         })
     }
 
-    /// The old named levels, on the curve where the slider's ends and thirds sit.
+    /// The old named levels, on the curve where the slider's thirds sit and where its end used
+    /// to be — "strong" is `1.0` now, not [`Self::MAX`], so a file that names it repaints as it
+    /// did rather than jumping to the new end of the slider.
     fn level(name: &str) -> Option<Self> {
         [
             ("off", Self::OFF),
             ("subtle", Self::new(1.0 / 3.0)),
             ("medium", Self::new(2.0 / 3.0)),
-            ("strong", Self::new(Self::MAX)),
+            ("strong", Self::new(1.0)),
         ]
         .into_iter()
         .find(|(label, _)| label.eq_ignore_ascii_case(name.trim()))
@@ -114,28 +119,33 @@ impl Opacity {
     }
 
     /// What the gutter, the top bar and the player bar composite to. Piecewise linear through
-    /// `(0, 1.00)`, `(1/3, 0.88)`, `(2/3, 0.74)`, `(1, 0.58)` — the old levels.
+    /// `(0, 1.00)`, `(1/3, 0.88)`, `(2/3, 0.74)` — the old levels — then on through
+    /// `(1, 0.58)`, where the old "strong" sat, to `(MAX, 0.30)`.
     pub fn gutter(self) -> f32 {
         let s = self.0;
         if s <= 1.0 / 3.0 {
             lerp(1.00, 0.88, s * 3.0)
         } else if s <= 2.0 / 3.0 {
             lerp(0.88, 0.74, (s - 1.0 / 3.0) * 3.0)
-        } else {
+        } else if s <= 1.0 {
             lerp(0.74, 0.58, (s - 2.0 / 3.0) * 3.0)
+        } else {
+            lerp(0.58, 0.30, (s - 1.0) / (Self::MAX - 1.0))
         }
     }
 
     /// What a card composites to, the gutter underneath it included. Through `(0, 1.00)`,
-    /// `(1/3, 0.94)`, `(2/3, 0.86)`, `(1, 0.74)`.
+    /// `(1/3, 0.94)`, `(2/3, 0.86)`, `(1, 0.74)` and on to `(MAX, 0.50)`.
     pub fn card(self) -> f32 {
         let s = self.0;
         if s <= 1.0 / 3.0 {
             lerp(1.00, 0.94, s * 3.0)
         } else if s <= 2.0 / 3.0 {
             lerp(0.94, 0.86, (s - 1.0 / 3.0) * 3.0)
-        } else {
+        } else if s <= 1.0 {
             lerp(0.86, 0.74, (s - 2.0 / 3.0) * 3.0)
+        } else {
+            lerp(0.74, 0.50, (s - 1.0) / (Self::MAX - 1.0))
         }
     }
 }
@@ -157,7 +167,7 @@ impl<'de> Deserialize<'de> for Opacity {
             type Value = Opacity;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a sheer amount between 0 and 1, or off/subtle/medium/strong")
+                f.write_str("a sheer amount between 0 and 1.25, or off/subtle/medium/strong")
             }
 
             fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Opacity, E> {
@@ -341,7 +351,8 @@ pub fn save(settings: &Settings) -> Result<()> {
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
     let json = serde_json::to_vec_pretty(settings).context("could not encode the settings")?;
-    std::fs::write(&path, json).with_context(|| format!("could not write {}", path.display()))
+    crate::persist::write_json_atomic(&path, &json)
+        .with_context(|| format!("could not write {}", path.display()))
 }
 
 #[cfg(test)]
@@ -478,7 +489,7 @@ mod tests {
     fn the_opacity_curve_is_ordered() {
         let mut last_gutter = 2.0;
         let mut last_card = 2.0;
-        for i in 0..=100 {
+        for i in 0..=(Opacity::MAX * 100.0) as u32 {
             let o = Opacity::new(i as f32 / 100.0);
             assert!(o.gutter() <= last_gutter, "{o:?} gutter rose");
             assert!(o.card() <= last_card, "{o:?} card rose");
@@ -489,6 +500,24 @@ mod tests {
             last_gutter = o.gutter();
             last_card = o.card();
         }
+    }
+
+    /// The old "strong" is no longer the end of the slider: the window keeps opening up past it
+    /// — and a file that names "strong" still lands exactly where it always did.
+    #[test]
+    fn the_slider_reaches_past_the_old_strong() {
+        let old_strong = Opacity::new(1.0);
+        assert_eq!(old_strong.gutter(), 0.58);
+        assert_eq!(old_strong.card(), 0.74);
+        assert_eq!(Opacity::parse("strong"), Some(old_strong));
+
+        let max = Opacity::new(Opacity::MAX);
+        assert_eq!(max.gutter(), 0.30);
+        assert_eq!(max.card(), 0.50);
+        assert!(
+            max.gutter() < old_strong.gutter() && max.card() < old_strong.card(),
+            "the new maximum must let through more than the old one"
+        );
     }
 
     /// `--scheme` accepts the label in whatever shape someone types it.
@@ -533,6 +562,7 @@ mod tests {
     fn opacity_parses_number_or_name_case_insensitively() {
         assert_eq!(Opacity::parse("strong"), Some(Opacity::new(1.0)));
         assert_eq!(Opacity::parse("STRONG"), Some(Opacity::new(1.0)));
+        assert_eq!(Opacity::parse("1.25"), Some(Opacity::new(Opacity::MAX)));
         assert_eq!(Opacity::parse("off"), Some(Opacity::OFF));
         assert_eq!(Opacity::parse("0.4"), Some(Opacity::new(0.4)));
         assert_eq!(Opacity::parse("nonsense"), None);

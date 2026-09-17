@@ -123,13 +123,26 @@ fn section(app: &App, ui: &mut egui::Ui, gap: f32, label: &str) {
     ui.add_space(4.0);
 }
 
+/// The panel's own title, a hair right of the rows below it by eye.
+fn header(app: &App, ui: &mut egui::Ui, label: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(label)
+                .font(theme::semibold(12.0))
+                .color(app.palette.secondary),
+        );
+    });
+    ui.add_space(4.0);
+}
+
 /// The track the transport is on, above the list of what follows it.
 fn now_playing(app: &mut App, ui: &mut egui::Ui) {
     let Some(i) = app.current else { return };
     let Some(track) = app.queue.get(i).cloned() else {
         return;
     };
-    section(app, ui, 0.0, "Now playing");
+    header(app, ui, "Now playing");
     // Namespaced under its own id: this row and "Next up"'s first row both start their own
     // `spec_rows` call at index 0, so without this their title/artist links resolve to the
     // exact same widget id (`ui.id()` is the same parent for both — they're sequential calls on

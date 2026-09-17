@@ -161,7 +161,8 @@ pub fn save(store: &Store) -> Result<()> {
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
     let bytes = serde_json::to_vec_pretty(store).context("could not encode the playback state")?;
-    std::fs::write(&path, bytes).with_context(|| format!("could not write {}", path.display()))
+    crate::persist::write_json_atomic(&path, &bytes)
+        .with_context(|| format!("could not write {}", path.display()))
 }
 
 /// Read the store. Anything unreadable reads as "nothing to restore".

@@ -116,6 +116,10 @@ pub struct Api {
     noauth: Mutex<Option<YtMusic<NoAuthToken>>>,
     browser: Mutex<Option<YtMusic<BrowserToken>>>,
     session: Mutex<Option<auth::Session>>,
+    /// Single-flights [`Self::refresh_from_browser`]: several requests can independently notice
+    /// a rotated cookie at once (`Self::library`'s four sections fetch concurrently), and without
+    /// this each would launch its own `yt-dlp` cookie re-import in parallel.
+    refresh: Mutex<()>,
 }
 
 impl Api {
@@ -127,6 +131,7 @@ impl Api {
             noauth: Mutex::new(None),
             browser: Mutex::new(None),
             session: Mutex::new(session),
+            refresh: Mutex::new(()),
         })
     }
 
@@ -148,18 +153,16 @@ impl Api {
         Ok(yt)
     }
 
-    /// Build the signed-in client from the stored cookie, so it is ready when needed.
-    async fn ensure_browser(&self) -> Result<()> {
+    /// Build the signed-in client from the stored cookie, so it is ready when needed. `Ok(false)`
+    /// means there is no stored session to build one from — not signed in, not an error; `Err` is
+    /// a real failure (an invalid cookie, or the client failing to build).
+    async fn ensure_browser(&self) -> Result<bool> {
         if self.browser.lock().await.is_some() {
-            return Ok(());
+            return Ok(true);
         }
-        let cookie = self
-            .session
-            .lock()
-            .await
-            .as_ref()
-            .map(|s| s.cookie.clone())
-            .context("not signed in")?;
+        let Some(cookie) = self.session.lock().await.as_ref().map(|s| s.cookie.clone()) else {
+            return Ok(false);
+        };
         let http = self.http().await;
         let token = BrowserToken::from_str(&cookie, &http)
             .await
@@ -169,14 +172,18 @@ impl Api {
             .build()
             .context("could not build the signed-in client")?;
         *self.browser.lock().await = Some(yt);
-        Ok(())
+        Ok(true)
     }
 
     /// The client to run a request against: the signed-in cookie client if there is one, else
     /// anonymous.
+    ///
+    /// A single call to `ensure_browser` decides which — checking `is_signed_in` first and then
+    /// separately building the browser client used to leave a window where a concurrent
+    /// `forget_session`/sign-out landed in between, turning what should have been a silent
+    /// fallback to anonymous into a spurious "not signed in" error.
     async fn client_ref(&self) -> Result<ClientRef> {
-        if self.is_signed_in().await {
-            self.ensure_browser().await?;
+        if self.ensure_browser().await? {
             let yt = self
                 .browser
                 .lock()
@@ -257,10 +264,9 @@ impl Api {
     /// A Google account may own brand channels alongside the personal one. The personal entry has
     /// no page id; the brand ones do, and that id is what selects them.
     pub async fn accounts(&self) -> Result<Vec<model::Account>> {
-        if !self.is_signed_in().await {
+        if !self.ensure_browser().await? {
             return Ok(Vec::new());
         }
-        self.ensure_browser().await?;
         let yt = self
             .browser
             .lock()
@@ -313,10 +319,9 @@ impl Api {
     /// stored session be discarded. `Err` means the check could not be made, and the session must
     /// be kept: a stored sign-in should survive being offline.
     pub async fn verify_session(&self) -> Result<Option<String>> {
-        if !self.is_signed_in().await {
+        if !self.ensure_browser().await? {
             return Ok(None);
         }
-        self.ensure_browser().await?;
         let yt = self
             .browser
             .lock()
@@ -345,6 +350,17 @@ impl Api {
     /// Google rotates `__Secure-1PSIDTS`, so a stored cookie goes stale on its own. Returns false
     /// when there is nothing to refresh from — a pasted session, or no stored session at all.
     async fn refresh_from_browser(&self) -> bool {
+        let before = self.session.lock().await.as_ref().map(|s| s.cookie.clone());
+        let _guard = self.refresh.lock().await;
+        // Another caller may have refreshed while this one waited for the lock above:
+        // `install_cookie` replaces the stored cookie on success, so a cookie that changed
+        // while waiting is what says the herd's first request already did this work. A built
+        // client merely existing is not that signal — one was already built from the stale
+        // cookie, which is why this refresh was called at all.
+        let after = self.session.lock().await.as_ref().map(|s| s.cookie.clone());
+        if after != before {
+            return after.is_some();
+        }
         let source = self
             .session
             .lock()
@@ -916,7 +932,18 @@ impl Api {
     /// and `params` are a matched pair from that shelf's own "more" button (`Shelf.more_browse_id`
     /// / `Shelf.more_params`) — passing the artist's channel id here when the shelf carried its
     /// own different one is what used to make this return an unrelated, unfiltered page.
-    pub async fn artist_albums(&self, browse_id: &str, params: &str) -> Result<Vec<model::Entry>> {
+    ///
+    /// `wanted_title` is the shelf's own heading. The response is frequently more than the
+    /// shelf — the captured "From your library" expansion was the *whole artist page* — so its
+    /// titled sections are searched for that heading and only its items returned when one
+    /// matches. A response with no matching heading falls back to the flat, tolerant parse, as
+    /// before.
+    pub async fn artist_albums(
+        &self,
+        browse_id: &str,
+        params: &str,
+        wanted_title: &str,
+    ) -> Result<Vec<model::Entry>> {
         let (aid, p) = (browse_id.to_owned(), params.to_owned());
         // Raw first: the typed parser assumes one fixed grid pointer and errors on any other
         // shape, which is what made "Show all" fail while the entries were right there in the
@@ -928,7 +955,16 @@ impl Api {
         match &raw {
             Ok(json) => {
                 dump("REFRYT_DUMP_ARTIST_ALBUMS", json);
-                let items = innertube::parse_artist_albums(json);
+                let mut sections = innertube::parse_artist_sections(json);
+                let asked = wanted_title.trim();
+                if let Some(i) = sections.iter().position(|s| {
+                    s.title
+                        .as_deref()
+                        .is_some_and(|t| t.trim().eq_ignore_ascii_case(asked))
+                }) {
+                    return Ok(sections.swap_remove(i).items);
+                }
+                let items: Vec<model::Entry> = sections.drain(..).flat_map(|s| s.items).collect();
                 if !items.is_empty() {
                     return Ok(items);
                 }
@@ -2518,10 +2554,12 @@ fn map_artist(a: GetArtist) -> model::Artist {
         views: a.views,
         description: a.description,
         thumbnail: artist_thumb,
+        // The typed fallback's thumbnails are square portraits, never the wide banner.
+        hero: None,
         top_songs,
         // The typed fallback has no shelf JSON to read a "Show all" target from.
         top_songs_playlist: None,
-        shelves,
+        shelves: std::sync::Arc::new(shelves),
     }
 }
 

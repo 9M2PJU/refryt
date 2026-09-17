@@ -62,7 +62,7 @@ pub fn install_hook() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&report) {
-            let _ = std::fs::write(&path, bytes);
+            let _ = crate::persist::write_json_atomic(&path, &bytes);
         }
     }));
 }

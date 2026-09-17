@@ -238,7 +238,17 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
         // background — the slider would do nothing, so it is dimmed and inert rather than
         // silently pretending.
         ui.add_enabled_ui(!app.decorated, |ui| {
-            widgets::slider(ui, &app.palette, &mut sheer, 0.0..=1.0, 220.0);
+            widgets::slider(ui, &app.palette, &mut sheer, 0.0..=Opacity::MAX, 220.0);
+            ui.add_space(6.0);
+            // The number the slider only implies: a percentage is what "how transparent is it"
+            // is actually asked and answered in, and the label's x is fixed by the slider's own
+            // width, so the changing digits move nothing else. A percentage of the slider's
+            // whole range, which reaches past the old maximum — not of the composite alpha.
+            ui.label(
+                RichText::new(format!("{:.0}%", sheer / Opacity::MAX * 100.0))
+                    .font(theme::regular(12.0))
+                    .color(app.palette.text),
+            );
         });
     });
     ui.add_space(4.0);
@@ -509,7 +519,9 @@ fn browser_import(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.add_space(4.0);
 
-    let browsers = browser_cookies::detected();
+    let browsers = app
+        .detected_browsers
+        .get_or_insert_with(browser_cookies::detected);
     if browsers.is_empty() {
         ui.label(
             RichText::new(
@@ -545,7 +557,7 @@ fn browser_import(app: &mut App, ui: &mut egui::Ui) {
 
     let mut chosen = None;
     ui.horizontal_wrapped(|ui| {
-        for b in &browsers {
+        for b in browsers.iter() {
             if widgets::pill_button(ui, &app.palette, b.label).clicked() {
                 chosen = Some(b.key);
             }
@@ -568,7 +580,7 @@ fn signed_in(app: &mut App, ui: &mut egui::Ui) {
     };
     // Asked for once per visit; a Google account may own brand channels besides the personal one.
     if app.accounts.is_empty() {
-        app.backend.fetch_accounts();
+        app.backend.fetch_accounts(app.account_epoch);
     }
     // Naming the account is the point: it is YouTube confirming the session, not us assuming it.
     ui.label(

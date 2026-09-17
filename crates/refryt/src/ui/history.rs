@@ -71,7 +71,10 @@ fn content(app: &mut App, ui: &mut egui::Ui) {
                 continue;
             }
             section(ui, &app.palette, &s.title);
-            entry_rows(app, ui, &s.items);
+            // Each dated shelf restarts its own row-index-based widget ids at 0 — without a
+            // namespace per shelf, "Today" row 0 and "Yesterday" row 0 collide (the same bug
+            // already fixed once for upnext.rs's "Now playing" vs "Next up").
+            ui.push_id(&s.title, |ui| entry_rows(app, ui, &s.items));
         }
     });
 }

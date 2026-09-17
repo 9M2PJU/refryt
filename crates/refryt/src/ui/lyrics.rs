@@ -9,11 +9,16 @@ use crate::theme;
 pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     let p = app.palette;
     ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new("Lyrics")
-            .font(theme::semibold(14.0))
-            .color(p.text),
-    );
+    // The panel's own title, a hair right of the lyrics below it by eye — the same nudge the
+    // queue's own header takes.
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Lyrics")
+                .font(theme::semibold(14.0))
+                .color(p.text),
+        );
+    });
     ui.add_space(8.0);
 
     if app.lyrics_loading {

@@ -63,6 +63,23 @@ const PLAY_HISTORY: usize = 12;
 /// How many replaced queues are kept for `Previous` to bring back, so starting an album does not
 /// erase the playlist you were in.
 const QUEUE_HISTORY: usize = 5;
+/// Every local track's folder-path segments paired with its position in `App::local_tracks` —
+/// `ui::library::local_entries`'s own return/cache shape, named here so `App::local_entries_cache`
+/// doesn't need to spell out the nested tuple-of-tuples.
+pub(crate) type LocalEntries = Vec<(Vec<String>, usize)>;
+
+/// How many already-played tracks are kept sitting before `current` before the oldest are
+/// dropped. Autoplay's radio river only ever appends (`append_new`), so an unbounded played
+/// prefix is the one way the queue — and the state `save_playback` serializes every few seconds —
+/// grows without limit over a long session. Generous enough that trimming is never something a
+/// listener could notice by scrolling the queue up.
+const MAX_PLAYED_PREFIX: usize = 200;
+
+/// How long the startup splash may hold the shell back, counted from process start. Generous
+/// against a slow session check and a slow first feed, but a hard stop for the one case neither
+/// has a timeout for: a request that simply never answers would otherwise leave the splash — or
+/// an unresponsive window — up indefinitely.
+const SPLASH_MAX: Duration = Duration::from_secs(10);
 
 /// A step back within the current queue: where the transport was, and how long the queue was.
 /// Restoring truncates any autoplay tail appended after that point.
@@ -178,6 +195,18 @@ impl PlayHistory {
         }
     }
 
+    /// A track was deleted from the live queue by hand (`RowAction::RemoveFromQueue`), not by
+    /// playing forward through it. Every remembered within-queue point's `index`/`queue_len` was
+    /// captured against the queue's *old* shape, and shifting them to match the new one correctly
+    /// (a removal can land before, at, or after any given point, each needing different handling)
+    /// is not worth the complexity a manual, one-off edit like this creates: it's simpler, and no
+    /// less honest, to treat a manual edit the same as `leaving_queue` already treats a brand new
+    /// queue — Previous stops rewinding past the moment of the edit rather than risk rewinding to
+    /// the wrong track.
+    fn forget_within_queue(&mut self) {
+        self.played.clear();
+    }
+
     /// One queue is being replaced by another: keep the whole old queue, and clear the
     /// within-queue points, which index the queue now gone.
     fn leaving_queue(&mut self, queue: Vec<Track>, index: usize, radio: Option<Radio>) {
@@ -228,6 +257,10 @@ pub enum Route {
     Library,
     Settings,
     Artist(String),
+    /// The songs by one artist that are in the account's library — the "You Liked" page, from
+    /// the artist page's own tile. Reads the already-loaded artist, so `ensure_route_loaded`
+    /// only has to make sure that artist is the one being shown.
+    ArtistLiked(String),
     Album(String),
     Playlist(String),
     /// A mood's playlists. The payload is the opaque params string from `MoodRef`.
@@ -253,6 +286,7 @@ impl Route {
             "settings" => Some(Route::Settings),
             other => match other.split_once(':') {
                 Some(("artist", id)) => Some(Route::Artist(id.to_owned())),
+                Some(("artistliked", id)) => Some(Route::ArtistLiked(id.to_owned())),
                 Some(("album", id)) => Some(Route::Album(id.to_owned())),
                 Some(("playlist", id)) => Some(Route::Playlist(id.to_owned())),
                 _ => None,
@@ -373,13 +407,15 @@ impl PlaylistSort {
     /// partial playlist would present a truncated list as the whole of it, exactly the mistake
     /// `LibrarySort`'s own doc comment describes YouTube's library sort avoiding by being a
     /// server param instead; a playlist has no such param to hand this to; see `sort_playlist`.
+    /// The liked page sorts its index-derived rows with this too, where "the whole list" is
+    /// whatever the index holds.
     ///
     /// `Default` and `Reverse` are never actually reached here — [`apply_playlist_sort`]
     /// intercepts both to restore the served order from its own snapshot instead, since this
     /// method only knows how to build a *new* order and has nowhere to restore an old one from.
     /// The arms stay as harmless no-ops rather than `unreachable!()`, so a future direct caller
     /// gets "did nothing" instead of a panic.
-    fn apply(self, tracks: &mut [crate::model::Track]) {
+    pub(crate) fn apply(self, tracks: &mut [crate::model::Track]) {
         match self {
             PlaylistSort::Default | PlaylistSort::Reverse => {}
             PlaylistSort::TitleAsc => tracks.sort_by_key(|t| t.title.to_lowercase()),
@@ -827,6 +863,9 @@ pub struct App {
     pub(crate) searched: String,
     pub(crate) searching: bool,
     pub(crate) results: SearchResults,
+    /// Bumped every time `results` is replaced, so `ui::search`'s `All`-scope filtered index list
+    /// can cache itself against this instead of re-filtering `results.items` every frame.
+    pub(crate) results_generation: u64,
     pub(crate) status: Option<String>,
     /// Which kind of result the search page is filtered to. `All` is a view over `results`
     /// (never a second request); every other scope drives a dedicated per-category fetch, since
@@ -840,6 +879,9 @@ pub struct App {
     pub(crate) scoped_loading: bool,
     pub(crate) scoped_error: Option<String>,
     scoped_for: Option<(String, SearchScope)>,
+    /// Cache for `ui::search`'s `All`-scope filtered index list: the `results_generation` it was
+    /// computed for, and the indices themselves. Recomputed only when the generation moves on.
+    pub(crate) search_all_indices: Option<(u64, Vec<usize>)>,
 
     /// The artist page being shown, plus whether a fetch is outstanding / failed.
     ///
@@ -855,14 +897,36 @@ pub struct App {
     pub(crate) album_loading: bool,
     pub(crate) album_error: Option<String>,
     album_for: Option<String>,
+    /// Bumped on `forget_account_data` and every real sign-in/sign-out transition. Threaded
+    /// through `fetch_library`/`fetch_library_playlists`/`fetch_home`/`fetch_accounts`'s events
+    /// so a reply already in flight when the account changed underneath it — the window
+    /// `forget_account_data` itself cannot close, since it cannot cancel a request already
+    /// sent — is dropped instead of quietly repopulating freshly-cleared state with the
+    /// previous account's data.
+    pub(crate) account_epoch: u64,
+    /// The id of the album/playlist card most recently asked to play — `Event::CardTracksReady`
+    /// checks this before acting, the same "is this reply for what I most recently asked for"
+    /// guard `album_for`/`playlist_for` already give the page loaders, since two cards' play
+    /// buttons clicked close together race each other's fetch exactly the same way.
+    pending_card_play: Option<String>,
 
-    /// The app's own icon, as a texture for the Settings page's branding. Loaded once, lazily
-    /// (`ui::settings::page` fills this in on first use rather than at startup, since nothing
-    /// else needs it), and kept for the rest of the session.
+    /// The app's own icon, as a texture for the Settings page's branding and the startup splash.
+    /// Loaded once, lazily (whichever of the two needs it first fills it in rather than doing it
+    /// at startup), and kept for the rest of the session.
     pub(crate) logo: Option<egui::TextureHandle>,
+
+    /// Which browsers have a cookie profile on disk, for the sign-in page's "Import from a
+    /// browser" list. Cached the same way as `logo` above (lazily, on first Settings visit) since
+    /// this cannot change without a restart or a new browser profile being created mid-session.
+    pub(crate) detected_browsers: Option<Vec<crate::browser_cookies::Browser>>,
 
     /// What the Settings page shows about authentication.
     pub(crate) auth: crate::auth::AuthState,
+    /// Whether the startup splash may still cover frames. Armed at construction only when a
+    /// stored session is being checked, released for good the first frame it is not wanted — auth
+    /// resolved and, when the landing route is Home, its first feed arrived or failed — so it can
+    /// never reappear mid-session. See [`Self::splash_visible`].
+    startup_splash: bool,
     /// Why the last sign-in attempt failed. Kept apart from `auth`, so a refused attempt does not
     /// make a working session look lost.
     pub(crate) sign_in_error: Option<String>,
@@ -872,9 +936,29 @@ pub struct App {
     pub(crate) library_error: Option<String>,
     pub(crate) library_loaded: bool,
     pub(crate) library_sort: LibrarySort,
+    /// Every song the account has liked, built by a background page-through of Liked Music and
+    /// cached to disk. There is no liked-by-artist endpoint — see `crate::liked`'s own doc — so
+    /// this is what the artist page's "You Liked" section and the player bar's backfill read.
+    pub(crate) liked: crate::liked::Index,
+    /// A liked scan is in flight.
+    pub(crate) liked_scanning: bool,
+    /// The in-flight scan is a full one: its pages accumulate in `liked_buffer` and are swapped
+    /// in when it completes, so the displayed index never empties mid-scan.
+    liked_full_scan: bool,
+    liked_buffer: Vec<crate::model::Track>,
+    /// The index changed since it was last written out.
+    liked_dirty: bool,
+    last_liked_save: Instant,
     /// Every track found under `settings.local_folders` by the last full rescan — there is no
     /// incremental update, a changed folder list just rescans everything again.
     pub(crate) local_tracks: Vec<crate::model::Track>,
+    /// Bumped whenever `local_tracks` is replaced, so `ui::library::local_entries` can cache its
+    /// per-track folder-segment index instead of rebuilding it from scratch every frame the
+    /// Local tab is open.
+    pub(crate) local_tracks_generation: u64,
+    /// Cache for `ui::library::local_entries`: the `(local_tracks_generation, local_folders)` it
+    /// was computed for, and the index itself.
+    pub(crate) local_entries_cache: Option<(u64, Vec<String>, LocalEntries)>,
     pub(crate) local_scanning: bool,
     pub(crate) local_scan_error: Option<String>,
     /// Which folder the Library's Local tab is currently browsing, one path segment per level,
@@ -909,6 +993,11 @@ pub struct App {
     pub(crate) artist_expand: Option<(String, String)>,
     pub(crate) artist_expand_loading: bool,
     pub(crate) artist_expand_error: Option<String>,
+    /// How the "Liked Songs by <artist>" page orders its rows. Client-side like the playlist
+    /// sort, but it needs no snapshot to return to Default: the liked index always holds the
+    /// served order, and each frame's rows are rebuilt from it. Sticky across artists — it is
+    /// about the list style, not the one artist.
+    pub(crate) artist_liked_sort: PlaylistSort,
     /// The home feed, as YouTube serves it. Replaces the moods-and-history page we used to
     /// assemble ourselves, which used none of YouTube's ranking.
     ///
@@ -936,6 +1025,12 @@ pub struct App {
     pub(crate) current: Option<usize>,
     /// Set once we have asked mpv to play, so we can tell "not started yet" from "track ended".
     pub(crate) playback_started: bool,
+    /// The generation of the most recent `Backend::play`/`play_video` call — every
+    /// `Event::Resolving`/`Playing`/`PlaybackFailed` carries the generation it was started
+    /// under, and one whose generation doesn't match this is a reply to a play that has since
+    /// been superseded (Next/Previous, another queue row, the video toggle, all firing again
+    /// before the first one's yt-dlp resolve finished) and must not overwrite `now`.
+    play_generation: u64,
     /// Autoplay river state, opened by Start Mix. `None` for a hand-picked queue.
     pub(crate) radio: Option<Radio>,
     /// Hidden "previous" history for the transport. Bounded; see [`PlayHistory`].
@@ -1002,6 +1097,13 @@ pub struct App {
     pub(crate) history_shelves: Option<Arc<Vec<crate::model::Shelf>>>,
     pub(crate) history_loading: bool,
     pub(crate) history_error: Option<String>,
+    /// The History visit in progress. Bumped on every entry to the page and whenever the data is
+    /// invalidated, and carried by every fetch so a reply for a superseded visit can be dropped.
+    history_epoch: u64,
+    /// The visit the page last settled on: equal to `history_epoch` once the current visit's
+    /// fetch has landed — or failed with a list already on screen — which is what stops the
+    /// per-frame loader refetching.
+    history_loaded_epoch: u64,
     /// The volume to restore on unmute. Updated whenever you set a nonzero volume.
     pub(crate) last_volume: f64,
     /// A restored position to seek to once the track loads: `(queue index, seconds)`. Consumed
@@ -1098,6 +1200,26 @@ fn window_hwnd(_: &eframe::CreationContext<'_>) -> Option<u64> {
     None
 }
 
+/// Whether the History page needs a fetch for the visit it is on: signed in, nothing already in
+/// flight, no latched error, and the shelves on screen (if any) loaded under a different epoch.
+/// Split out from `load_history` so the "once per visit" rule is testable without an `App`.
+fn history_needs_load(
+    signed_in: bool,
+    loading: bool,
+    failed: bool,
+    loaded_epoch: u64,
+    epoch: u64,
+) -> bool {
+    signed_in && !loading && !failed && loaded_epoch != epoch
+}
+
+/// Whether two lists are the same queue, track for track. `start_from` needs the *whole* list,
+/// not just the loaded track: a mix seeded from the song playing now starts with it, and matching
+/// on the track alone turned Start Mix into a pause button that never touched the queue.
+fn same_queue(a: &[Track], b: &[Track]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.video_id == y.video_id)
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, options: Options) -> anyhow::Result<Self> {
         let Options {
@@ -1148,7 +1270,8 @@ impl App {
         let player = Some(Player::new());
         // A stored session is only a claim until YouTube confirms it — cookies expire between
         // runs, and asserting otherwise is what showed an empty library under a "Signed in" label.
-        let auth = if backend.is_signed_in_sync() {
+        let checking = backend.is_signed_in_sync();
+        let auth = if checking {
             backend.verify_session();
             crate::auth::AuthState::Checking
         } else {
@@ -1187,12 +1310,14 @@ impl App {
             searched: String::new(),
             searching: false,
             results: SearchResults::default(),
+            results_generation: 0,
             status: None,
             search_scope: SearchScope::default(),
             scoped_results: Vec::new(),
             scoped_loading: false,
             scoped_error: None,
             scoped_for: None,
+            search_all_indices: None,
             artist: None,
             artist_loading: false,
             artist_error: None,
@@ -1201,14 +1326,24 @@ impl App {
             album_loading: false,
             album_error: None,
             album_for: None,
+            account_epoch: 0,
+            pending_card_play: None,
             logo: None,
+            detected_browsers: None,
             auth,
+            startup_splash: checking,
             sign_in_error: None,
             library: crate::model::Library::default(),
             library_loading: false,
             library_error: None,
             library_loaded: false,
             library_sort: LibrarySort::Latest,
+            liked: crate::liked::Index::default(),
+            liked_scanning: false,
+            liked_full_scan: false,
+            liked_buffer: Vec::new(),
+            liked_dirty: false,
+            last_liked_save: Instant::now(),
             playlist: None,
             playlist_loading: false,
             playlist_error: None,
@@ -1219,6 +1354,7 @@ impl App {
             artist_expand: None,
             artist_expand_loading: false,
             artist_expand_error: None,
+            artist_liked_sort: PlaylistSort::default(),
             home: None,
             home_loading: false,
             home_error: None,
@@ -1232,6 +1368,7 @@ impl App {
             queue: Vec::new(),
             current: None,
             playback_started: false,
+            play_generation: 0,
             radio: None,
             play_history: PlayHistory::default(),
             repeat: RepeatMode::Off,
@@ -1271,6 +1408,8 @@ impl App {
             history_shelves: None,
             history_loading: false,
             history_error: None,
+            history_epoch: 1,
+            history_loaded_epoch: 0,
             last_volume: 70.0,
             resume: None,
             last_playback_save: Instant::now(),
@@ -1301,6 +1440,8 @@ impl App {
             video_open: false,
             video: None,
             local_tracks: Vec::new(),
+            local_tracks_generation: 0,
+            local_entries_cache: None,
             local_scanning: false,
             local_scan_error: None,
             local_browse_path: Vec::new(),
@@ -1370,13 +1511,20 @@ impl App {
     /// A brand channel has its own library, playlists and home feed; keeping the old ones on
     /// screen after a switch would be showing one account's data under another's name.
     pub(crate) fn forget_account_data(&mut self) {
+        self.account_epoch += 1;
         self.library = crate::model::Library::default();
         self.library_loaded = false;
         self.library_error = None;
+        self.liked = crate::liked::Index::default();
+        self.liked_scanning = false;
+        self.liked_buffer.clear();
+        self.liked_dirty = false;
+        crate::liked::remove();
         self.home = None;
         self.home_error = None;
         self.history_shelves = None;
         self.history_error = None;
+        self.history_invalidate();
         self.playlist = None;
         self.playlist_for = None;
         self.accounts.clear();
@@ -1639,11 +1787,11 @@ impl App {
             .flatten();
     }
 
-    /// Write the queue and transport. Throttled by the caller; best-effort (a failure is only a
-    /// debug line — losing the queue is not worth a toast).
-    fn save_playback(&self) {
+    /// The queue and transport, as the on-disk store shape — `None` when there is nothing worth
+    /// persisting.
+    fn playback_store(&self) -> Option<crate::playback::Store> {
         if self.queue.is_empty() {
-            return;
+            return None;
         }
         let position = if self.playback_started {
             self.player
@@ -1653,7 +1801,7 @@ impl App {
         } else {
             self.resume.map(|(_, p)| p).unwrap_or(0.0)
         };
-        let store = crate::playback::Store {
+        Some(crate::playback::Store {
             version: 1,
             queue: self
                 .queue
@@ -1665,9 +1813,16 @@ impl App {
             repeat: Some(self.repeat.into()),
             shuffle: self.shuffle,
             volume: self.last_volume,
-        };
-        if let Err(e) = crate::playback::save(&store) {
-            tracing::debug!(error = %format!("{e:#}"), "could not save the playback state");
+        })
+    }
+
+    /// Write the queue and transport off the render thread. Throttled by the caller; best-effort
+    /// (a failure is only a debug line — losing the queue is not worth a toast). Not what runs on
+    /// exit: `eframe::App::save` needs the write to actually finish before the process does, so it
+    /// calls `crate::playback::save` directly instead of handing this off to the backend.
+    fn save_playback(&self) {
+        if let Some(store) = self.playback_store() {
+            self.backend.save_playback(store);
         }
     }
 
@@ -1688,6 +1843,9 @@ impl App {
         if self.last_playback_save.elapsed() >= Duration::from_secs(5) {
             self.last_playback_save = Instant::now();
             self.save_playback();
+        }
+        if self.liked_dirty && self.last_liked_save.elapsed() >= Duration::from_secs(5) {
+            self.save_liked_if_dirty();
         }
     }
 
@@ -1742,6 +1900,9 @@ impl App {
             self.toast("Already downloaded");
             return;
         }
+        if self.download_progress.contains_key(&track.video_id) {
+            return;
+        }
         self.download_progress.insert(track.video_id.clone(), 0.0);
         self.backend
             .download_track(track, self.settings.quality.format());
@@ -1751,7 +1912,10 @@ impl App {
     fn start_download_many(&mut self, tracks: Vec<Track>) {
         let pending: Vec<Track> = tracks
             .into_iter()
-            .filter(|t| !self.downloads.entries.contains_key(&t.video_id))
+            .filter(|t| {
+                !self.downloads.entries.contains_key(&t.video_id)
+                    && !self.download_progress.contains_key(&t.video_id)
+            })
             .collect();
         if pending.is_empty() {
             self.toast("Already downloaded");
@@ -1824,12 +1988,12 @@ impl App {
         // new one starts — which is why handing playback back restarted from zero. Same guard
         // `play_index_restore` uses: wait for the new file to actually report playing.
         self.playback_started = false;
-        if self.video_open {
-            self.backend.play_video(track, handle, volume);
+        self.play_generation = if self.video_open {
+            self.backend.play_video(track, handle, volume)
         } else {
             self.backend
-                .play(track, handle, volume, self.settings.normalise_volume);
-        }
+                .play(track, handle, volume, self.settings.normalise_volume)
+        };
         if position > 1.0 {
             self.resume = Some((index, position));
         }
@@ -1862,8 +2026,30 @@ impl App {
     pub(crate) fn navigate(&mut self, route: Route) {
         if self.history.push(route) {
             self.scroll_to_top = true;
+            self.note_route_entered();
             self.ensure_route_loaded();
         }
+    }
+
+    /// Mark the route now on screen as entered, for the pages that must refresh per visit.
+    ///
+    /// History is the only one today: it is dated ("Today", "Yesterday"), so a list fetched an
+    /// hour ago is a lie. `ensure_route_loaded`'s per-frame safety net cannot do this by itself —
+    /// its `load_*` guards are "already have it" tests — so entry is the one place that knows a
+    /// new visit has begun. The shelves on screen are deliberately kept: a revisit refreshes
+    /// underneath the old list rather than flashing the skeleton.
+    fn note_route_entered(&mut self) {
+        if matches!(self.current_route(), Route::History) {
+            self.history_error = None;
+            self.history_invalidate();
+        }
+    }
+
+    /// Supersede whatever the History page has loaded, in flight or on screen: the next
+    /// `load_history` fetches, and a reply still on its way for the old epoch is dropped.
+    fn history_invalidate(&mut self) {
+        self.history_epoch += 1;
+        self.history_loading = false;
     }
 
     pub(crate) fn can_go_back(&self) -> bool {
@@ -1881,6 +2067,7 @@ impl App {
     pub(crate) fn back(&mut self) {
         if self.history.back() {
             self.scroll_to_top = false;
+            self.note_route_entered();
             self.ensure_route_loaded();
         }
     }
@@ -1888,6 +2075,7 @@ impl App {
     pub(crate) fn forward(&mut self) {
         if self.history.forward() {
             self.scroll_to_top = false;
+            self.note_route_entered();
             self.ensure_route_loaded();
         }
     }
@@ -1898,9 +2086,41 @@ impl App {
     /// that says what the current state describes, and returns when they already agree. That is
     /// what makes this safe to call from `navigate`, from Back and Forward, *and* once per frame
     /// as a safety net for a route whose fetch was dropped while we were elsewhere.
+    /// Whether the startup splash should cover this frame — see [`Self::startup_splash`]. The
+    /// moment it is not wanted it is released for good, so nothing later in the session can bring
+    /// it back. The `--startup-timing`/`--stats-after` measurement runs keep the old path: they
+    /// exist to time the shell, and `verify_session` has no request timeout to bound them by.
+    fn splash_visible(&mut self) -> bool {
+        if !self.startup_splash || self.startup_timing || self.stats_after.is_some() {
+            return false;
+        }
+        let waiting = match self.auth {
+            crate::auth::AuthState::Checking => true,
+            // The shell paints before the landing feed is in — the rail, the chips, a grid of
+            // skeletons — and that half-built frame is the same flash the splash exists to cover.
+            // Hold until Home has something real to show, or has failed and has an error to show.
+            crate::auth::AuthState::SignedIn { .. } => {
+                matches!(self.current_route(), Route::Home)
+                    && self.home.is_none()
+                    && self.home_error.is_none()
+            }
+            // Signed out, or the check failed: there is no feed coming, and the shell — sign-in
+            // prompt included — is the real state, not a placeholder for one.
+            _ => false,
+        };
+        let visible = waiting && crate::elapsed_since_start() < SPLASH_MAX;
+        if !visible {
+            self.startup_splash = false;
+        }
+        visible
+    }
+
     pub(crate) fn ensure_route_loaded(&mut self) {
         match self.current_route() {
             Route::Artist(id) => self.load_artist(id),
+            // The liked page draws the artist's own `from_library`, so it only needs that
+            // artist loaded — the same idempotent fetch, so Back/Forward and a cold entry work.
+            Route::ArtistLiked(id) => self.load_artist(id),
             Route::Album(id) => self.load_album(id),
             Route::Playlist(id) => self.load_playlist(id),
             Route::Mood(params) => self.load_mood_playlists(params),
@@ -1946,11 +2166,13 @@ impl App {
     /// see `Event::CardTracksReady`'s own doc comment for why this is a separate fetch from
     /// `load_album`'s.
     pub(crate) fn play_album(&mut self, id: String) {
+        self.pending_card_play = Some(id.clone());
         self.backend.play_album(id);
     }
 
     /// [`Self::play_album`], for a playlist card.
     pub(crate) fn play_playlist(&mut self, id: String) {
+        self.pending_card_play = Some(id.clone());
         self.backend.play_playlist(id);
     }
 
@@ -2006,6 +2228,34 @@ impl App {
         self.backend.fetch_mood_playlists(params);
     }
 
+    /// Page Liked Music into the liked index. A full scan when the cache is missing or old,
+    /// otherwise just the first page — the newest likes — so a like made elsewhere shows up at
+    /// once. Both run off the UI thread; the pages arrive as events.
+    fn start_liked_scan(&mut self) {
+        if !matches!(self.auth, crate::auth::AuthState::SignedIn { .. }) {
+            return;
+        }
+        self.liked_scanning = true;
+        self.liked_full_scan = self.liked.needs_full_scan();
+        self.liked_buffer.clear();
+        self.backend
+            .fetch_liked(self.account_epoch, self.liked_full_scan);
+    }
+
+    /// Write the liked index out when it has changed. Serialising a few thousand tracks is a
+    /// handful of milliseconds, and this only runs after a scan completes or a rating changed —
+    /// not per frame.
+    fn save_liked_if_dirty(&mut self) {
+        if !self.liked_dirty || self.liked.is_empty() {
+            return;
+        }
+        self.liked_dirty = false;
+        self.last_liked_save = Instant::now();
+        if let Err(e) = crate::liked::save(&self.liked) {
+            tracing::warn!(error = %format!("{e:#}"), "could not save the liked index");
+        }
+    }
+
     /// The signed-in library, once per session. Signed out, the page shows a prompt instead.
     fn load_library(&mut self) {
         if !matches!(self.auth, crate::auth::AuthState::SignedIn { .. })
@@ -2016,7 +2266,8 @@ impl App {
             return;
         }
         self.library_loading = true;
-        self.backend.fetch_library(self.library_sort.param());
+        self.backend
+            .fetch_library(self.library_sort.param(), self.account_epoch);
     }
 
     /// The home feed loads once per filter and stays cached while it is selected.
@@ -2034,7 +2285,8 @@ impl App {
         }
         if self.home.is_none() && self.home_error.is_none() && !self.home_loading {
             self.home_loading = true;
-            self.backend.fetch_home(self.home_filter.clone());
+            self.backend
+                .fetch_home(self.home_filter.clone(), self.account_epoch);
         }
     }
 
@@ -2051,11 +2303,24 @@ impl App {
         self.home_error = None;
         self.home_loading = true;
         self.scroll_to_top = true;
-        self.backend.fetch_home(self.home_filter.clone());
+        self.backend
+            .fetch_home(self.home_filter.clone(), self.account_epoch);
     }
 
     fn artist_is_for(&self, id: &str) -> bool {
         self.artist_for.as_deref() == Some(id)
+    }
+
+    /// The id the artist page on screen was actually browsed as — what a route into that artist
+    /// must reuse.
+    ///
+    /// Not `Artist::id`: that is the id the response's own subscribe button targets, which can
+    /// be a different channel entirely (the live signed-in Tommy Richman page subscribed as
+    /// `UC7eum…` while every browse id linking to it — and the page's own share entity — said
+    /// `UCl7…`; opening the former has no "From your library" shelf, so the liked page came up
+    /// empty). `artist_for` is by construction the id the load used.
+    pub(crate) fn artist_id(&self) -> Option<&str> {
+        self.artist_for.as_deref()
     }
 
     fn album_is_for(&self, id: &str) -> bool {
@@ -2073,7 +2338,7 @@ impl App {
     /// lands at the failed attempt's offset.
     pub(crate) fn retry_route(&mut self) {
         match self.current_route() {
-            Route::Artist(_) => {
+            Route::Artist(_) | Route::ArtistLiked(_) => {
                 self.artist_for = None;
                 self.artist_error = None;
             }
@@ -2119,6 +2384,7 @@ impl App {
             Route::History => {
                 self.history_error = None;
                 self.history_shelves = None;
+                self.history_invalidate();
             }
             Route::Search | Route::Settings => return,
         }
@@ -2149,7 +2415,8 @@ impl App {
         self.artist_expand = Some((browse_id.clone(), title.to_owned()));
         self.artist_expand_loading = true;
         self.artist_expand_error = None;
-        self.backend.fetch_artist_albums(browse_id, params);
+        self.backend
+            .fetch_artist_albums(browse_id, params, title.to_owned());
     }
 
     /// Change the library's order.
@@ -2167,7 +2434,7 @@ impl App {
         self.resync_local_playlists();
         if matches!(self.auth, crate::auth::AuthState::SignedIn { .. }) {
             self.library_loading = true;
-            self.backend.fetch_library(sort.param());
+            self.backend.fetch_library(sort.param(), self.account_epoch);
         }
     }
 
@@ -2186,6 +2453,13 @@ impl App {
             self.playlist_sort_pending = false;
             return;
         };
+        // Defense-in-depth: the UI already hides Sort for one of these (`Playlist::is_expanding`),
+        // but an unbounded radio river has no "the rest" to load, so this must never chase one
+        // even if reached some other way.
+        if playlist.is_expanding() {
+            self.playlist_sort_pending = false;
+            return;
+        }
         if playlist.tracks.next.is_none() {
             self.playlist_sort_pending = false;
             apply_playlist_sort(
@@ -2293,7 +2567,7 @@ impl App {
             return;
         }
         self.library.playlists.loading = true;
-        self.backend.fetch_library_playlists();
+        self.backend.fetch_library_playlists(self.account_epoch);
     }
 
     /// Mirrors `local_playlists` into `library.playlists.items` as `PlaylistRef`s, so the
@@ -2355,6 +2629,7 @@ impl App {
         // Drop the previous query's rows so the page shows its skeleton instead of results that
         // no longer answer what was asked.
         self.results = SearchResults::default();
+        self.results_generation += 1;
         self.backend.search(query);
         if self.search_scope != SearchScope::All {
             self.fetch_scoped_search(self.search_scope);
@@ -2428,6 +2703,7 @@ impl App {
                     self.searching = false;
                     self.status = results.is_empty().then(|| "No results".to_owned());
                     self.results = results;
+                    self.results_generation += 1;
                     let playable = self.results.playable();
                     if self.autoplay && !playable.is_empty() {
                         self.autoplay = false;
@@ -2514,6 +2790,7 @@ impl App {
                     self.local_scanning = false;
                     self.local_scan_error = None;
                     self.local_tracks = tracks;
+                    self.local_tracks_generation += 1;
                 }
                 Event::LocalScanFailed { error } => {
                     self.local_scanning = false;
@@ -2557,8 +2834,14 @@ impl App {
                 // An album/playlist card's play button, not a page view — see
                 // `Event::CardTracksReady`'s own doc comment for why this isn't folded into
                 // `AlbumLoaded`/`PlaylistLoaded`. Same "already loaded → pause/resume" rule
-                // the album/playlist header's own Play button follows.
-                Event::CardTracksReady { id, tracks } if !tracks.is_empty() => {
+                // the album/playlist header's own Play button follows. Guarded by
+                // `pending_card_play` for the same reason page loads guard on `album_is_for`:
+                // two cards' play buttons clicked close together race each other's fetch, and
+                // only the reply for the one clicked most recently should act.
+                Event::CardTracksReady { id, tracks }
+                    if !tracks.is_empty() && self.pending_card_play.as_deref() == Some(&id) =>
+                {
+                    self.pending_card_play = None;
                     // See `NowPlaying::playlist_playing`'s own doc comment: a playlist card has
                     // no per-track field naming it the way an album card reads `album_id`, so
                     // this is what lets its own play button show Pause too.
@@ -2575,14 +2858,21 @@ impl App {
                 // The expansion replaces the shelf it came from, in place, and drops its
                 // "Show all" button along with it. `expanded` is what `artist.rs::shelves()`
                 // reads to switch that shelf from its carousel preview to the full boxed grid.
+                //
+                // The reply is narrowed to the preview's own kinds first: a shelf's "more"
+                // button can answer with a whole artist page (the captured "From your library"
+                // expansion did), and letting that land wholesale is what mixed albums and
+                // playlists into a songs shelf. `shelf_expansion` never empties a shelf.
                 Event::ArtistAlbumsLoaded { artist_id, items } => {
                     self.artist_expand_loading = false;
                     if let Some((id, title)) = self.artist_expand.clone()
                         && id == artist_id
                         && let Some(artist) = self.artist.as_mut()
-                        && let Some(shelf) = artist.shelves.iter_mut().find(|s| s.title == title)
+                        && let Some(shelf) = Arc::make_mut(&mut artist.shelves)
+                            .iter_mut()
+                            .find(|s| s.title == title)
                     {
-                        shelf.items = items;
+                        shelf.items = crate::model::shelf_expansion(items, &shelf.items);
                         shelf.more_params = None;
                         shelf.expanded = true;
                     }
@@ -2675,13 +2965,53 @@ impl App {
                 Event::PlaylistLoaded { id, playlist } => self.cache_rail_playlist(&id, &playlist),
                 Event::PlaylistFailed { .. } => {}
 
-                Event::LibraryLoaded { library } => {
+                // See `App::account_epoch`'s own doc comment: a reply for an account already
+                // switched away from is dropped rather than repopulating cleared state.
+                Event::LibraryLoaded { library, epoch } if epoch == self.account_epoch => {
                     self.library_loading = false;
                     self.library = library;
                     self.library_loaded = true;
                     self.resync_local_playlists();
                     self.apply_playlist_order();
+                    // The restored track is the one copy that never went through
+                    // `Resolving`/`Playing`, so `reconcile_state` has not run on it — a liked
+                    // song restored at launch showed an unrated thumb in the bar until the
+                    // next play. Now that Liked Songs is here, fill it in; only blanks are
+                    // filled, so a rating the account disagrees with is never overwritten.
+                    if let Some(mut track) = self.now.track.take() {
+                        self.reconcile_state(&mut track);
+                        self.now.track = Some(track);
+                    }
                 }
+                Event::LibraryLoaded { .. } => {}
+                // The liked scan: pages accumulate, then a completed full scan swaps in (so an
+                // unlike made elsewhere is dropped, not merged back) and the index is written
+                // out. A quick refresh merges as pages arrive. Epoch-guarded like the library's.
+                Event::LikedPage { tracks, epoch } if epoch == self.account_epoch => {
+                    if self.liked_full_scan {
+                        self.liked_buffer.extend(tracks);
+                    } else if !tracks.is_empty() {
+                        self.liked.merge(tracks);
+                        self.liked_dirty = true;
+                    }
+                }
+                Event::LikedPage { .. } => {}
+                Event::LikedScanDone { complete, epoch } if epoch == self.account_epoch => {
+                    self.liked_scanning = false;
+                    if self.liked_full_scan && complete {
+                        self.liked.replace(std::mem::take(&mut self.liked_buffer));
+                        self.liked_dirty = true;
+                        // The restored track was reconciled against an empty index at launch;
+                        // now that it is complete, the bar can be told.
+                        if let Some(mut track) = self.now.track.take() {
+                            self.reconcile_state(&mut track);
+                            self.now.track = Some(track);
+                        }
+                    }
+                    self.liked_buffer.clear();
+                    self.save_liked_if_dirty();
+                }
+                Event::LikedScanDone { .. } => {}
                 // A further page of one section, appended in order.
                 Event::LibraryMore { section, page } => {
                     let next = page.next;
@@ -2731,7 +3061,7 @@ impl App {
                 // The sidebar's own prefetch. It *replaces* rather than appends, and yields
                 // entirely to a real library load: the two race, and appending after one had
                 // already landed listed every playlist twice.
-                Event::SidebarPlaylists { page } => {
+                Event::SidebarPlaylists { page, epoch } if epoch == self.account_epoch => {
                     if self.library_loaded {
                         self.library.playlists.loading = false;
                     } else {
@@ -2749,10 +3079,12 @@ impl App {
                         self.apply_playlist_order();
                     }
                 }
-                Event::SidebarPlaylistsFailed { error } => {
+                Event::SidebarPlaylists { .. } => {}
+                Event::SidebarPlaylistsFailed { error, epoch } if epoch == self.account_epoch => {
                     tracing::warn!(%error, "could not load the sidebar's playlists");
                     self.library.playlists.loading = false;
                 }
+                Event::SidebarPlaylistsFailed { .. } => {}
                 Event::LibraryMoreFailed { section, error } => {
                     tracing::warn!(?section, %error, "could not load another library page");
                     match section {
@@ -2764,10 +3096,11 @@ impl App {
                         }
                     }
                 }
-                Event::LibraryFailed { error } => {
+                Event::LibraryFailed { error, epoch } if epoch == self.account_epoch => {
                     self.library_loading = false;
                     self.library_error = Some(error);
                 }
+                Event::LibraryFailed { .. } => {}
 
                 Event::SubscriptionChanged {
                     channel_id,
@@ -2828,14 +3161,31 @@ impl App {
                     self.moods_loading = false;
                     self.moods_error = Some(error);
                 }
-                Event::HistoryLoaded { shelves } => {
+                Event::HistoryLoaded { shelves, epoch } if epoch == self.history_epoch => {
                     self.history_loading = false;
                     self.history_shelves = Some(Arc::new(shelves));
+                    self.history_loaded_epoch = epoch;
                 }
-                Event::HistoryFailed { error } => {
+                Event::HistoryFailed { error, epoch } if epoch == self.history_epoch => {
                     self.history_loading = false;
-                    self.history_error = Some(error);
+                    // A refresh failing with a list already on screen must not throw that list
+                    // away: the visit was an attempt to update it, and a transient failure — a
+                    // stale session, a rate limit — should not blank a page that was working.
+                    // The visit is still marked settled (so the per-frame loader does not retry
+                    // in a loop), the failure rides a toast, and the next visit retries. With
+                    // nothing on screen there is nothing to keep, so the page shows its error
+                    // and "Try again".
+                    if self.history_shelves.is_some() {
+                        tracing::warn!(%error, "history refresh failed; keeping the last list");
+                        self.history_loaded_epoch = epoch;
+                        self.toast_error("Could not refresh your history");
+                    } else {
+                        self.history_error = Some(error);
+                    }
                 }
+                // A reply for a History visit since superseded: dropped, so a slow fetch cannot
+                // overwrite a newer one's shelves.
+                Event::HistoryLoaded { .. } | Event::HistoryFailed { .. } => {}
                 Event::PlaylistCreated { title } => {
                     self.toast(&format!("Created “{title}”"));
                     // The rail lists what the library holds, so it has to be asked again before
@@ -2853,17 +3203,23 @@ impl App {
                     filter,
                     shelves,
                     chips,
+                    epoch,
                 } => {
-                    // A reply for a filter since changed is stale — drop it rather than
-                    // showing one filter's shelves under another's chips.
-                    if self.home_filter == filter {
+                    // A reply for a filter since changed, or an account since switched away
+                    // from, is stale — drop it rather than showing one filter's shelves under
+                    // another's chips, or one account's feed under another's.
+                    if self.home_filter == filter && epoch == self.account_epoch {
                         self.home_loading = false;
                         self.home = Some(Arc::new(shelves));
                         self.home_chips = chips;
                     }
                 }
-                Event::HomeFailed { filter, error } => {
-                    if self.home_filter == filter {
+                Event::HomeFailed {
+                    filter,
+                    error,
+                    epoch,
+                } => {
+                    if self.home_filter == filter && epoch == self.account_epoch {
                         self.home_loading = false;
                         self.home_error = Some(error);
                     }
@@ -2885,48 +3241,73 @@ impl App {
                     self.mood_playlists_loading = false;
                 }
 
-                Event::AccountsLoaded { accounts } => self.accounts = accounts,
+                Event::AccountsLoaded { accounts, epoch } if epoch == self.account_epoch => {
+                    self.accounts = accounts;
+                }
+                Event::AccountsLoaded { .. } => {}
 
                 Event::SignInFailed { error } => {
                     self.sign_in_error = Some(error);
                 }
 
                 Event::AuthChanged(state) => {
-                    match &state {
+                    // `Checking` → `SignedIn` is the ordinary *startup* confirmation of a stored
+                    // session, and the flag is read before the assignment below because that
+                    // assignment is itself the fix this line needs.
+                    let was_checking = matches!(self.auth, crate::auth::AuthState::Checking);
+                    // Assigned before the loaders run, not after: `load_library` gates on the
+                    // *current* auth state, and at startup this event arrives while `self.auth`
+                    // is still `Checking` — so its call below silently bailed and Liked Songs
+                    // was only ever fetched once the Library page happened to be visited
+                    // (which is why a liked song restored at launch, or played from a card,
+                    // could show unrated in the bar all session).
+                    self.auth = state;
+                    match &self.auth {
                         // A fresh session invalidates any previously fetched library.
                         crate::auth::AuthState::SignedIn { .. } => {
                             self.library_loaded = false;
                             self.sign_in_error = None;
-                            // `Checking` → `SignedIn` is the ordinary *startup* confirmation of
-                            // a stored session — and `Api::client_ref` already uses that stored
+                            // Only a *real* transition into signed-in — from
+                            // `SignedOut`/`Failed`, finishing sign-in from Settings mid-session
+                            // — invalidates what's already loaded, since that feed genuinely
+                            // was the anonymous one. `Api::client_ref` already uses the stored
                             // cookie optimistically for every request from the very first
                             // frame, before this event ever fires (see its own doc comment), so
                             // a home feed fetched while still `Checking` already came back
-                            // personalised. Wiping and refetching it here regardless used to
+                            // personalised; wiping and refetching it here regardless used to
                             // show a pointless second load on every single launch: the feed
                             // flashing back to its skeleton and reappearing with, as far as the
-                            // user can see, the same content. Only a *real* transition into
-                            // signed-in — from `SignedOut`/`Failed`, finishing sign-in from
-                            // Settings mid-session — actually invalidates what's already
-                            // loaded, since that feed genuinely was the anonymous one.
-                            if !matches!(self.auth, crate::auth::AuthState::Checking) {
+                            // user can see, the same content.
+                            if !was_checking {
+                                self.account_epoch += 1;
                                 self.home = None;
                                 self.home_error = None;
                                 self.history_shelves = None;
                                 self.history_error = None;
+                                self.history_invalidate();
                             }
                             // The topbar's photo chip reads these; asking once here beats
                             // every-frame refires from the pages that display them.
-                            self.backend.fetch_accounts();
-                            // Liked Songs is also how a Radio/Mix track's like status gets
-                            // backfilled (`reconcile_state`) — waiting for the Library page to
-                            // be visited left it stale for most of a session that never opened
-                            // one.
+                            self.backend.fetch_accounts(self.account_epoch);
+                            // Liked Songs is also how a restored or card-played track's like
+                            // status gets backfilled (`reconcile_state`).
                             self.load_library();
+                            // The liked index: the cache first (counts are there before the
+                            // scan is), then a page-through of Liked Music in the background.
+                            self.liked = crate::liked::load();
+                            self.start_liked_scan();
                         }
                         crate::auth::AuthState::SignedOut => {
+                            self.account_epoch += 1;
                             self.library = crate::model::Library::default();
                             self.library_loaded = false;
+                            // The liked index is account data: cleared from memory and removed
+                            // from disk, never left for whoever signs in next.
+                            self.liked = crate::liked::Index::default();
+                            self.liked_scanning = false;
+                            self.liked_buffer.clear();
+                            self.liked_dirty = false;
+                            crate::liked::remove();
                             // Local playlists have nothing to do with a YouTube session — they
                             // stay visible signed out too.
                             self.resync_local_playlists();
@@ -2935,14 +3316,17 @@ impl App {
                             self.home_error = None;
                             self.history_shelves = None;
                             self.history_error = None;
+                            self.history_invalidate();
                         }
                         _ => {}
                     }
-                    self.auth = state;
                     self.load_sidebar_playlists();
                 }
 
-                Event::Resolving(mut track) => {
+                // A reply whose generation doesn't match the latest `play`/`play_video` call is
+                // for a play already superseded by a later one (see `play_generation`'s own doc
+                // comment) — dropped rather than let it silently overwrite `now` out of order.
+                Event::Resolving(mut track, generation) if generation == self.play_generation => {
                     self.reconcile_state(&mut track);
                     self.now = NowPlaying {
                         track: Some(track),
@@ -2952,7 +3336,8 @@ impl App {
                         playlist_playing: self.now.playlist_playing.clone(),
                     };
                 }
-                Event::Playing(mut track) => {
+                Event::Resolving(..) => {}
+                Event::Playing(mut track, generation) if generation == self.play_generation => {
                     self.reconcile_state(&mut track);
                     let video_id = track.video_id.clone();
                     let wide = track.wide;
@@ -2980,6 +3365,7 @@ impl App {
                         self.fetch_lyrics(track);
                     }
                 }
+                Event::Playing(..) => {}
                 Event::MixLoaded { seed, mut queue } => {
                     // The player overlay is the now-playing song's own rating and the only like
                     // state a mix carries; write it onto the first row so the bar's thumbs show
@@ -3019,6 +3405,7 @@ impl App {
                         if let Some(radio) = &mut self.radio {
                             radio.state = landed(added, queue.next);
                         }
+                        self.trim_played_prefix();
                     }
                 }
                 Event::MixSeedFailed { seed, error } => {
@@ -3071,6 +3458,7 @@ impl App {
                             // hold would be requested forever, one round trip at a time.
                             radio.state = landed(added, queue.next);
                         }
+                        self.trim_played_prefix();
                     }
                 }
                 Event::MixMoreFailed { token, error } => {
@@ -3257,7 +3645,11 @@ impl App {
                 Event::ImageReady(loaded) => self.images.insert(ctx, *loaded),
                 Event::ImageFailed(url, px, wide) => self.images.mark_failed(url, px, wide),
 
-                Event::PlaybackFailed { track, error } => {
+                Event::PlaybackFailed {
+                    track,
+                    error,
+                    generation,
+                } if generation == self.play_generation => {
                     self.now = NowPlaying {
                         track: Some(track),
                         resolving: false,
@@ -3267,6 +3659,7 @@ impl App {
                     };
                     self.playback_started = false;
                 }
+                Event::PlaybackFailed { .. } => {}
             }
         }
     }
@@ -3280,10 +3673,12 @@ impl App {
         if index >= tracks.len() {
             return;
         }
-        // The clicked row is already the one loaded: pause/resume it, the same convention an
-        // album/playlist header's own Play button already follows (`queue_matches`/
-        // `toggle_playback`), rather than restarting it from the top.
-        if self.queue_matches(&tracks[index..=index]) {
+        // The clicked row is already the loaded track *and* this is the queue it is in:
+        // pause/resume it, the same convention an album/playlist header's own Play button
+        // follows, rather than restarting it from the top. The whole-list comparison matters:
+        // a mix seeded from the song playing now opens with that song, and matching the track
+        // alone made Start Mix just toggle playback, leaving the queue untouched.
+        if self.current == Some(index) && same_queue(&self.queue, &tracks) {
             self.toggle_playback();
             return;
         }
@@ -3345,14 +3740,38 @@ impl App {
         };
         self.current = Some(index);
         self.playback_started = false;
-        self.backend
-            .play(track, handle, volume, self.settings.normalise_volume);
+        self.play_generation =
+            self.backend
+                .play(track, handle, volume, self.settings.normalise_volume);
     }
 
     /// Remember the track the transport is leaving, so `Previous` can rewind to it.
     fn record_play(&mut self) {
         let Some(current) = self.current else { return };
         self.play_history.remember(current, self.queue.len());
+    }
+
+    /// Drop the oldest already-played tracks once there are more than `MAX_PLAYED_PREFIX` of
+    /// them sitting before `current` — see that constant's own doc comment for why. Called after
+    /// autoplay appends more tracks (`Event::MixSeeded`/`MixMore`), the only place the queue grows
+    /// without a listener-driven bound.
+    fn trim_played_prefix(&mut self) {
+        let Some(current) = self.current else { return };
+        let Some(drop) = current.checked_sub(MAX_PLAYED_PREFIX) else {
+            return;
+        };
+        if drop == 0 {
+            return;
+        }
+        self.queue.drain(..drop);
+        self.current = Some(current - drop);
+        // Every remembered position just shifted by `drop` — see
+        // `PlayHistory::forget_within_queue`'s own doc comment for why starting fresh is simpler
+        // and no less honest than shifting each one to match.
+        self.play_history.forget_within_queue();
+        if let Some((index, position)) = self.resume {
+            self.resume = index.checked_sub(drop).map(|i| (i, position));
+        }
     }
 
     fn prefetch_next(&self) {
@@ -3813,6 +4232,17 @@ impl App {
                     {
                         self.current = Some(current - 1);
                     }
+                    // The removed slot's index no longer means what it did to either of these —
+                    // see `PlayHistory::forget_within_queue`'s own doc comment for why history
+                    // is dropped outright rather than shifted.
+                    self.play_history.forget_within_queue();
+                    if let Some((index, position)) = self.resume {
+                        if index == i {
+                            self.resume = None;
+                        } else if index > i {
+                            self.resume = Some((index - 1, position));
+                        }
+                    }
                 }
             }
         }
@@ -3988,18 +4418,28 @@ impl App {
         self.backend.fetch_moods();
     }
 
-    /// Fetch what you played, once per visit. Signed out the page shows a prompt instead —
-    /// YouTube answers history with "sign in" and parsing that would only produce an error.
+    /// Fetch what you played, once per visit.
+    ///
+    /// Unlike every sibling `load_*`, "already loaded" is *not* `history_shelves.is_some()`:
+    /// History is time-based, so each entry to the page refetches. `note_route_entered` bumps
+    /// `history_epoch` on the way in and this fetches for the new epoch, keeping the shelves
+    /// already on screen up until the reply replaces them. The latched error still stops the
+    /// per-frame safety net from hammering a failing fetch; a visit (or `retry_route`) clears it.
+    ///
+    /// Signed out the page shows a prompt instead — YouTube answers history with "sign in" and
+    /// parsing that would only produce an error.
     fn load_history(&mut self) {
-        if !self.signed_in()
-            || self.history_shelves.is_some()
-            || self.history_loading
-            || self.history_error.is_some()
-        {
+        if !history_needs_load(
+            self.signed_in(),
+            self.history_loading,
+            self.history_error.is_some(),
+            self.history_loaded_epoch,
+            self.history_epoch,
+        ) {
             return;
         }
         self.history_loading = true;
-        self.backend.fetch_history();
+        self.backend.fetch_history(self.history_epoch);
     }
 
     /// Make a new playlist on your account and show it in the rail.
@@ -4272,7 +4712,7 @@ impl App {
             }
         }
         if let Some(artist) = self.artist.as_mut() {
-            for shelf in &mut artist.shelves {
+            for shelf in Arc::make_mut(&mut artist.shelves) {
                 f(shelf);
             }
         }
@@ -4338,7 +4778,9 @@ impl App {
     /// A card carries no menu, so a song started from a shelf arrives unrated and with no
     /// bookmark tokens — and the player echoes that very copy back as [`Event::Playing`],
     /// which is what the bar reads. Any list that parsed the same song from a *row* does know,
-    /// so ask them before believing an empty state.
+    /// so ask them before believing an empty state — and failing every loaded copy, the liked
+    /// index knows every song the account has liked, which is the one list that outlives the
+    /// page it was read on.
     fn reconcile_state(&self, track: &mut Track) {
         let mut like = None;
         let mut library = None;
@@ -4357,6 +4799,9 @@ impl App {
                 ));
             }
         });
+        if like.is_none() {
+            like = self.liked.like_of(&track.video_id);
+        }
         if track.like == LikeStatus::Indifferent
             && let Some(like) = like
         {
@@ -4514,10 +4959,17 @@ impl App {
     /// Set a track's rating everywhere it appears: the queue, the now-playing copy, and every
     /// loaded list. Ratings arrive optimistically and revert on failure, so every copy must
     /// move together or the row and the player bar disagree.
+    ///
+    /// The liked index moves with them: an artist page must count a song the moment it is liked,
+    /// not at the next scan.
     fn set_like(&mut self, video_id: &str, like: LikeStatus) {
-        let set = |t: &mut Track| {
+        let mut copy: Option<Track> = None;
+        let mut set = |t: &mut Track| {
             if t.video_id == video_id {
                 t.like = like;
+                if copy.is_none() {
+                    copy = Some(t.clone());
+                }
             }
         };
         if let Some(t) = self.now.track.as_mut() {
@@ -4572,14 +5024,36 @@ impl App {
                 }
             }
         }
+        match like {
+            LikeStatus::Like => {
+                if let Some(track) = copy {
+                    self.liked.set_liked(track);
+                    self.liked_dirty = true;
+                }
+            }
+            // Dislike is not liked: the index is the liked set and nothing else.
+            LikeStatus::Indifferent | LikeStatus::Dislike => {
+                self.liked.set_unliked(video_id);
+                self.liked_dirty = true;
+            }
+        }
     }
 }
 
 impl eframe::App for App {
     /// eframe calls this periodically and on exit, so the queue survives a normal close as well
     /// as the five-second periodic save.
+    ///
+    /// Written synchronously and directly (not through `Backend::save_playback`, which the
+    /// periodic path uses to keep this same write off the render thread): this call must have
+    /// actually reached disk before eframe finishes tearing the process down, and a background
+    /// task handed to the backend's runtime has no such guarantee.
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
-        self.save_playback();
+        if let Some(store) = self.playback_store()
+            && let Err(e) = crate::playback::save(&store)
+        {
+            tracing::debug!(error = %format!("{e:#}"), "could not save the playback state");
+        }
     }
 
     /// Transparent so the rounded corners show the desktop through them.
@@ -4629,7 +5103,27 @@ impl eframe::App for App {
 
         // Safety net: a route whose fetch was dropped while we were elsewhere must load rather
         // than render an empty page. Idempotent, so calling it every frame costs a comparison.
+        //
+        // Before the splash check, deliberately: the landing page's fetch must be in flight
+        // underneath the splash for the half of it that waits on the first feed to have anything
+        // to wait for.
         self.ensure_route_loaded();
+
+        // A stored session being checked is not the signed-out shell: rendering one — a chip
+        // wired to Settings, "No playlists yet.", a "Sign in" prompt — is wrong for the moment it
+        // is on screen, and with a saved cookie that moment happens on every launch. Neither is
+        // the half-built signed-in shell of the frame after it settles, while the landing feed is
+        // still in flight. The splash covers both; a fresh profile never enters `Checking`, so the
+        // fast path is untouched. The background and blur are painted above, so the window looks
+        // the same underneath it.
+        if self.splash_visible() {
+            ui::splash::screen(self, ui, maximized);
+            // `begin_frame` above must be closed even on a frame that draws none of the shell, or
+            // this frame's start time is silently discarded by the next one's.
+            self.stats.end_frame();
+            return;
+        }
+
         let route = self.current_route();
 
         // Claim order is the shell. The player bar goes first so it spans the whole window;
@@ -4798,6 +5292,7 @@ impl eframe::App for App {
                     Route::Library => ui::library::page(self, ui),
                     Route::Settings => ui::settings::page(self, ui),
                     Route::Artist(_) => ui::artist::page(self, ui),
+                    Route::ArtistLiked(_) => ui::artist_liked::page(self, ui),
                     Route::Album(_) => ui::album::page(self, ui),
                     Route::Playlist(_) => ui::playlist::page(self, ui),
                     Route::Mood(_) => ui::mood::page(self, ui),
@@ -5415,6 +5910,22 @@ mod tests {
         assert!(h.rewind().is_none(), "emptied history must report nothing");
     }
 
+    /// A manual `RemoveFromQueue` drops the within-queue rewind points — they indexed a queue
+    /// shape that edit just changed — but leaves whole-queue history (`leaving_queue`) alone,
+    /// since that's an independent, already-frozen snapshot the edit cannot touch.
+    #[test]
+    fn removing_a_queue_entry_forgets_only_the_within_queue_points() {
+        let mut h = PlayHistory::default();
+        h.leaving_queue(queue_ids(&["a", "b"]), 0, None);
+        h.remember(1, 5);
+        h.remember(2, 5);
+        h.forget_within_queue();
+        match h.rewind() {
+            Some(Rewind::PreviousQueue { index, .. }) => assert_eq!(index, 0),
+            _ => panic!("expected the earlier whole queue to survive"),
+        }
+    }
+
     /// A replaced queue is only reached after the points in the current one, and the points
     /// that indexed the queue now gone were cleared when it was replaced.
     #[test]
@@ -5543,5 +6054,43 @@ mod tests {
         assert_eq!(pending.state, River::Pending);
         assert_eq!(pending.seed, "t2");
         assert_eq!(pending.tail_start(&queue), None);
+    }
+
+    /// History refreshes once per visit, not once per app run: the entry bumps the epoch, the
+    /// loader fetches while the epochs differ, and the landing reply closes the gap. In between,
+    /// the per-frame safety net must not refetch — and a latched error or a load in flight must
+    /// not either, or a failing fetch would be hammered every frame.
+    #[test]
+    fn history_fetches_once_per_visit() {
+        // A fresh visit: nothing loaded for this epoch yet.
+        assert!(history_needs_load(true, false, false, 0, 1));
+        // The reply landed: nothing to do until the next visit bumps the epoch.
+        assert!(!history_needs_load(true, false, false, 1, 1));
+        // Already in flight.
+        assert!(!history_needs_load(true, true, false, 0, 1));
+        // Failed: wait for a visit (or a retry) to clear the latch.
+        assert!(!history_needs_load(true, false, true, 0, 1));
+        // Signed out: the page is a prompt, not a feed.
+        assert!(!history_needs_load(false, false, false, 0, 1));
+        // The next visit.
+        assert!(history_needs_load(true, false, false, 1, 2));
+    }
+
+    /// Start Mix on the song playing now: the mix's queue opens with that song, so a guard that
+    /// looked only at the loaded track treated it as "already playing this" and toggled playback
+    /// instead of replacing the queue. The queue has to match track for track.
+    #[test]
+    fn a_list_only_toggles_when_it_is_the_queue_on_screen() {
+        let playing = vec![track("x")];
+        assert!(same_queue(&playing, &[track("x")]));
+        // The mix opens with the playing song but is its own queue: replace, do not toggle.
+        assert!(!same_queue(&playing, &[track("x"), track("y")]));
+        // Same tracks, different order or length: a different queue.
+        assert!(!same_queue(
+            &[track("x"), track("y")],
+            &[track("y"), track("x")]
+        ));
+        assert!(!same_queue(&[track("x")], &[track("x"), track("y")]));
+        assert!(!same_queue(&[], &playing));
     }
 }

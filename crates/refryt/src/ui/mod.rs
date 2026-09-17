@@ -3,6 +3,7 @@
 
 pub mod album;
 pub mod artist;
+pub mod artist_liked;
 pub mod charts;
 pub mod crash;
 pub mod explore;
@@ -19,6 +20,7 @@ pub mod releases;
 pub mod search;
 pub mod settings;
 pub mod sidebar;
+pub mod splash;
 pub mod topbar;
 pub mod upnext;
 pub mod video;
@@ -110,6 +112,31 @@ pub(crate) fn art_texture_wide<'a>(
     let px = art_px(ctx, points);
     url.and_then(|url| {
         images.texture_wide(url, px, |key, sized, px, wide| {
+            backend.fetch_image(key, sized, px, wide)
+        })
+    })
+}
+
+/// [`art_px`] for the artist hero: a banner is drawn across the whole card, so the 512pt cap the
+/// cover sizes share would be visibly soft. Capped at 2048 — wider than any window the card is
+/// likely to be drawn in, and a 2048×533 texture is ~4 MB, well inside the cache's budget.
+pub(crate) fn art_px_hero(ctx: &egui::Context, points: f32) -> u32 {
+    let px = (points * ctx.pixels_per_point()).ceil().max(1.0) as u32;
+    px.next_multiple_of(32).clamp(256, 2048)
+}
+
+/// Look up — and trigger the fetch of — the artist hero banner for a card `points` wide. The
+/// height follows [`crate::images::HERO_ASPECT`]; the artist page cover-crops the remainder.
+pub(crate) fn art_texture_hero<'a>(
+    images: &'a mut Images,
+    backend: &Backend,
+    ctx: &egui::Context,
+    url: Option<&Arc<str>>,
+    points: f32,
+) -> Option<&'a egui::TextureHandle> {
+    let px = art_px_hero(ctx, points);
+    url.and_then(|url| {
+        images.texture_hero(url, px, |key, sized, px, wide| {
             backend.fetch_image(key, sized, px, wide)
         })
     })
@@ -755,7 +782,9 @@ pub(crate) fn track_rows(
 /// opened mid-page.
 ///
 /// 3 columns × 5 rows is the target: wide enough for that and the full 15 shows at once with no
-/// arrows at all. Only a narrower window — fewer columns fitting — needs them.
+/// arrows at all. Only a narrower window — fewer columns fitting — needs them. `numbered` draws
+/// the position number in each row's leading slot, which the artist page's "Popular" list wants
+/// and the shelves it sits beside do not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn track_shelf_pages(
     ui: &mut egui::Ui,
@@ -764,6 +793,7 @@ pub(crate) fn track_shelf_pages(
     backend: &Backend,
     stats: &mut crate::stats::Stats,
     heading: &str,
+    numbered: bool,
     now: &crate::player::NowPlaying,
     tracks: &[crate::model::Track],
     playlists: &[PlaylistRef],
@@ -784,12 +814,16 @@ pub(crate) fn track_shelf_pages(
         |i| {
             let t = &tracks[i];
             RowSpec {
-                number: None,
+                number: numbered.then_some(i + 1),
                 rank: t.rank.as_deref(),
                 trend: t.trend,
                 title: &t.title,
                 album_id: t.album_id.as_deref(),
-                subtitle: track_subtitle_inner(t, false),
+                // No album in this shelf's subtitle, at any column count: the list is drawn in
+                // narrow columns (1–3 of them inside the artist page's own layout), where
+                // "artist • album • plays" is clipped mid-word before the plays even show. The
+                // title itself still links to the album.
+                subtitle: track_subtitle_inner(t, true),
                 duration: t.duration,
                 plays: t.plays.as_deref(),
                 explicit: t.explicit,
@@ -1663,14 +1697,8 @@ pub(crate) struct HeaderOutcome {
     pub save: bool,
     pub dots: Option<egui::Response>,
     pub link: Option<Route>,
-    pub text_x: f32,
-    pub text_w: f32,
-    pub art_bottom: f32,
     /// The art as it was actually drawn — shrunken from the request when the card is narrow.
-    pub art_size: f32,
-    /// The bottom of the last text row painted, controls included. Callers that draw their
-    /// own button row (the artist page) use it to decide whether the row still fits.
-    pub text_bottom: f32,
+    pub art_bottom: f32,
     /// The point just past the last button drawn (Play, Save or •••, whichever was last),
     /// vertically centred on the row — where a caller-specific extra control (the playlist
     /// page's sort icon) can paint itself on the same baseline. `None` when no control row was
@@ -1911,11 +1939,7 @@ pub(crate) fn page_header(
         save: false,
         dots: None,
         link,
-        text_x: tx,
-        text_w,
         art_bottom: art_rect.bottom(),
-        art_size,
-        text_bottom,
         controls_end: None,
     };
     if h.play_size.is_none() && h.save_in_library.is_none() && !h.dots {
@@ -1959,16 +1983,20 @@ pub(crate) fn page_header(
         }
         controls.add_space(6.0);
     }
-    let dots = widgets::icon_button(
-        &mut controls,
-        palette,
-        crate::icons::Icon::Ellipsis,
-        16.0,
-        false,
-    );
+    // The ••• is the page's own menu trigger and is only drawn where the page has one to hang
+    // off it — a page with controls but no menu (the liked list) draws Play and stops.
+    let dots = h.dots.then(|| {
+        widgets::icon_button(
+            &mut controls,
+            palette,
+            crate::icons::Icon::Ellipsis,
+            16.0,
+            false,
+        )
+    });
     outcome.controls_end = Some(controls.min_rect().right_center());
     drop(controls);
-    outcome.dots = Some(dots);
+    outcome.dots = dots;
     outcome.art_bottom = outcome.art_bottom.max(controls_rect.bottom() + 6.0);
     outcome
 }
