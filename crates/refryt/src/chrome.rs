@@ -1,6 +1,7 @@
 //! The frameless window: rounded background, custom titlebar, drag and resize.
 //!
-//! We ask the OS for a borderless transparent window and paint everything ourselves. That buys
+//! We ask the OS for a borderless window — transparent where the compositor blends it and opaque
+//! on Windows — and paint everything ourselves. That buys
 //! the look, and costs us the behaviour a titlebar normally provides for free — dragging,
 //! resizing from the edges, double-click to maximise. All of that lives here.
 //!

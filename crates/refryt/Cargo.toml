@@ -32,12 +32,12 @@ ytmapi-rs.workspace = true
 refryt-resolve.workspace = true
 libmpv2.workspace = true
 # The software render API for the in-app music video. `libmpv2`'s safe wrapper only exposes the
-# OpenGL render params, which the app cannot use on Windows (wgpu there for per-pixel alpha), so
-# the video view drives mpv's `sw` render context directly through these bindings.
+# OpenGL render params, so the video view drives mpv's `sw` render context directly through these
+# bindings instead: one code path under any egui renderer, at the cost of a copy per frame.
 libmpv2-sys = "=4.0.1"
-# `blur.rs`'s three backends (KDE, Windows, and the do-nothing stub for everything else) all
-# read the raw window/display handles eframe exposes, so this is unconditional rather than
-# behind any one target's `cfg`.
+# `blur.rs`'s backends (KDE and the do-nothing stub for everything else, Windows included) read
+# the raw window/display handles eframe exposes, so this is unconditional rather than behind any
+# one target's `cfg`.
 raw-window-handle = "0.6"
 # The system tray icon (`tray.rs`). Genuinely cross-platform — its own internal `cfg`s pick
 # libappindicator on Linux, the Shell_NotifyIcon API on Windows, NSStatusItem on macOS — so this
@@ -52,6 +52,7 @@ playwire = "1.0"
 rfd = "0.17.2"
 lofty = "0.25.1"
 walkdir = "2.5.0"
+discord-rich-presence = "1.1"
 
 # Real acrylic on KDE Wayland: asking KWin to blur what shows through. Two protocols for one
 # job, both already resolved to versions already in the tree — winit pulls the same
@@ -74,19 +75,35 @@ wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 
-# Real acrylic on Windows: `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE)`, documented since
-# Windows 11 22H2 and one call — no protocol to bind, no region to compute, DWM blurs the whole
-# client area itself. Pinned to 0.52, the version winit itself already resolves to on Windows,
-# so this is another edge onto an already-compiled crate rather than a second copy of it.
+# Pinned to 0.52, the version winit itself already resolves to on Windows, so this is an edge
+# onto an already-compiled crate rather than a second copy of it.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "=0.52.0", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
-# `glow` (OpenGL/WGL) never gets a real per-pixel-alpha swapchain on Windows, so a transparent,
-# undecorated window renders opaque and DWM has nothing to blur behind — the backdrop call in
-# `blur.rs` was silently accepted and doing nothing. `egui`/eframe's own recommendation for this
-# exact platform gap is `wgpu`, whose Windows backend goes through a DXGI composition swapchain
-# that DWM actually blends — this is additive (Linux keeps `glow`, chosen there for its much
-# smaller dependency tree), and eframe's `Renderer::default()` picks `wgpu` automatically the
-# moment both backends are compiled in, so no code change is needed to select it.
+# `-System_Registry`/`-Security` are `autostart`'s per-user `Run` key; `-UI_Shell` /
+# `-UI_WindowsAndMessaging` are `open_url`'s `ShellExecuteW`. There is no `-Graphics_Dwm`: the
+# backdrop call it used to carry is gone with the transparency option (see `blur.rs`).
+windows-sys = { version = "=0.52.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# The in-app sign-in window (`webview_login.rs`). WebView2 is the one browser whose cookie store
+# this app is allowed to read on Windows: Chromium's App-Bound Encryption makes Chrome/Edge/Brave's
+# own stores unreadable to any other process (yt-dlp#10927), and Google no longer accepts OAuth on
+# the YouTube Music API (ytmusicapi#676, yt-dlp#11462), so asking a browser we own stays the only
+# path. `wry` is the WebView2 binding, `tao` the event loop its window needs — both Windows-only,
+# nothing reaches the Linux or AppImage builds. WebView2 itself is a Windows component, but the
+# GNU target links the loader dynamically, so `WebView2Loader.dll` ships next to the exe the same
+# way `libmpv-2.dll` already does.
+wry = "0.57"
+tao = "0.37"
+# Windows renders through wgpu. Not for transparency — the shell is opaque there now (`blur.rs`
+# has no Windows backend) — but for stability: the glow/WGL path presents whole-window black
+# frames under load on Windows (reproduced: scrolling an artist page while covers upload gives
+# uniform black frames every so often, while the same build on wgpu does not). eframe's
+# `Renderer::default()` picks wgpu automatically the moment both backends are compiled in, so no
+# code change selects it; Linux keeps glow, chosen there for its much smaller dependency tree.
 eframe = { workspace = true, features = ["wgpu"] }
 
 # Embeds refryt.ico as the .exe's own icon resource (build.rs) — unconditional, not under a

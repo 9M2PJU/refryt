@@ -78,6 +78,23 @@ mkdir -p "$pkg"
 cp "target/$target/release/refryt.exe" "$pkg/"
 cp "$mpv_dev/libmpv-2.dll" "$pkg/"
 
+# Colour emoji: Windows' own font, Segoe UI Emoji, is COLR — the emoji painter reads PNG strikes
+# and nothing else (`emoji.rs`) — so Noto Color Emoji travels next to the exe. Committed under
+# assets/fonts rather than fetched at build time: it is a compatibility asset, not a tool that
+# has to chase upstream like yt-dlp does. It is the v2.042 build, deliberately: v2.043 and later
+# are COLRv1-only, which is the same thing Segoe UI Emoji could not be read for.
+cp assets/fonts/NotoColorEmoji.ttf "$pkg/"
+
+# WebView2's loader: the x86_64-pc-windows-gnu target links it dynamically (only MSVC targets
+# link the static library), so the sign-in window's one file has to travel next to the exe. It
+# lives in the webview2-com-sys crate's own source tree, fetched with everything else.
+loader="$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -path '*webview2-com-sys-*/x64/WebView2Loader.dll' 2>/dev/null | head -1)"
+if [ -z "$loader" ]; then
+    echo "error: WebView2Loader.dll not found under ${CARGO_HOME:-$HOME/.cargo}/registry — run 'cargo fetch' first" >&2
+    exit 1
+fi
+cp "$loader" "$pkg/"
+
 # yt-dlp is the resolver that exists specifically to survive YouTube changing something — it is
 # not optional, playback does not work at all without it — so it ships inside the zip rather than
 # assuming the target machine already has it. Always freshly fetched, unlike the mpv package

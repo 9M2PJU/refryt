@@ -337,6 +337,8 @@ pub(crate) enum RowAction {
     Subscribe {
         channel_id: String,
         subscribe: bool,
+        /// The page button's own token for this direction, when it carried one.
+        params: Option<Arc<str>>,
     },
     DontRecommend {
         token: String,

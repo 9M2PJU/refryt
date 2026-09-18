@@ -116,7 +116,7 @@ pub struct Api {
     noauth: Mutex<Option<YtMusic<NoAuthToken>>>,
     browser: Mutex<Option<YtMusic<BrowserToken>>>,
     session: Mutex<Option<auth::Session>>,
-    /// Single-flights [`Self::refresh_from_browser`]: several requests can independently notice
+    /// Single-flights [`Self::refresh_from_source`]: several requests can independently notice
     /// a rotated cookie at once (`Self::library`'s four sections fetch concurrently), and without
     /// this each would launch its own `yt-dlp` cookie re-import in parallel.
     refresh: Mutex<()>,
@@ -221,6 +221,20 @@ impl Api {
         self.install_cookie(cookie, Some(browser)).await
     }
 
+    /// Sign in through the app's own WebView2 window (Windows only).
+    ///
+    /// The browser import's counterpart for the case that path cannot serve: Chromium's
+    /// App-Bound Encryption makes a modern Chrome/Edge/Brave store unreadable to anything but
+    /// the browser itself, so this window reads its own cookies and hands them over. The window
+    /// lives in a child process of this same binary — see `webview_login`'s module doc — so this
+    /// only awaits it.
+    #[cfg(target_os = "windows")]
+    pub async fn sign_in_from_window(&self) -> Result<String> {
+        let cookie = crate::webview_login::capture().await?;
+        self.install_cookie(cookie, Some(crate::webview_login::SOURCE))
+            .await
+    }
+
     /// Install a cookie, verify with YouTube that it is really a session, and persist it.
     ///
     /// Three gates, because the first two are each insufficient on their own:
@@ -310,6 +324,11 @@ impl Api {
         self.forget_session().await;
         let _ = auth::delete_cookie();
         let _ = auth::delete_oauth();
+        // The sign-in window keeps Google's own session in its profile, and that is a credential
+        // too: left behind, the next Log in would silently re-capture the same account instead
+        // of asking who is signing in.
+        #[cfg(target_os = "windows")]
+        crate::webview_login::forget();
     }
 
     /// Confirm the stored session with YouTube, refreshing it from the browser if it has gone
@@ -333,7 +352,7 @@ impl Api {
             return Ok(Some(account));
         }
         // Recognised as anonymous: the cookies have rotated under us. Re-import once.
-        if !self.refresh_from_browser().await {
+        if !self.refresh_from_source().await {
             return Ok(None);
         }
         let yt = self
@@ -345,11 +364,11 @@ impl Api {
         account_name(&yt).await
     }
 
-    /// Re-import from the browser this session came from, once, when YouTube stops recognising it.
+    /// Re-import from wherever this session came from, once, when YouTube stops recognising it.
     ///
     /// Google rotates `__Secure-1PSIDTS`, so a stored cookie goes stale on its own. Returns false
     /// when there is nothing to refresh from — a pasted session, or no stored session at all.
-    async fn refresh_from_browser(&self) -> bool {
+    async fn refresh_from_source(&self) -> bool {
         let before = self.session.lock().await.as_ref().map(|s| s.cookie.clone());
         let _guard = self.refresh.lock().await;
         // Another caller may have refreshed while this one waited for the lock above:
@@ -367,16 +386,23 @@ impl Api {
             .await
             .as_ref()
             .and_then(|s| s.source.clone());
-        let Some(browser) = source else {
+        let Some(source) = source else {
             return false;
         };
-        match self.sign_in_from_browser(&browser).await {
+        let refreshed = match source.as_str() {
+            // Not a browser `--cookies-from-browser` knows about: reopening the sign-in window
+            // finds Google's session still in its profile, so this is normally a plain capture.
+            #[cfg(target_os = "windows")]
+            crate::webview_login::SOURCE => self.sign_in_from_window().await,
+            _ => self.sign_in_from_browser(&source).await,
+        };
+        match refreshed {
             Ok(_) => {
-                tracing::info!(%browser, "refreshed the session from the browser");
+                tracing::info!(%source, "refreshed the session from its source");
                 true
             }
             Err(e) => {
-                tracing::warn!(%browser, error = %format!("{e:#}"), "could not refresh the session");
+                tracing::warn!(%source, error = %format!("{e:#}"), "could not refresh the session");
                 false
             }
         }
@@ -722,7 +748,7 @@ impl Api {
             return Ok(page);
         }
         // Empty *and* carrying YouTube's signed-out prompt: the cookie has expired under us.
-        if self.refresh_from_browser().await {
+        if self.refresh_from_source().await {
             let query = match &continuation {
                 Some(token) => BrowseQuery::next_page(token.clone()),
                 None => BrowseQuery::sorted(browse_id, sort),
@@ -1108,7 +1134,7 @@ impl Api {
         if innertube::looks_signed_out(&json) {
             // The cookie may have gone stale under us, same as `library_page` already guards
             // against — retry once after a fresh browser re-import before giving up.
-            if self.refresh_from_browser().await {
+            if self.refresh_from_source().await {
                 let json = self.browse(HISTORY).await?;
                 if !innertube::looks_signed_out(&json) {
                     return Ok(innertube::parse_browse_shelves(&json));
@@ -1120,10 +1146,19 @@ impl Api {
     }
 
     /// Follow or unfollow an artist. Signed in only.
-    pub async fn set_subscribed(&self, channel_id: &str, subscribe: bool) -> Result<()> {
+    ///
+    /// `params` is the button's own token from the page it was clicked on, when there was one:
+    /// YouTube's web client sends it with the call, and some channels refuse the write without it.
+    pub async fn set_subscribed(
+        &self,
+        channel_id: &str,
+        subscribe: bool,
+        params: Option<&str>,
+    ) -> Result<()> {
         let query = SubscribeQuery {
             channel_id: channel_id.to_owned(),
             subscribe,
+            params: params.map(str::to_owned),
         };
         let json = match self.client_ref().await? {
             ClientRef::NoAuth(_) => anyhow::bail!("sign in to subscribe"),
@@ -1971,6 +2006,9 @@ impl ytmapi_rs::query::PostQuery for DeletePlaylistQuery {
 struct SubscribeQuery {
     channel_id: String,
     subscribe: bool,
+    /// The button's own `params` token, when the page carried one. The web client always sends
+    /// it; without it YouTube answers some channels with a bare 400 "invalid argument".
+    params: Option<String>,
 }
 
 impl ytmapi_rs::parse::ParseFrom<SubscribeQuery> for RawBrowse {
@@ -1991,6 +2029,9 @@ impl ytmapi_rs::query::PostQuery for SubscribeQuery {
             "channelIds".to_owned(),
             serde_json::json!([self.channel_id]),
         );
+        if let Some(params) = &self.params {
+            body.insert("params".to_owned(), serde_json::json!(params));
+        }
         body
     }
 
@@ -2557,7 +2598,9 @@ fn map_artist(a: GetArtist) -> model::Artist {
         // The typed fallback's thumbnails are square portraits, never the wide banner.
         hero: None,
         top_songs,
-        // The typed fallback has no shelf JSON to read a "Show all" target from.
+        // The typed fallback has no shelf JSON to read either the title or the "Show all"
+        // target from; the page falls back to its own "Popular" heading.
+        top_songs_title: None,
         top_songs_playlist: None,
         shelves: std::sync::Arc::new(shelves),
     }
@@ -2782,6 +2825,41 @@ mod tests {
         assert_eq!(
             body.get("playlistId").and_then(|v| v.as_str()),
             Some("RDAMPLOLAK5uy_x")
+        );
+    }
+
+    /// The subscribe body is the channel id plus the page button's own token when there was one
+    /// — the token is what makes some channels accept the write — and nothing else. Without a
+    /// token it stays the bare body it always sent, so a page that carried none is no worse off.
+    #[test]
+    fn the_subscribe_body_carries_the_buttons_params_when_there_is_one() {
+        let with = SubscribeQuery {
+            channel_id: "UC1".into(),
+            subscribe: true,
+            params: Some("EgIIGxgA".into()),
+        };
+        let body = ytmapi_rs::query::PostQuery::header(&with);
+        assert_eq!(
+            body.get("channelIds"),
+            Some(&serde_json::json!(["UC1"])),
+            "the channel id went missing"
+        );
+        assert_eq!(
+            body.get("params").and_then(|v| v.as_str()),
+            Some("EgIIGxgA")
+        );
+        assert_eq!(body.len(), 2, "unexpected fields in the body");
+
+        let without = SubscribeQuery {
+            channel_id: "UC1".into(),
+            subscribe: false,
+            params: None,
+        };
+        let body = ytmapi_rs::query::PostQuery::header(&without);
+        assert_eq!(
+            body.len(),
+            1,
+            "no token means the bare body, exactly as before"
         );
     }
 }

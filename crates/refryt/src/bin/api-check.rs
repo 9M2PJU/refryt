@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("could not load artist {id}"))?;
         println!();
         println!(
-            "artist OK: {} — {}",
+            "artist OK: {} ({id}) — {}",
             artist.name,
             [artist.subscribers.as_deref(), artist.views.as_deref()]
                 .into_iter()

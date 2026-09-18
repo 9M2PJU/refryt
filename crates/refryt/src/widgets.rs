@@ -116,6 +116,17 @@ pub(crate) fn activate(ctx: &egui::Context, response: &egui::Response, id: &str)
     false
 }
 
+/// Whether a click landed on a row's cover — the hover play button's own control.
+///
+/// The overlay drawn on a row's artwork is a button in its own right, not decoration: pressing it
+/// plays on a single click whatever the double-click-to-play setting says, the same way a card's
+/// own button hit region already does. Only square art ever draws one (a 16:9 still has none), so
+/// only square art is a button. `pos` is the click's own position, which `clicked` alone cannot
+/// tell apart from a click on the row's title or its rating thumbs.
+fn on_cover(shape: ArtShape, art: Rect, pos: Option<egui::Pos2>, clicked: bool) -> bool {
+    clicked && shape == ArtShape::Square && pos.is_some_and(|p| art.contains(p))
+}
+
 /// Whether `id` is the row/card the listener last single-clicked (double-click-to-play mode).
 pub(crate) fn is_selected(ctx: &egui::Context, id: &str) -> bool {
     double_click_play(ctx) && selected(ctx).as_deref() == Some(id)
@@ -1438,15 +1449,49 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         0.0
     };
 
+    // A narrow row — the open queue on a small window — compresses instead of starving: the
+    // number column and the art yield first, and what they give back is the title's room. A
+    // full-size art and a 30pt number column left 21pt of it on a 215pt card, which is one
+    // ellipsis. Computed out here, before the cover's hit region is decided and before anything
+    // is painted, so the two cannot disagree about where the cover is.
+    let num_w = if (number.is_some() || rank.is_some()) && !narrow {
+        theme::ROW_NUMBER_W
+    } else {
+        0.0
+    };
+    let row_art = if narrow { 32.0 } else { theme::ART_SIZE };
+    // A video still keeps its 16:9 aspect instead of being squeezed into the square slot.
+    let art_w = if shape == ArtShape::Wide {
+        row_art * 16.0 / 9.0
+    } else {
+        row_art
+    };
+    let art_rect = Rect::from_center_size(
+        rect.left_center() + vec2(theme::ROW_LEFT_INSET + num_w + art_w / 2.0, 0.0),
+        vec2(art_w, row_art),
+    );
+
     // Geometric, not `hovered()`: children stacked on top (links, thumbs) steal the hover
     // flag, which would blink the highlight out as the pointer crosses them.
     let over = response.contains_pointer();
     let t = fade(ui, response.id.with("row"), over);
     // Double-click-to-play: the row's own track is the id to select or play. A row without a
     // menu (the queue's current row) is not a selectable list item, so it keeps the plain click.
-    let activate = match menu.as_ref() {
-        Some(m) => activate(ui.ctx(), &response, m.track.video_id.as_str()),
-        None => response.clicked(),
+    // The cover is exempt: it is the hover play button's own control, so a click on it plays on a
+    // single click whatever the setting says — and short-circuiting `activate` is what keeps that
+    // click from also marking the row as merely selected.
+    let activate = if on_cover(
+        shape,
+        art_rect,
+        response.interact_pointer_pos(),
+        response.clicked(),
+    ) {
+        true
+    } else {
+        match menu.as_ref() {
+            Some(m) => activate(ui.ctx(), &response, m.track.video_id.as_str()),
+            None => response.clicked(),
+        }
     };
     let selected = menu
         .as_ref()
@@ -1464,25 +1509,6 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
                 .rect_filled(rect, radius, palette.surface_hover.gamma_multiply(t));
         }
 
-        // A narrow row — the open queue on a small window — compresses instead of starving:
-        // the number column and the art yield first, and what they give back is the title's
-        // room. (Decided up with `duration_w`, which leans on it.)
-        let num_w = if (number.is_some() || rank.is_some()) && !narrow {
-            theme::ROW_NUMBER_W
-        } else {
-            0.0
-        };
-        let row_art = if narrow { 32.0 } else { theme::ART_SIZE };
-        // A video still keeps its 16:9 aspect instead of being squeezed into the square slot.
-        let art_w = if shape == ArtShape::Wide {
-            row_art * 16.0 / 9.0
-        } else {
-            row_art
-        };
-        let art_rect = Rect::from_center_size(
-            rect.left_center() + vec2(theme::ROW_LEFT_INSET + num_w + art_w / 2.0, 0.0),
-            vec2(art_w, row_art),
-        );
         paint_art(ui, palette, art_rect, art, shape);
         // A cover you can press is a control; one you cannot is a picture.
         if shape == ArtShape::Square {
@@ -2492,6 +2518,11 @@ fn card_menu(
                             choice = Some(RowAction::Subscribe {
                                 channel_id: artist.id.clone(),
                                 subscribe: !subscribed,
+                                params: if subscribed {
+                                    artist.actions.unsubscribe_params.clone()
+                                } else {
+                                    artist.actions.subscribe_params.clone()
+                                },
                             });
                             mui.close();
                         }
@@ -3618,5 +3649,155 @@ mod tests {
         // Exactly at the threshold the zone still fits; sharing starts below it.
         assert!(corner_shares_duration(519.0, true, true, true));
         assert!(!corner_shares_duration(520.0, true, true, true));
+    }
+
+    /// The cover's play button is a control of its own: a click inside a square row's artwork
+    /// plays, and it must read that way even in double-click-to-play mode, where the row's own
+    /// single click only selects. A click anywhere else on the row is not the button's, and a
+    /// 16:9 still has no button to press.
+    #[test]
+    fn only_a_click_on_a_square_rows_cover_presses_its_play_button() {
+        let art = Rect::from_min_size(egui::pos2(10.0, 4.0), vec2(40.0, 40.0));
+        let inside = Some(egui::pos2(30.0, 24.0));
+        let outside = Some(egui::pos2(300.0, 24.0));
+        assert!(on_cover(ArtShape::Square, art, inside, true));
+        // A click that was not a click at all — a drag, or a hover — never presses it.
+        assert!(!on_cover(ArtShape::Square, art, inside, false));
+        // Somewhere else on the row: the row's own click, double-click setting and all.
+        assert!(!on_cover(ArtShape::Square, art, outside, true));
+        // A video's still carries no overlay, so it has nothing to press.
+        assert!(!on_cover(ArtShape::Wide, art, inside, true));
+        // A click with no recorded position cannot be attributed to the cover.
+        assert!(!on_cover(ArtShape::Square, art, None, true));
+    }
+
+    /// The cover's button, driven for real: a row is laid out in a headless `Context`, the pointer
+    /// is moved onto the cover and clicked once, and the row must play. Then a single click on the
+    /// row's body — the same frame sequence, the same setting — must only select. This is the half
+    /// `on_cover` cannot prove: that the click's position and the row's own clicked flag line up on
+    /// the frame the release lands.
+    #[test]
+    fn a_single_click_on_the_cover_plays_in_double_click_mode() {
+        use std::cell::Cell;
+
+        use egui::{Event, PointerButton, Pos2};
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let palette = crate::theme::Palette::dark();
+        // The setting the cover exists to be an exception to.
+        set_double_click_play(&ctx, true);
+
+        let track = crate::model::Track {
+            video_id: "cover-test".into(),
+            title: "A Song".into(),
+            artists: vec![crate::model::ArtistLink::plain("Someone")],
+            album: None,
+            album_id: None,
+            duration: Some(200),
+            plays: None,
+            explicit: false,
+            like: crate::model::LikeStatus::Indifferent,
+            in_library: false,
+            library_add: None,
+            library_remove: None,
+            set_video_id: None,
+            thumbnail: None,
+            rank: None,
+            trend: crate::model::ChartTrend::Unknown,
+            wide: false,
+            local_path: None,
+        };
+        let playlists: [crate::model::PlaylistRef; 0] = [];
+
+        let mut t = 0.0;
+        let activate = Cell::new(false);
+        let cover = Cell::new(Pos2::ZERO);
+        let body = Cell::new(Pos2::ZERO);
+        let mut pass = |events: Vec<Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0))),
+                time: Some(t),
+                events,
+                ..Default::default()
+            };
+            let mut fired = false;
+            ctx.run_ui(input, |ui| {
+                let hit = track_row(
+                    ui,
+                    &palette,
+                    TrackRow {
+                        number: None,
+                        rank: None,
+                        trend: crate::model::ChartTrend::Unknown,
+                        title: &track.title,
+                        album_id: None,
+                        subtitle: plain_subtitle("Someone"),
+                        duration: track.duration,
+                        plays: None,
+                        explicit: false,
+                        active: false,
+                        playing: false,
+                        badge: None,
+                        art: None,
+                        shape: ArtShape::Square,
+                        id_salt: 0,
+                        menu: Some(RowMenu {
+                            track: &track,
+                            playlist_id: None,
+                            playlists: &playlists,
+                            signed_in: true,
+                            queue_index: None,
+                        }),
+                        like: track.like,
+                        show_rating: false,
+                    },
+                );
+                fired = hit.activate;
+                let rect = hit.response.rect;
+                cover.set(egui::pos2(
+                    rect.left() + crate::theme::ART_SIZE / 2.0,
+                    rect.center().y,
+                ));
+                body.set(egui::pos2(rect.right() - 40.0, rect.center().y));
+            })
+            .drop_without_applying_deltas();
+            activate.set(fired);
+        };
+        let click = |pos: Pos2, pressed: bool| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // Lay the row out once so the cover's position is known.
+        pass(vec![]);
+        // One clean click, on the cover.
+        pass(vec![Event::PointerMoved(cover.get())]);
+        pass(vec![click(cover.get(), true)]);
+        pass(vec![click(cover.get(), false)]);
+        assert!(
+            activate.get(),
+            "the cover's own button did not play on a single click in double-click mode"
+        );
+        assert!(
+            !is_selected(&ctx, "cover-test"),
+            "clicking the cover also marked the row as merely selected"
+        );
+
+        // The same click elsewhere on the row: double-click mode means select, not play.
+        pass(vec![Event::PointerMoved(body.get())]);
+        pass(vec![click(body.get(), true)]);
+        pass(vec![click(body.get(), false)]);
+        assert!(
+            !activate.get(),
+            "a body click played, but double-click mode should only select it"
+        );
+        assert!(
+            is_selected(&ctx, "cover-test"),
+            "a single body click did not select the row"
+        );
     }
 }

@@ -6,10 +6,12 @@
 //! the ceiling of what text painting can do. Playlist names are full of emoji and they came out
 //! looking like text.
 //!
-//! So the emoji are painted as images instead: find the system's colour emoji font, pull the PNG
-//! the font already stores for that glyph, and blit it where the glyph would have gone. The
-//! *advance* still comes from the monochrome face, so spacing and truncation are unchanged — only
-//! the pixels differ.
+//! So the emoji are painted as images instead: find a colour emoji font that stores PNG strikes,
+//! pull the PNG for that glyph, and blit it where the glyph would have gone. The *advance* still
+//! comes from the monochrome face, so spacing and truncation are unchanged — only the pixels
+//! differ. On Linux and macOS that font is the system's own; on Windows it is Noto Color Emoji,
+//! which the packaging ships next to the exe (`font_path`), because Segoe UI Emoji is COLR and
+//! has no PNG strike to read.
 //!
 //! What this deliberately does not do is shape. A ZWJ sequence (👨‍👩‍👧) needs `GSUB` ligature
 //! lookups to reach its single glyph; here its components are drawn side by side, which is wrong
@@ -317,35 +319,58 @@ fn load_font() -> Option<Arc<memmap2::Mmap>> {
 }
 
 fn font_path() -> Option<PathBuf> {
-    const CANDIDATES: &[&str] = &[
-        // Arch, Fedora
-        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-        "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
-        // Debian, Ubuntu
-        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-        "/usr/share/fonts/truetype/noto-color-emoji/NotoColorEmoji.ttf",
-        "/usr/share/fonts/NotoColorEmoji.ttf",
-        // macOS ships an `sbix` font, which skrifa reads the same way.
-        "/System/Library/Fonts/Apple Color Emoji.ttc",
-    ];
-    for path in CANDIDATES {
-        if Path::new(path).is_file() {
-            return Some(PathBuf::from(path));
-        }
+    // Windows' own colour font, Segoe UI Emoji, is COLR — nothing for `png_for` to read — so the
+    // app carries one that has PNG strikes: Noto Color Emoji, next to the exe in a packaged
+    // build. `CARGO_MANIFEST_DIR` is the repository's copy for a dev run; it is a compile-time
+    // path that only resolves on the machine that produced the binary, and the shipped copy is
+    // found first anyway.
+    #[cfg(target_os = "windows")]
+    {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
+        let repository =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts/NotoColorEmoji.ttf");
+        exe_dir
+            .into_iter()
+            .map(|dir| dir.join("NotoColorEmoji.ttf"))
+            .chain(std::iter::once(repository))
+            .find(|path| path.is_file())
     }
-    if let Some(home) = directories::BaseDirs::new() {
-        let local = home
-            .home_dir()
-            .join(".local/share/fonts/NotoColorEmoji.ttf");
-        if local.is_file() {
-            return Some(local);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        const CANDIDATES: &[&str] = &[
+            // Arch, Fedora
+            "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
+            // Debian, Ubuntu
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/truetype/noto-color-emoji/NotoColorEmoji.ttf",
+            "/usr/share/fonts/NotoColorEmoji.ttf",
+            // macOS ships an `sbix` font, which skrifa reads the same way.
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+        ];
+        for path in CANDIDATES {
+            if Path::new(path).is_file() {
+                return Some(PathBuf::from(path));
+            }
         }
+        if let Some(home) = directories::BaseDirs::new() {
+            let local = home
+                .home_dir()
+                .join(".local/share/fonts/NotoColorEmoji.ttf");
+            if local.is_file() {
+                return Some(local);
+            }
+        }
+        // Distributions move fonts around; fontconfig is the one component that always knows
+        // where they went. Only reached when every well-known path missed.
+        fontconfig_path()
     }
-    // Distributions move fonts around; fontconfig is the one component that always knows where
-    // they went. Only reached when every well-known path missed.
-    fontconfig_path()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn fontconfig_path() -> Option<PathBuf> {
     let out = std::process::Command::new("fc-match")
         .args(["-f", "%{file}", "Noto Color Emoji"])

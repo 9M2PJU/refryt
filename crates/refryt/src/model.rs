@@ -127,6 +127,12 @@ pub struct ArtistActions {
     pub mix: Option<WatchTarget>,
     /// `None` when the source said nothing about it — which is not the same as "not subscribed".
     pub subscribed: Option<bool>,
+    /// The `params` token the button carried for each direction. YouTube's subscribe and
+    /// unsubscribe calls take the button's own token alongside the channel id, and the two
+    /// directions carry different ones; missing is not fatal, it just falls back to the bare
+    /// channel id the call used to send.
+    pub subscribe_params: Option<Arc<str>>,
+    pub unsubscribe_params: Option<Arc<str>>,
     /// The token that stops YouTube recommending this artist. One-way, so it is only offered
     /// where the response actually provided it.
     pub dont_recommend: Option<Arc<str>>,
@@ -509,6 +515,10 @@ pub struct Artist {
     /// falls back to the circle-art header this page has always had.
     pub hero: Option<Arc<str>>,
     pub top_songs: Vec<Track>,
+    /// YouTube's own title for that shelf. "Top songs" on every capture so far, but the artist
+    /// page draws whatever the response called it rather than inventing a heading of its own.
+    /// `None` on the typed fallback, which has no shelf to read one from.
+    pub top_songs_title: Option<String>,
     /// The id of the "Top songs" shelf's own auto-generated playlist — its "Show all" target.
     /// YouTube embeds only 5 songs directly in the artist page; the rest live here, one playlist
     /// fetch away, the same way any other playlist opens.

@@ -97,8 +97,8 @@ fn playlists(app: &mut App, ui: &mut egui::Ui) {
 }
 
 /// The modal the **+** opens: the app dims behind a centered card — name field, Create,
-/// Cancel — the shape ytmdesktop uses, rather than a form wedged into the rail. Enter or
-/// Create commits; Escape, Cancel or clicking the dim abandons.
+/// Cancel — rather than a form wedged into the rail. Enter or Create commits; Escape, Cancel or
+/// clicking the dim abandons.
 ///
 /// One area paints both the dim and the card. Two layers would not hold: egui promotes a
 /// layer on pointer interaction, so a dim layer moved above the window the moment the

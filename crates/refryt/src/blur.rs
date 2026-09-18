@@ -1,8 +1,8 @@
 //! Blur behind the window.
 //!
-//! Neither KWin nor DWM blurs a window that has not asked, which is why a transparent winit
-//! window stays merely transparent on its own however see-through it is — each compositor wants
-//! its own opt-in. Two real backends, each the natural way for its platform:
+//! KWin does not blur a window that has not asked, which is why a transparent winit window stays
+//! merely transparent on its own however see-through it is — the compositor wants its own opt-in.
+//! One real backend, the natural way for its platform:
 //!
 //! - **KDE Wayland**: two protocols for one job. The standard
 //!   `ext_background_effect_manager_v1` first — what KWin 6.7 offers after it dropped its own
@@ -13,12 +13,15 @@
 //!   compositor blurs a rectangle behind a window that isn't one. The standard protocol also
 //!   carries a `capabilities` event, so the Settings toggle follows the Blur desktop effect
 //!   switch live instead of offering blur the compositor has been told not to do.
-//! - **Windows**: one call, `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE)`. DWM blurs the
-//!   whole client area itself — no region, no protocol negotiation, nothing to compute.
 //!
-//! Silent by design, on both. GNOME before 51, wlroots, X11, a Windows build older than 11 22H2,
-//! macOS: all take the same unavailable path, the window stays translucent without the blur, and
-//! Settings says so rather than offering a switch that does nothing.
+//! Windows has no backend and wants none: the shell is opaque there (`app::App::new`), so a
+//! backdrop would have nothing to show through — and the DWM material that used to be applied
+//! read as flat white rather than as blur.
+//!
+//! Silent by design. GNOME before 51, wlroots, X11, Windows, macOS: all take the same
+//! unavailable path — the window stays merely translucent, and Settings explains that rather
+//! than offering a switch that would do nothing (on Windows, where the shell is opaque, the
+//! switch does not exist at all).
 
 /// The blur region for a rounded window, as rectangles.
 ///
@@ -60,15 +63,13 @@ pub fn rounded_region(w: u32, h: u32, radius: u32) -> Vec<(i32, i32, i32, i32)> 
 #[cfg(target_os = "linux")]
 pub use wayland::Blur;
 
-#[cfg(target_os = "windows")]
-pub use windows::Blur;
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(target_os = "linux"))]
 pub use stub::Blur;
 
-/// Everywhere that is neither Linux nor Windows — macOS today, and whatever else this ever
-/// compiles for: the same shape, doing nothing.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// Everywhere that is not Linux — Windows included, where the transparency feature itself is
+/// absent rather than merely blurless — plus macOS today and whatever else this ever compiles
+/// for: the same shape, doing nothing.
+#[cfg(not(target_os = "linux"))]
 mod stub {
     #[derive(Default)]
     pub struct Blur;
@@ -352,85 +353,6 @@ mod wayland {
             // Nothing else flushes our requests.
             let _ = self.conn.flush();
         }
-    }
-}
-
-#[cfg(target_os = "windows")]
-mod windows {
-    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::Graphics::Dwm::{
-        DWM_SYSTEMBACKDROP_TYPE, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-        DwmSetWindowAttribute,
-    };
-
-    /// No region, no protocol to bind: DWM blurs the whole client area once asked, so `size`
-    /// and `radius` — both load-bearing on the KDE path — go unused here.
-    pub struct Blur {
-        hwnd: Option<HWND>,
-        last: Option<bool>,
-    }
-
-    impl Blur {
-        /// There is no query for "does this Windows offer the backdrop", short of asking for it
-        /// and reading back whether DWM accepted — the same rule the KDE path follows for its
-        /// own protocol. So `new` probes once with the real backdrop and immediately turns it
-        /// back off: nothing has asked for blur yet, only found out whether it can be had. A
-        /// refusal (`false`) covers a Windows older than 11 22H2, where the attribute id itself
-        /// is unrecognised, as well as a handle DWM would not accept at all.
-        pub fn new(handles: &(impl HasWindowHandle + HasDisplayHandle)) -> Self {
-            let hwnd = Self::hwnd(handles).filter(|&h| {
-                let accepted = set_backdrop(h, DWMSBT_TRANSIENTWINDOW);
-                if accepted {
-                    set_backdrop(h, DWMSBT_NONE);
-                }
-                accepted
-            });
-            Self { hwnd, last: None }
-        }
-
-        /// Whether DWM offered the backdrop. What greys out the settings toggle.
-        pub fn available(&self) -> bool {
-            self.hwnd.is_some()
-        }
-
-        pub fn set(&mut self, on: bool, _size: (u32, u32), _radius: u32) {
-            if self.last == Some(on) {
-                return;
-            }
-            let Some(hwnd) = self.hwnd else { return };
-            set_backdrop(
-                hwnd,
-                if on {
-                    DWMSBT_TRANSIENTWINDOW
-                } else {
-                    DWMSBT_NONE
-                },
-            );
-            self.last = Some(on);
-        }
-
-        fn hwnd(handles: &(impl HasWindowHandle + HasDisplayHandle)) -> Option<HWND> {
-            let RawWindowHandle::Win32(window) = handles.window_handle().ok()?.as_raw() else {
-                return None;
-            };
-            Some(window.hwnd.get() as HWND)
-        }
-    }
-
-    /// `pvattribute` takes the backdrop kind by address, as every `DwmSetWindowAttribute` call
-    /// does — the API is untyped past the attribute id, so there is nothing more specific to
-    /// pass. `false` for anything short of `S_OK`: a partial acceptance is not a real one.
-    fn set_backdrop(hwnd: HWND, kind: DWM_SYSTEMBACKDROP_TYPE) -> bool {
-        let hr = unsafe {
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE as u32,
-                &kind as *const DWM_SYSTEMBACKDROP_TYPE as *const core::ffi::c_void,
-                core::mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
-            )
-        };
-        hr == 0
     }
 }
 

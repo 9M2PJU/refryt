@@ -195,8 +195,6 @@ const INTER_SEMIBOLD: &str = "inter-semibold";
 const INTER_BOLD: &str = "inter-bold";
 /// The emoji face, shared by every weight — emoji have no weights to speak of.
 const EMOJI: &str = "noto-emoji";
-/// The system CJK face, if one exists — loaded from disk, never bundled. See `install_fonts`.
-const CJK: &str = "noto-cjk";
 
 // `FontFamily::Name` wraps an `Arc<str>` precisely so it is cheap to clone, but `"…".into()`
 // builds a fresh one — a heap allocation and copy — on every call, and `medium()`/`semibold()`
@@ -269,21 +267,23 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
     // fallbacks for scripts neither covers. Order is precedence: the first face with the glyph
     // wins, so Inter keeps the text-style arrows and dingbats it draws better itself.
     //
-    // Between the two sits whatever CJK face the system carries, loaded from disk rather than
+    // Between the two sits whatever CJK faces the system carries, loaded from disk rather than
     // bundled — Noto Sans CJK JP alone is ~19 MB across the weights, and a music app that
     // cannot show its users' own song titles is broken. Nothing here ships a font that large
     // for the one machine in ten that has no CJK installed at all; without one, titles fall
     // back to the boxes they were, which was never this code's making.
-    if let Some(cjk) = system_cjk_font() {
+    let mut cjk_names = Vec::new();
+    for (name, bytes) in system_cjk_fonts() {
         fonts
             .font_data
-            .insert(CJK.to_owned(), Arc::new(FontData::from_static(cjk)));
+            .insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
+        cjk_names.push(name);
     }
     let head = fonts.families.entry(FontFamily::Proportional).or_default();
     head.insert(0, "inter".to_owned());
     head.insert(1, EMOJI.to_owned());
-    if fonts.font_data.contains_key(CJK) {
-        head.insert(2, CJK.to_owned());
+    for (i, name) in cjk_names.iter().enumerate() {
+        head.insert(2 + i, (*name).to_owned());
     }
 
     let fallbacks: Vec<String> = fonts.families[&FontFamily::Proportional]
@@ -300,38 +300,84 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// The first system CJK face among the paths distributions actually ship, `None` when the
-/// machine carries none. Fedora and Arch keep Noto under `opentype/noto`, Debian and KDE under
-/// `noto-cjk`; the Regular weight is preferred so titles match the UI's own voice, and the
-/// DemiLight commonly-installed variant fills in where it does not exist.
+/// Every system CJK face worth registering, one per script, in fallback order.
+///
+/// Linux carries a single super-TTC that covers Japanese, Korean and Chinese, so one entry does
+/// it. Windows ships a face per script and none covers the others' kana or hangul — Yu Gothic
+/// for Japanese, Malgun Gothic for Korean, Microsoft YaHei for Chinese — so all three go in,
+/// Japanese first to match the Linux preference. Each group takes the first path that exists;
+/// a group with nothing installed simply contributes nothing.
 ///
 /// Mapped, not read: `NotoSansCJK-Regular.ttc` is a ~20 MB super-TTC, and a music app that
 /// cannot show its users' own song titles is broken — but almost none of those 20 MB needs to
 /// be resident. `std::fs::read` would keep the whole file in a process-lifetime heap `Vec`
 /// (the largest single line item in the idle figure on any machine with `noto-cjk`); a map is
-/// file-backed and only the pages holding glyphs actually drawn are ever faulted in. The map
-/// is leaked because epaint wants `&'static [u8]` and the font must outlive every glyph
-/// lookup egui makes, i.e. the whole process — the same lifetime a leak gives it.
-fn system_cjk_font() -> Option<&'static [u8]> {
-    for path in [
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-DemiLight.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-DemiLight.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK.ttc",
-    ] {
-        let Ok(file) = std::fs::File::open(path) else {
-            continue;
-        };
-        // SAFETY: as in `emoji::load_font` — a font file replaced under a running process is
-        // seen as changed bytes; skrifa bounds-checks every read and a bad parse yields
-        // fallback boxes, never UB.
-        let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else {
-            continue;
-        };
-        return Some(&**Box::leak(Box::new(map)));
-    }
-    None
+/// file-backed and only the pages holding glyphs actually drawn are ever faulted in.
+fn system_cjk_fonts() -> Vec<(&'static str, &'static [u8])> {
+    #[cfg(target_os = "windows")]
+    const GROUPS: &[(&str, &[&str])] = &[
+        (
+            "system-cjk-jp",
+            &[
+                // Yu Gothic ships on Windows 10 and 11; Meiryo and MS Gothic are the older
+                // installs.
+                r"C:\Windows\Fonts\YuGothM.ttc",
+                r"C:\Windows\Fonts\meiryo.ttc",
+                r"C:\Windows\Fonts\msgothic.ttc",
+            ],
+        ),
+        (
+            "system-cjk-kr",
+            &[
+                r"C:\Windows\Fonts\malgun.ttf",
+                r"C:\Windows\Fonts\gulim.ttc",
+                r"C:\Windows\Fonts\batang.ttc",
+            ],
+        ),
+        (
+            "system-cjk-sc",
+            &[
+                r"C:\Windows\Fonts\msyh.ttc",
+                r"C:\Windows\Fonts\msjh.ttc",
+                r"C:\Windows\Fonts\simsun.ttc",
+            ],
+        ),
+    ];
+    // Fedora and Arch keep Noto under `opentype/noto`, Debian and KDE under `noto-cjk`; the
+    // Regular weight is preferred so titles match the UI's own voice, and the DemiLight
+    // commonly-installed variant fills in where it does not exist.
+    #[cfg(not(target_os = "windows"))]
+    const GROUPS: &[(&str, &[&str])] = &[(
+        "system-cjk",
+        &[
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-DemiLight.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-DemiLight.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK.ttc",
+        ],
+    )];
+
+    GROUPS
+        .iter()
+        .filter_map(|(name, paths)| {
+            paths
+                .iter()
+                .find_map(|path| mapped_font(path).map(|bytes| (*name, bytes)))
+        })
+        .collect()
+}
+
+/// Map a font file and leak the mapping — see [`system_cjk_fonts`] for why a map, and why
+/// leaking is the lifetime epaint wants: `&'static [u8]` has to outlive every glyph lookup
+/// egui makes, i.e. the whole process, which is exactly what a leak gives it.
+fn mapped_font(path: &str) -> Option<&'static [u8]> {
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: as in `emoji::load_font` — a font file replaced under a running process is seen
+    // as changed bytes; skrifa bounds-checks every read and a bad parse yields fallback boxes,
+    // never UB.
+    let map = (unsafe { memmap2::Mmap::map(&file) }).ok()?;
+    Some(&**Box::leak(Box::new(map)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -548,6 +594,26 @@ mod tests {
                     c as u32
                 );
             }
+        }
+    }
+
+    /// Whatever CJK face the system carries must actually resolve the scripts it was loaded
+    /// for. Skipped when the machine has none — that fallback is best-effort by design — but
+    /// with one installed, kana and hangul must not come out as boxes. Windows is the case this
+    /// pins: its faces are one per script, so a missing path list (the bug) renders Japanese
+    /// and Korean song titles as replacement glyphs.
+    #[test]
+    fn the_system_cjk_font_covers_kana_and_hangul() {
+        if system_cjk_fonts().is_empty() {
+            return;
+        }
+        let ctx = fonts_ready();
+        for c in ['あ', 'ア', '漢', '한', '글'] {
+            assert!(
+                can_draw(&ctx, c),
+                "no glyph for {c:?} (U+{:04X}) despite a system CJK face",
+                c as u32
+            );
         }
     }
 

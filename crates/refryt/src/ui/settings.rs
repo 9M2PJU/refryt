@@ -11,7 +11,9 @@ use egui::RichText;
 use crate::app::App;
 use crate::auth::AuthState;
 use crate::browser_cookies;
-use crate::settings::{Opacity, Quality, Theme};
+#[cfg(not(target_os = "windows"))]
+use crate::settings::Opacity;
+use crate::settings::{Quality, Theme};
 use crate::theme::{self, Scheme, Variant};
 use crate::widgets;
 
@@ -30,6 +32,8 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         playback(app, ui);
         ui.add_space(22.0);
         system(app, ui);
+        ui.add_space(22.0);
+        integrations(app, ui);
         ui.add_space(22.0);
         local_music(app, ui);
         ui.add_space(22.0);
@@ -230,65 +234,80 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
     }
     ui.add_space(8.0);
 
-    // A slider, not chips: transparency is a continuum, and four names only ever made the
-    // setting look like a choice of four windows. The label centres on the slider's own row.
-    let mut sheer = app.settings.opacity.sheer();
-    labeled_row(&app.palette, ui, "Transparency", |ui| {
-        // `--decorated` gives the window back to the OS, which paints its own opaque
-        // background — the slider would do nothing, so it is dimmed and inert rather than
-        // silently pretending.
-        ui.add_enabled_ui(!app.decorated, |ui| {
-            widgets::slider(ui, &app.palette, &mut sheer, 0.0..=Opacity::MAX, 220.0);
-            ui.add_space(6.0);
-            // The number the slider only implies: a percentage is what "how transparent is it"
-            // is actually asked and answered in, and the label's x is fixed by the slider's own
-            // width, so the changing digits move nothing else. A percentage of the slider's
-            // whole range, which reaches past the old maximum — not of the composite alpha.
-            ui.label(
-                RichText::new(format!("{:.0}%", sheer / Opacity::MAX * 100.0))
-                    .font(theme::regular(12.0))
-                    .color(app.palette.text),
-            );
+    // Windows gets no transparency and no blur row at all. Its per-pixel-alpha route composites
+    // the shell over a flat DWM material — a washed-out white, not the desktop — so the slider
+    // promised see-through that could never look right, and the blur behind that material was
+    // invisible. Absent beats a switch that lies; the window is opaque there (`app::App::new`
+    // forces the stored values off, in case a settings file came from Linux).
+    #[cfg(not(target_os = "windows"))]
+    {
+        // A slider, not chips: transparency is a continuum, and four names only ever made the
+        // setting look like a choice of four windows. The label centres on the slider's own row.
+        let mut sheer = app.settings.opacity.sheer();
+        labeled_row(&app.palette, ui, "Transparency", |ui| {
+            // `--decorated` gives the window back to the OS, which paints its own opaque
+            // background — the slider would do nothing, so it is dimmed and inert rather than
+            // silently pretending.
+            ui.add_enabled_ui(!app.decorated, |ui| {
+                widgets::slider(ui, &app.palette, &mut sheer, 0.0..=Opacity::MAX, 220.0);
+                ui.add_space(6.0);
+                // The number the slider only implies: a percentage is what "how transparent is
+                // it" is actually asked and answered in, and the label's x is fixed by the
+                // slider's own width, so the changing digits move nothing else. A percentage of
+                // the slider's whole range, which reaches past the old maximum — not of the
+                // composite alpha.
+                ui.label(
+                    RichText::new(format!("{:.0}%", sheer / Opacity::MAX * 100.0))
+                        .font(theme::regular(12.0))
+                        .color(app.palette.text),
+                );
+            });
         });
-    });
-    ui.add_space(4.0);
-    if app.decorated {
-        note(
-            app,
-            ui,
-            "The acrylic mode needs the frameless window; `--decorated` hands it back to the OS.",
-        );
-    } else {
-        note(app, ui, "How much of the desktop shows through the shell.");
-    }
-    ui.add_space(8.0);
-
-    let blur_available = app.blur.available();
-    let blur_useful = sheer > 0.0;
-    let mut blur = app.settings.blur;
-    widgets::setting_row(
-        ui,
-        &app.palette,
-        "Blur what shows through",
-        if !blur_available {
-            "Your compositor does not offer window blur; the window is simply translucent."
-        } else if !blur_useful {
-            "Nothing shows through at the current transparency."
-        } else {
-            "Real blur behind the window, on compositors that offer it."
-        },
-        |ui| {
-            // Dimmed and inert rather than clickable-but-pointless when there is nothing to
-            // turn on — no compositor support, or nothing set to show through it yet.
-            widgets::toggle_enabled(
+        ui.add_space(4.0);
+        if app.decorated {
+            note(
+                app,
                 ui,
-                &app.palette,
-                ui.id().with("setting-blur"),
-                &mut blur,
-                blur_available && blur_useful,
+                "The acrylic mode needs the frameless window; `--decorated` hands it back to the OS.",
             );
-        },
-    );
+        } else {
+            note(app, ui, "How much of the desktop shows through the shell.");
+        }
+        ui.add_space(8.0);
+
+        let blur_available = app.blur.available();
+        let blur_useful = sheer > 0.0;
+        let mut blur = app.settings.blur;
+        widgets::setting_row(
+            ui,
+            &app.palette,
+            "Blur what shows through",
+            if !blur_available {
+                "Your compositor does not offer window blur; the window is simply translucent."
+            } else if !blur_useful {
+                "Nothing shows through at the current transparency."
+            } else {
+                "Real blur behind the window, on compositors that offer it."
+            },
+            |ui| {
+                // Dimmed and inert rather than clickable-but-pointless when there is nothing to
+                // turn on — no compositor support, or nothing set to show through it yet.
+                widgets::toggle_enabled(
+                    ui,
+                    &app.palette,
+                    ui.id().with("setting-blur"),
+                    &mut blur,
+                    blur_available && blur_useful,
+                );
+            },
+        );
+
+        let ctx = ui.ctx().clone();
+        app.update_settings(&ctx, |s| {
+            s.opacity = Opacity::new(sheer);
+            s.blur = blur;
+        });
+    }
 
     let mut adaptive_art_color = app.settings.adaptive_art_color;
     toggle_row(
@@ -305,8 +324,6 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
         s.theme = theme_choice;
         s.scheme = scheme_choice;
         s.scheme_variant = flavour_choice;
-        s.opacity = Opacity::new(sheer);
-        s.blur = blur;
         s.adaptive_art_color = adaptive_art_color;
     });
 }
@@ -389,11 +406,12 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
 fn system(app: &mut App, ui: &mut egui::Ui) {
     heading(app, ui, "System");
 
-    // No autostart mechanism is wired up for any target but Linux, so the row itself doesn't
-    // exist elsewhere rather than offering a switch that would do nothing.
-    #[cfg(target_os = "linux")]
+    // Both platforms this ships to have a mechanism — an XDG autostart entry on Linux, the
+    // per-user `Run` key on Windows (`autostart`'s own doc comment) — so the row exists
+    // wherever one does, and nowhere else.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut start_on_boot = app.settings.start_on_boot;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     toggle_row(
         app,
         ui,
@@ -426,11 +444,44 @@ fn system(app: &mut App, ui: &mut egui::Ui) {
 
     let ctx = ui.ctx().clone();
     app.update_settings(&ctx, |s| {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             s.start_on_boot = start_on_boot;
         }
         s.hide_tray_on_close = hide_tray;
+    });
+}
+
+/// Discord Rich Presence. Nothing to configure: the app connects as its own Discord application
+/// (the id is fixed in `crate::discord`), so the toggle is the whole setting.
+fn integrations(app: &mut App, ui: &mut egui::Ui) {
+    heading(app, ui, "Integrations");
+
+    let mut enabled = app.settings.discord_rich_presence;
+    widgets::setting_row(
+        ui,
+        &app.palette,
+        "Discord Rich Presence",
+        "Shows what you are playing on your Discord profile. Needs Discord running.",
+        |ui| {
+            widgets::toggle(
+                ui,
+                &app.palette,
+                ui.id().with("setting-discord"),
+                &mut enabled,
+            );
+        },
+    );
+    ui.add_space(4.0);
+    note(
+        app,
+        ui,
+        "The presence appears while this is on and something is playing.",
+    );
+
+    let ctx = ui.ctx().clone();
+    app.update_settings(&ctx, |s| {
+        s.discord_rich_presence = enabled;
     });
 }
 
@@ -507,15 +558,55 @@ fn sign_in(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.add_space(14.0);
 
+    #[cfg(target_os = "windows")]
+    {
+        window_sign_in(app, ui);
+        ui.add_space(16.0);
+    }
     browser_import(app, ui);
+}
+
+/// The path that works where the browser import cannot: a modern Chromium's cookie store is
+/// sealed with App-Bound Encryption, so the only process that can read it is the browser itself
+/// — and this window is one. See [`crate::webview_login`].
+#[cfg(target_os = "windows")]
+fn window_sign_in(app: &mut App, ui: &mut egui::Ui) {
+    ui.label(
+        RichText::new("Sign in with a browser window")
+            .font(theme::semibold(13.0))
+            .color(app.palette.text),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Opens a small window with Google's sign-in page. It is the app's own browser, so \
+             the session is read from there directly — nothing is taken from the browsers you \
+             use, and none of them needs to be closed first.",
+        )
+        .font(theme::regular(12.0))
+        .color(app.palette.dim),
+    );
+    ui.add_space(8.0);
+
+    if widgets::pill_button(ui, &app.palette, "Open the sign-in window").clicked() {
+        // Deliberately not `auth = Checking`: that state means "verifying a stored session at
+        // startup", and `AuthChanged` reads it to tell an optimistically personalised feed from
+        // an anonymous one a fresh sign-in has just invalidated. The state changes when the
+        // attempt actually lands.
+        app.backend.sign_in_from_window();
+    }
 }
 
 /// The path that works: read the cookies out of a browser that is already signed in.
 fn browser_import(app: &mut App, ui: &mut egui::Ui) {
     ui.label(
-        RichText::new("Import from a browser")
-            .font(theme::semibold(13.0))
-            .color(app.palette.text),
+        RichText::new(if cfg!(target_os = "windows") {
+            "Or import from a browser"
+        } else {
+            "Import from a browser"
+        })
+        .font(theme::semibold(13.0))
+        .color(app.palette.text),
     );
     ui.add_space(4.0);
 
@@ -524,10 +615,13 @@ fn browser_import(app: &mut App, ui: &mut egui::Ui) {
         .get_or_insert_with(browser_cookies::detected);
     if browsers.is_empty() {
         ui.label(
-            RichText::new(
+            RichText::new(if cfg!(target_os = "windows") {
+                "No Firefox profile found. Sign in to music.youtube.com in Firefox, or use the \
+                 sign-in window above."
+            } else {
                 "No browser profile found. Sign in to music.youtube.com in Firefox, Chrome, \
-                 Chromium, Brave, Vivaldi or Edge.",
-            )
+                 Chromium, Brave, Vivaldi or Edge."
+            })
             .font(theme::regular(12.0))
             .color(app.palette.dim),
         );
@@ -542,17 +636,10 @@ fn browser_import(app: &mut App, ui: &mut egui::Ui) {
         .font(theme::regular(12.0))
         .color(app.palette.dim),
     );
-    // Windows locks a running Chromium browser's cookie database far more strictly than
-    // Linux does; yt-dlp's own docs call closing the browser first the fix for exactly this,
-    // and it is the single most common reason this import fails there. Worth saying up front
-    // rather than only after a failed attempt, since the error it produces (a locked-file
-    // message from deep inside yt-dlp) does not make the fix obvious on its own.
-    #[cfg(windows)]
-    ui.label(
-        RichText::new("On Windows, close the browser first if the import below fails.")
-            .font(theme::regular(12.0))
-            .color(app.palette.dim),
-    );
+    // No "close the browser first" hint any more: on Windows only Firefox is ever offered here,
+    // and Firefox neither locks its store nor seals it, so there is nothing to close for. The
+    // Chromium browsers that needed that advice are not shown there at all — see
+    // `browser_cookies::readable_on_this_os`.
     ui.add_space(8.0);
 
     let mut chosen = None;
@@ -565,7 +652,8 @@ fn browser_import(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     if let Some(key) = chosen {
-        app.auth = AuthState::Checking;
+        // Same reason as the sign-in window button above: `Checking` belongs to the startup
+        // session check, not to an interactive attempt.
         app.backend.sign_in_from_browser(key.to_owned());
     }
 }

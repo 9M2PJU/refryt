@@ -28,10 +28,11 @@ through anything but your own browser and YouTube itself.
   down to turning any folder into a real playlist without ever leaving the app.
 - **Radio/autoplay**, ratings, your library, listening history, moods & genres, charts — the
   usual shape of YouTube Music, without the rest of the browser around it.
-- **A translucent, blurred shell** with real desktop compositor blur where it's available, nine
-  colour schemes, and light/dark variants for each.
-- **A system tray and autostart** on Linux, and the keyboard shortcuts you'd expect from
-  Spotify's own desktop app (space to play/pause, arrows to skip, and so on).
+- **A translucent, blurred shell** with real desktop compositor blur where it's available (KDE
+  Wayland today; the Windows shell is opaque), nine colour schemes, and light/dark variants for
+  each.
+- **A system tray and autostart** on Linux and Windows, and the keyboard shortcuts you'd expect
+  from Spotify's own desktop app (space to play/pause, arrows to skip, and so on).
 - **Sign-in that's just importing a browser session** — Chrome, Firefox, Brave, Vivaldi, Edge,
   whatever you're already signed into. No pasting cookies, no device codes.
 
@@ -42,7 +43,7 @@ through anything but your own browser and YouTube itself.
 - **[`yt-dlp`](https://github.com/yt-dlp/yt-dlp)** for stream resolution
 - **[`ytmapi-rs`](https://github.com/nick42d/youtui)** for YouTube Music's InnerTube protocol
 - **`tokio`** + **`reqwest`**/`rustls` for async networking
-- **`glow`** (OpenGL) on Linux, **`wgpu`** (DirectComposition) on Windows, for rendering
+- **`glow`** (OpenGL) on Linux, **`wgpu`** (DX12) on Windows, for rendering
 - **`lofty`** + **`walkdir`** + **`rfd`** for local files and folders
 
 ## Installing

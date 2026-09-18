@@ -1176,6 +1176,16 @@ pub struct App {
     /// OS media controls and media keys, when the platform offers them. `None` on a session with
     /// no media service (e.g. no D-Bus session bus); the app runs the same without it.
     pub(crate) media: Option<crate::media::Media>,
+    /// The Discord Rich Presence worker, while the setting is on and an application id is set.
+    /// Dropping it tells the worker to clear the presence and stop.
+    discord: Option<crate::discord::Discord>,
+    /// What was last handed to Discord — the track's id, whether it was playing, and its title —
+    /// so the presence is only resent when something material changes rather than every frame.
+    presence_key: Option<(Option<String>, bool, String)>,
+    /// Where the track was when the presence was last sent, and when: together they say whether
+    /// the progress bar Discord is drawing has been broken by a seek, which needs a resend.
+    presence_position: f64,
+    presence_sent_at: Instant,
     /// Kept for the video view, which creates its mpv render context lazily.
     ctx: egui::Context,
     /// Whether the in-app music video is showing in the content card.
@@ -1190,7 +1200,7 @@ pub struct App {
 fn window_hwnd(cc: &eframe::CreationContext<'_>) -> Option<u64> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match cc.window_handle().ok()?.as_raw() {
-        RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+        RawWindowHandle::Win32(w) => Some(w.hwnd.get() as u64),
         _ => None,
     }
 }
@@ -1218,6 +1228,15 @@ fn history_needs_load(
 /// on the track alone turned Start Mix into a pause button that never touched the queue.
 fn same_queue(a: &[Track], b: &[Track]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.video_id == y.video_id)
+}
+
+/// Unix seconds, for the Discord presence's timestamps. Zero on a clock that predates 1970, which
+/// only ever costs a progress bar.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl App {
@@ -1257,6 +1276,17 @@ impl App {
         }
         if no_autoplay {
             settings.autoplay = false;
+        }
+        // Windows never shows the desktop through the shell — its per-pixel-alpha route
+        // composites over a flat DWM material, which read as washed-out white — so the whole
+        // feature is absent there: no transparent request in `main`, no blur backend in
+        // `blur.rs`, no Appearance rows in `ui::settings`. Force the loaded values off rather
+        // than only hiding the controls: a settings file written on Linux must not put the
+        // Windows window behind that material.
+        #[cfg(target_os = "windows")]
+        {
+            settings.opacity = crate::settings::Opacity::OFF;
+            settings.blur = false;
         }
         let palette = settings.palette(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &palette);
@@ -1436,6 +1466,10 @@ impl App {
             content_rect: egui::Rect::NOTHING,
             blur,
             media,
+            discord: None,
+            presence_key: None,
+            presence_position: 0.0,
+            presence_sent_at: Instant::now(),
             ctx: cc.egui_ctx.clone(),
             video_open: false,
             video: None,
@@ -1457,6 +1491,9 @@ impl App {
         app.downloads = crate::downloads::load();
         app.push_downloads_to_backend();
         app.restore_playback();
+        // Start the presence here too, not only from a Settings change: a launch with the setting
+        // already on should show up without the user having to toggle it off and back on.
+        app.sync_discord();
         Ok(app)
     }
 
@@ -1525,12 +1562,25 @@ impl App {
         self.history_shelves = None;
         self.history_error = None;
         self.history_invalidate();
+        self.cancel_account_fetches();
         self.playlist = None;
         self.playlist_for = None;
         self.accounts.clear();
         // Local playlists are not tied to any YouTube account — they should survive an account
         // switch exactly like they survive sign-out.
         self.resync_local_playlists();
+    }
+
+    /// Abandon the in-flight, account-scoped fetches an epoch bump orphans.
+    ///
+    /// A reply for an old epoch is dropped rather than allowed to repopulate cleared state —
+    /// but the reply is also what clears the `*_loading` flag, so the flag would otherwise stay
+    /// set and the page would never ask again: a skeleton that latches until the app restarts.
+    /// That is exactly what a sign-in or sign-out racing the home fetch produced. History is not
+    /// listed because `history_invalidate` already does this for it.
+    fn cancel_account_fetches(&mut self) {
+        self.home_loading = false;
+        self.library_loading = false;
     }
 
     /// Apply and persist a settings change.
@@ -1578,7 +1628,7 @@ impl App {
                 None => {}
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         if self.settings.start_on_boot != before.start_on_boot {
             let result = if self.settings.start_on_boot {
                 crate::autostart::enable()
@@ -1594,6 +1644,11 @@ impl App {
             self.local_scan_error = None;
             self.backend
                 .scan_local_folders(self.settings.local_folders.clone());
+        }
+        // The toggle takes effect at once; the application id itself is fixed in `discord.rs`,
+        // so there is nothing else about the integration that can change.
+        if self.settings.discord_rich_presence != before.discord_rich_presence {
+            self.sync_discord();
         }
         if let Err(e) = crate::settings::save(&self.settings) {
             tracing::warn!(error = %format!("{e:#}"), "could not save settings");
@@ -1761,6 +1816,92 @@ impl App {
         if let Some(media) = self.media.as_mut() {
             media.set_state(&snapshot);
         }
+    }
+
+    /// Hand Discord the current track, when there is one. Called right after `publish_media`, so
+    /// both see the same transport.
+    ///
+    /// Only on a material change: Discord rate-limits activity updates, and the end timestamp is
+    /// absolute, so it keeps the bar moving between sends on its own. A seek is the exception —
+    /// it changes neither track nor state but does break that bar, so the position is compared
+    /// against where the track should be by now rather than against its last value.
+    fn publish_presence(&mut self) {
+        let Some(discord) = self.discord.as_ref() else {
+            return;
+        };
+        let state = self.player.as_ref().map(|p| p.state()).unwrap_or_default();
+        let playing = self.playback_started && !state.paused;
+        // Mirrors `publish_media`: a restored, not-yet-loaded track shows its saved position.
+        let position = if self.playback_started {
+            state.position
+        } else {
+            self.resume
+                .filter(|(i, _)| Some(*i) == self.current)
+                .map(|(_, p)| p)
+                .unwrap_or(state.position)
+        };
+        let Some(track) = self.now.track.as_ref() else {
+            // Nothing to show: withdraw, but only if something was ever announced.
+            if self.presence_key.take().is_some() {
+                discord.clear();
+            }
+            return;
+        };
+        let id = track.local_path.is_none().then(|| track.video_id.clone());
+        let was_playing = self.presence_key.as_ref().is_some_and(|(_, p, _)| *p);
+        let expected = self.presence_position
+            + if was_playing {
+                self.presence_sent_at.elapsed().as_secs_f64()
+            } else {
+                0.0
+            };
+        let changed = match &self.presence_key {
+            Some((last_id, last_playing, last_title)) => {
+                last_id != &id
+                    || *last_playing != playing
+                    || last_title != &track.title
+                    || (position - expected).abs() > 1.5
+            }
+            None => true,
+        };
+        if !changed {
+            return;
+        }
+        let duration = if state.duration > 0.0 {
+            state.duration
+        } else {
+            track.duration.map(|d| d as f64).unwrap_or(0.0)
+        };
+        discord.set(crate::discord::Presence {
+            youtube_id: id.clone(),
+            title: track.title.clone(),
+            artist: track
+                .artists
+                .iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            album: track.album.clone(),
+            thumbnail: track.thumbnail.as_deref().map(str::to_owned),
+            wide: track.wide,
+            playing,
+            end_unix: playing.then(|| unix_now() + (duration - position).max(0.0) as i64),
+        });
+        self.presence_key = Some((id, playing, track.title.clone()));
+        self.presence_position = position;
+        self.presence_sent_at = Instant::now();
+    }
+
+    /// Start or stop the Discord worker to match the setting. Called on a Settings change and
+    /// once at launch. The application id is fixed, so the toggle is the whole decision.
+    pub(crate) fn sync_discord(&mut self) {
+        self.discord = if self.settings.discord_rich_presence {
+            Some(crate::discord::Discord::spawn())
+        } else {
+            None
+        };
+        // A new worker has not been told what is playing.
+        self.presence_key = None;
     }
 
     /// Bring back the last queue, track and transport from `playback.json`. The track is shown
@@ -3253,7 +3394,9 @@ impl App {
                 Event::AuthChanged(state) => {
                     // `Checking` → `SignedIn` is the ordinary *startup* confirmation of a stored
                     // session, and the flag is read before the assignment below because that
-                    // assignment is itself the fix this line needs.
+                    // assignment is itself the fix this line needs. Only startup ever sets
+                    // `Checking` — an interactive sign-in leaves the state alone until this
+                    // event — so the flag really does mean "the startup check".
                     let was_checking = matches!(self.auth, crate::auth::AuthState::Checking);
                     // Assigned before the loaders run, not after: `load_library` gates on the
                     // *current* auth state, and at startup this event arrives while `self.auth`
@@ -3285,6 +3428,7 @@ impl App {
                                 self.history_shelves = None;
                                 self.history_error = None;
                                 self.history_invalidate();
+                                self.cancel_account_fetches();
                             }
                             // The topbar's photo chip reads these; asking once here beats
                             // every-frame refires from the pages that display them.
@@ -3299,6 +3443,13 @@ impl App {
                         }
                         crate::auth::AuthState::SignedOut => {
                             self.account_epoch += 1;
+                            // Session data, all of it: the channels belong to the account that
+                            // just left, and the signed-out menu on Windows would otherwise
+                            // still list them. Clearing the chosen channel through
+                            // `update_settings` also rebuilds the HTTP client without it, so a
+                            // brand channel from the old account cannot leak into the next one.
+                            self.accounts.clear();
+                            self.update_settings(ctx, |s| s.account_page_id = None);
                             self.library = crate::model::Library::default();
                             self.library_loaded = false;
                             // The liked index is account data: cleared from memory and removed
@@ -3317,6 +3468,7 @@ impl App {
                             self.history_shelves = None;
                             self.history_error = None;
                             self.history_invalidate();
+                            self.cancel_account_fetches();
                         }
                         _ => {}
                     }
@@ -3650,6 +3802,14 @@ impl App {
                     error,
                     generation,
                 } if generation == self.play_generation => {
+                    // The player bar shows this too, but only while it is looked at: a play that
+                    // fails while the queue runs on deserves a line in the log either way.
+                    tracing::warn!(
+                        video_id = %track.video_id,
+                        title = %track.title,
+                        %error,
+                        "playback failed"
+                    );
                     self.now = NowPlaying {
                         track: Some(track),
                         resolving: false,
@@ -4016,7 +4176,8 @@ impl App {
             RowAction::Subscribe {
                 channel_id,
                 subscribe,
-            } => self.toggle_subscribed(&channel_id, subscribe),
+                params,
+            } => self.toggle_subscribed(&channel_id, subscribe, params),
             RowAction::DontRecommend { token, name } => {
                 if !self.signed_in() {
                     self.toast_error("Sign in to change your recommendations");
@@ -4340,15 +4501,21 @@ impl App {
         self.save_playlist_order();
     }
 
-    /// Follow or unfollow, painted at once and reverted if YouTube refuses.
-    pub(crate) fn toggle_subscribed(&mut self, channel_id: &str, subscribe: bool) {
+    /// Follow or unfollow, painted at once and reverted if YouTube refuses. `params` is the
+    /// page button's own token for the direction — see `ArtistActions`'s field docs.
+    pub(crate) fn toggle_subscribed(
+        &mut self,
+        channel_id: &str,
+        subscribe: bool,
+        params: Option<Arc<str>>,
+    ) {
         if !self.signed_in() {
             self.toast_error("Sign in to subscribe");
             return;
         }
         self.set_subscribed_state(channel_id, subscribe);
         self.backend
-            .set_subscribed(channel_id.to_owned(), subscribe);
+            .set_subscribed(channel_id.to_owned(), subscribe, params);
     }
 
     /// Start whatever YouTube handed over as something to play — an artist's shuffle or mix.
@@ -5077,7 +5244,11 @@ impl eframe::App for App {
         crate::widgets::set_downloaded(&ctx, self.downloads.entries.keys().cloned().collect());
 
         let maximized = Self::is_maximized(&ctx);
-        let rounded = !self.decorated && !maximized;
+        // Square on Windows, where the shell is opaque: the outer corner pixels of a rounded
+        // rect are never painted, and with transparency off that shows the window's own
+        // backdrop as four light nicks. Linux keeps the rounded shell — and its real
+        // transparency — exactly as before.
+        let rounded = !self.decorated && !maximized && !cfg!(target_os = "windows");
         let p = self.palette;
 
         chrome::paint_background(ui, &p, rounded);
@@ -5367,6 +5538,8 @@ impl eframe::App for App {
         // Hand the OS widget the current transport. After the advance/autoplay above, so a track
         // that just changed is what the OS shows.
         self.publish_media();
+        // Same snapshot, said to Discord.
+        self.publish_presence();
 
         // Repaint discipline. Exactly one of these, and only when something is actually moving:
         // a pending autocomplete debounce, or a progress bar that needs to advance. Search itself

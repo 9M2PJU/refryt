@@ -691,6 +691,20 @@ pub(crate) fn find_header_toggle(root: &Value, header_key: &str) -> Option<Libra
 /// Icons, never labels: this account's UI is in Greek, and `MUSIC_SHUFFLE` / `MIX` / `SUBSCRIBE`
 /// / `REMOVE_CIRCLE` say the same thing in every language. Neither radio playlist id can be
 /// built from the channel id — I checked — so both are only ever read from here.
+/// The `params` token a subscribe/unsubscribe endpoint carried.
+///
+/// The renderer nests the endpoints either directly or inside a `serviceEndpoints` array — the
+/// page header uses the latter, the menu item the former — so `find_key` reads both shapes. A
+/// button with no token is not an error: `None` means the caller sends the bare channel id, which
+/// is what it always sent.
+fn endpoint_params(renderer: &Value, endpoint: &str) -> Option<Arc<str>> {
+    find_key(renderer, endpoint)
+        .and_then(|endpoint| endpoint.get("params"))
+        .and_then(Value::as_str)
+        .filter(|params| !params.is_empty())
+        .map(Arc::from)
+}
+
 fn artist_actions(item: &Value) -> crate::model::ArtistActions {
     use crate::model::ArtistActions;
     let mut out = ArtistActions::default();
@@ -719,6 +733,8 @@ fn artist_actions(item: &Value) -> crate::model::ArtistActions {
                                 .get("defaultServiceEndpoint")
                                 .is_some_and(|d| d.get("unsubscribeEndpoint").is_some()),
                     );
+                    out.subscribe_params = endpoint_params(renderer, "subscribeEndpoint");
+                    out.unsubscribe_params = endpoint_params(renderer, "unsubscribeEndpoint");
                 }
                 Some("REMOVE_CIRCLE") => {
                     out.dont_recommend = find_key(renderer, "feedbackToken")
@@ -1921,12 +1937,17 @@ pub fn parse_artist(root: &Value) -> Option<Artist> {
         subscribed: subscribe
             .and_then(|s| s.get("subscribed"))
             .and_then(Value::as_bool),
+        // The button's own tokens, per direction: YouTube's web client sends them with the
+        // subscribe/unsubscribe call, and some channels refuse the write without them.
+        subscribe_params: subscribe.and_then(|s| endpoint_params(s, "subscribeEndpoint")),
+        unsubscribe_params: subscribe.and_then(|s| endpoint_params(s, "unsubscribeEndpoint")),
         dont_recommend: None,
     };
 
     let sections = find_section_list(root);
 
     let mut top_songs = Vec::new();
+    let mut top_songs_title = None;
     let mut top_songs_playlist = None;
     let mut shelves = Vec::new();
     let mut description = None;
@@ -1935,6 +1956,13 @@ pub fn parse_artist(root: &Value) -> Option<Artist> {
     for section in sections.into_iter().flatten() {
         if let Some(shelf) = section.get("musicShelfRenderer") {
             top_songs.extend(parse_artist_songs(shelf, &name, &id));
+            top_songs_title = top_songs_title.or_else(|| {
+                shelf
+                    .get("title")
+                    .map(text)
+                    .and_then(non_empty)
+                    .map(|t| t.trim().to_owned())
+            });
             // The shelf's own "Show all" target: YouTube embeds only 5 songs here, but this
             // browseId is the artist's full auto-generated top-songs playlist.
             top_songs_playlist = top_songs_playlist.or_else(|| {
@@ -1982,6 +2010,7 @@ pub fn parse_artist(root: &Value) -> Option<Artist> {
         thumbnail: thumbnail(header),
         hero: wide_thumbnail(header),
         top_songs,
+        top_songs_title,
         top_songs_playlist,
         shelves: std::sync::Arc::new(shelves),
     })
@@ -2767,6 +2796,42 @@ mod tests {
         for t in [&a.actions.shuffle, &a.actions.mix].into_iter().flatten() {
             assert!(!t.playlist_id.is_empty(), "a target with no playlist");
         }
+        // The button's own token, nested under `serviceEndpoints` in the page header. It is
+        // what makes the write land for a channel that refuses the bare channel-id body.
+        assert_eq!(
+            a.actions.subscribe_params.as_deref(),
+            Some("EgIIGxgA"),
+            "the subscribe button's params went missing"
+        );
+        // This capture offers no unsubscribe side, and that must stay `None` rather than be
+        // invented — the call falls back to the bare body for that direction.
+        assert!(a.actions.unsubscribe_params.is_none());
+    }
+
+    /// The menu item's toggle carries both directions' tokens: `defaultServiceEndpoint` is the
+    /// action on offer now, `toggledServiceEndpoint` the one it flips to.
+    #[test]
+    fn a_subscribe_menu_item_carries_both_tokens() {
+        let item = serde_json::json!({"menuRenderer": {"items": [{
+            "toggleMenuServiceItemRenderer": {
+                "defaultIcon": {"iconType": "SUBSCRIBE"},
+                "defaultServiceEndpoint": {"subscribeEndpoint": {
+                    "channelIds": ["UC1"],
+                    "params": "subscribe-token"
+                }},
+                "toggledServiceEndpoint": {"unsubscribeEndpoint": {
+                    "channelIds": ["UC1"],
+                    "params": "unsubscribe-token"
+                }}
+            }
+        }]}});
+        let actions = artist_actions(&item);
+        assert_eq!(actions.subscribed, Some(false));
+        assert_eq!(actions.subscribe_params.as_deref(), Some("subscribe-token"));
+        assert_eq!(
+            actions.unsubscribe_params.as_deref(),
+            Some("unsubscribe-token")
+        );
     }
 
     #[test]
@@ -2779,6 +2844,9 @@ mod tests {
             a.description.as_deref().is_some_and(|d| d.len() > 20),
             "no description"
         );
+        // The heading comes from the shelf itself, not a hardcoded one: every capture so far
+        // calls it "Top songs", and the page used to print "Popular" over it.
+        assert_eq!(a.top_songs_title.as_deref(), Some("Top songs"));
     }
 
     /// The hero is the letterboxed channel art, not the square portrait slot the avatar uses.

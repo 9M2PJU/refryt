@@ -8,14 +8,16 @@
 pub mod api;
 pub mod app;
 pub mod auth;
-/// "Start on boot" — Linux only, see the module's own doc comment.
-#[cfg(target_os = "linux")]
+/// "Start on boot" — an XDG autostart entry on Linux, the per-user `Run` key on Windows; see the
+/// module's own doc comment.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod autostart;
 pub mod backend;
 pub mod blur;
 pub mod browser_cookies;
 pub mod chrome;
 pub mod crash;
+pub mod discord;
 pub mod downloads;
 pub mod emoji;
 pub mod icons;
@@ -35,6 +37,9 @@ pub mod theme;
 pub mod tray;
 pub mod ui;
 pub mod video;
+/// The in-app sign-in window — Windows only, see the module's own doc comment.
+#[cfg(target_os = "windows")]
+pub mod webview_login;
 pub mod widgets;
 
 use std::sync::Arc;
@@ -49,6 +54,41 @@ pub fn mark_start() {
     let _ = START.set(std::time::Instant::now());
 }
 
+/// Where the app's own log goes.
+///
+/// A GUI binary started from the Start Menu on Windows has no console, and a desktop-launched
+/// AppImage on Linux has its stdout and stderr pointed at `/dev/null` by the launcher — so
+/// without a file the one warning that explains a failed playback (the resolver error, yt-dlp's
+/// own stderr) is invisible. Next to the credential and the crash record, in the config
+/// directory. macOS keeps the console: a bundle launched from Finder has its output captured by
+/// the system log, and nothing here has been tested against it.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn log_path() -> Option<std::path::PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "refryt")?;
+    Some(dirs.config_dir().join("refryt.log"))
+}
+
+/// Append-only writer for the log file.
+///
+/// Opened per event rather than held: a stale handle after a crash or an external rotation is
+/// worse than the tiny cost, and a file that cannot be opened silences only the file layer.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct LogFile(std::path::PathBuf);
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogFile {
+    type Writer = Box<dyn std::io::Write + Send + Sync>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.0)
+            .map(|file| Box::new(file) as Self::Writer)
+            .unwrap_or_else(|_| Box::new(std::io::sink()))
+    }
+}
+
 /// Install the tracing subscriber with a `RUST_LOG`-driven target filter.
 ///
 /// This uses `filter::Targets` rather than `EnvFilter` on purpose: `EnvFilter`'s dynamic
@@ -58,19 +98,50 @@ pub fn mark_start() {
 pub fn init_tracing(default: &str) {
     use tracing_subscriber::{filter::Targets, fmt, prelude::*};
 
-    let filter = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|s| s.parse::<Targets>().ok())
-        .unwrap_or_else(|| {
-            default
-                .parse::<Targets>()
-                .expect("valid default log filter")
-        });
+    let filter = || {
+        std::env::var("RUST_LOG")
+            .ok()
+            .and_then(|s| s.parse::<Targets>().ok())
+            .unwrap_or_else(|| {
+                default
+                    .parse::<Targets>()
+                    .expect("valid default log filter")
+            })
+    };
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .init();
+    let console = fmt::layer().with_filter(filter());
+
+    // The same lines also go to a file, so a Start Menu launch (Windows) or a launcher-started
+    // AppImage (Linux) is diagnosable. Kept to a couple of megabytes: the previous run is
+    // dropped rather than the disk growing without bound, and there is nothing in here worth
+    // archiving.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if let Some(path) = log_path() {
+        // A first run has no config directory yet — the credential and the settings file make
+        // it later — and the writer opens per event, so without this every event would fall
+        // back to the sink and the file would never appear.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::metadata(&path)
+            .map(|meta| meta.len() > 2 * 1024 * 1024)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+        tracing_subscriber::registry()
+            .with(console)
+            .with(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(LogFile(path))
+                    .with_filter(filter()),
+            )
+            .init();
+        return;
+    }
+
+    tracing_subscriber::registry().with(console).init();
 }
 
 pub fn elapsed_since_start() -> std::time::Duration {
@@ -84,28 +155,48 @@ pub fn elapsed_since_start() -> std::time::Duration {
 /// nothing. Spawning the platform opener is the same thing that feature does on Linux, costs no
 /// dependency, and matches how the app already shells out to `yt-dlp`.
 pub fn open_url(url: &str) {
-    #[cfg(target_os = "linux")]
-    let (program, args): (&str, &[&str]) = ("xdg-open", &[]);
-    #[cfg(target_os = "macos")]
-    let (program, args): (&str, &[&str]) = ("open", &[]);
+    // Windows goes through `ShellExecuteW` rather than spawning `cmd /C start`: the shell parses
+    // the URL itself, so an `&` or `^` in a watch link cannot be mangled by cmd's own parser,
+    // and nothing console-shaped is spawned at all. The return is an HINSTANCE-style code where
+    // anything at or below 32 is a failure.
     #[cfg(target_os = "windows")]
-    let (program, args): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
-
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args)
-        .arg(url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // `cmd` is a console-subsystem binary; without this, spawning it from this GUI-subsystem
-    // app flashes a new console window open for the length of the call.
-    #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt as _;
-        cmd.creation_flags(0x0800_0000);
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+        let result = unsafe {
+            ShellExecuteW(
+                0,
+                operation.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if result as isize <= 32 {
+            tracing::warn!(%url, code = result as isize, "could not open a link");
+        }
     }
-    match cmd.spawn() {
-        Ok(_) => {}
-        Err(e) => tracing::warn!(%url, error = %e, "could not open a link"),
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "linux")]
+        let (program, args): (&str, &[&str]) = ("xdg-open", &[]);
+        #[cfg(target_os = "macos")]
+        let (program, args): (&str, &[&str]) = ("open", &[]);
+
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(%url, error = %e, "could not open a link"),
+        }
     }
 }
 

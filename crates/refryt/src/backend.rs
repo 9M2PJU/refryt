@@ -587,12 +587,19 @@ async fn run_download(
     let dir = crate::downloads::dir()?;
     std::fs::create_dir_all(&dir)?;
     let args = crate::downloads::yt_dlp_args(track, format, &dir);
-    let mut child = tokio::process::Command::new(yt_dlp_program())
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(yt_dlp_program());
+    cmd.args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // `CREATE_NO_WINDOW`: yt-dlp is a console-subsystem binary, and without this Windows gives
+    // it a console of its own — a terminal window sitting on screen for the whole download.
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x0800_0000);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("could not start yt-dlp: {e}"))?;
     let stdout = child
@@ -600,7 +607,6 @@ async fn run_download(
         .take()
         .ok_or_else(|| anyhow::anyhow!("yt-dlp gave no output"))?;
     let mut lines = BufReader::new(stdout).lines();
-    let mut path: Option<std::path::PathBuf> = None;
     while let Some(line) = lines.next_line().await? {
         if let Some(percent) = parse_progress(&line) {
             Backend::emit(
@@ -611,9 +617,6 @@ async fn run_download(
                     percent,
                 },
             );
-        } else if line.starts_with('/') {
-            // `--print after_move:filepath` — the final path, printed once when the move is done.
-            path = Some(std::path::PathBuf::from(line.trim()));
         }
     }
     let status = child
@@ -623,7 +626,10 @@ async fn run_download(
     if !status.success() {
         anyhow::bail!("yt-dlp exited with {status}");
     }
-    path.ok_or_else(|| anyhow::anyhow!("yt-dlp did not report an output file"))
+    // Not from stdout: the sanitized title can carry characters yt-dlp's own stream drops (see
+    // `yt_dlp_args`), so the file is located by the id marker the template guarantees.
+    crate::downloads::find_downloaded(&dir, &track.video_id)
+        .ok_or_else(|| anyhow::anyhow!("yt-dlp reported success but left no file"))
 }
 
 /// A `[download]  42.3% of ...` line as a number, or `None` for any other line.
@@ -1169,10 +1175,13 @@ impl Backend {
     }
 
     /// Follow or unfollow an artist.
-    pub fn set_subscribed(&self, channel_id: String, subscribe: bool) {
+    pub fn set_subscribed(&self, channel_id: String, subscribe: bool, params: Option<Arc<str>>) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
-            let event = match api.set_subscribed(&channel_id, subscribe).await {
+            let event = match api
+                .set_subscribed(&channel_id, subscribe, params.as_deref())
+                .await
+            {
                 Ok(()) => Event::SubscriptionChanged {
                     channel_id,
                     subscribed: subscribe,
@@ -1682,6 +1691,30 @@ impl Backend {
         });
     }
 
+    /// Sign in through the app's own sign-in window (Windows only).
+    ///
+    /// The path for a machine whose only browser is a modern Chromium: the window owns the
+    /// session it creates, so App-Bound Encryption never stands between us and the cookie.
+    #[cfg(target_os = "windows")]
+    pub fn sign_in_from_window(&self) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let event = match api.sign_in_from_window().await {
+                Ok(account) => {
+                    Self::forget_legacy_token();
+                    Event::AuthChanged(AuthState::SignedIn { account })
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "the sign-in window failed");
+                    Event::SignInFailed {
+                        error: format!("{e:#}"),
+                    }
+                }
+            };
+            Self::emit(&tx, &ctx, event);
+        });
+    }
+
     /// Only one credential at a time: signing in with a cookie drops any OAuth token.
     fn forget_legacy_token() {
         let _ = auth::delete_oauth();
@@ -1767,10 +1800,13 @@ impl Backend {
             // A downloaded track plays from disk without the resolver — offline, and without the
             // yt-dlp latency. Unlike a local file it is still a real YouTube play, so it goes
             // through the same scrobble tail below.
+            // `is_file`: an index entry whose file was moved or deleted must fall through to the
+            // resolver, not hand mpv a path that cannot open.
             let downloaded = downloads
                 .lock()
                 .ok()
-                .and_then(|guard| guard.get(&track.video_id).cloned());
+                .and_then(|guard| guard.get(&track.video_id).cloned())
+                .filter(|path| path.is_file());
             if let Some(path) = downloaded {
                 let event =
                     match player::load(&mpv, &path.to_string_lossy(), volume, None, normalise) {

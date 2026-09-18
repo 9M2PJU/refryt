@@ -8,6 +8,7 @@ a transparent, inset tile passes through untouched — then emits:
 
     assets/icons/app/refryt-master.png      the RGBA master both AppImage scripts resize from
     assets/icons/app/refryt-{16..512}.png   the pre-sized hicolor set `just install` copies
+    assets/icons/app/refryt.ico             the multi-size icon the Windows build embeds
 
 Run after changing the source logo:  python3 scripts/make-icons.py [newlogo.png]
 """
@@ -21,6 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "assets/icons/app")
 RADIUS_FRAC = 0.2237  # iOS-style app-icon corner radius; matches the original master
 SIZES = (16, 32, 48, 64, 128, 256, 512)
+ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 SS = 4  # mask supersampling, so 512px corners are not jagged
 
 
@@ -59,7 +61,18 @@ def main() -> None:
     for s in SIZES:
         _masked(src, s).save(os.path.join(OUT, f"refryt-{s}.png"))
 
-    print(f"wrote refryt-master.png ({src.width}px) and refryt-{{{','.join(map(str, SIZES))}}}.png from {os.path.relpath(src_path, ROOT)}")
+    # The .ico is written from the already-masked master, so the Windows icon carries the same
+    # rounded corners as every other size, and at each of Windows' own preferred dimensions.
+    master.save(
+        os.path.join(OUT, "refryt.ico"),
+        format="ICO",
+        sizes=[(s, s) for s in ICO_SIZES],
+    )
+
+    print(
+        f"wrote refryt-master.png ({src.width}px), refryt.ico, and "
+        f"refryt-{{{','.join(map(str, SIZES))}}}.png from {os.path.relpath(src_path, ROOT)}"
+    )
 
 
 if __name__ == "__main__":

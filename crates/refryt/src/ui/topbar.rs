@@ -50,14 +50,17 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
     }
     let signed_in = app.signed_in();
     let chip = account_chip(app, &mut right);
-    if chip.clicked() && !signed_in {
+    // Signed out, the chip is the way in. On Windows it opens the menu below, whose first item
+    // starts the sign-in window; everywhere else the browser import lives in Settings, so it
+    // goes there directly, as it always did.
+    if chip.clicked() && !signed_in && !cfg!(target_os = "windows") {
         app.navigate(Route::Settings);
     }
     // Signed in, the avatar opens the account menu — View profile, Switch account, Settings,
-    // Sign out. Button-anchored: `Toggle` records no pointer position, so a pointer-anchored
-    // popup would never render.
-    if signed_in {
-        account_menu(app, &mut right, &chip);
+    // Sign out. Signed out on Windows it opens too, led by Log in. Button-anchored: `Toggle`
+    // records no pointer position, so a pointer-anchored popup would never render.
+    if signed_in || cfg!(target_os = "windows") {
+        account_menu(app, &mut right, &chip, signed_in);
     }
     right.add_space(2.0);
     // Listening history beside the chip, as a clock — it is a page, not a setting.
@@ -345,9 +348,10 @@ fn avatar_circle(app: &mut App, ui: &mut Ui, name: Option<&str>) -> egui::Respon
     response.on_hover_text(name.unwrap_or("Not signed in"))
 }
 
-/// What the chip opens: the channels this Google account can browse as — each with its photo
-/// and a tick on the current one — then Settings and Sign out.
-fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response) {
+/// What the chip opens: signed in, the channels this Google account can browse as — each with
+/// its photo and a tick on the current one — then Settings and Sign out; signed out on Windows,
+/// Log in (the sign-in window) and Settings.
+fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response, signed_in: bool) {
     let popup = egui::Popup::new(
         ui.id().with("ytm-account-menu"),
         ui.ctx().clone(),
@@ -362,12 +366,19 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response) {
     .open_memory(chip.clicked().then_some(egui::SetOpenCommand::Toggle));
 
     enum Choice {
+        LogIn,
         Profile(String),
         Switch(Option<String>),
         Settings,
         Help,
         SignOut,
     }
+    // A failed attempt is reported where it was started — right here — not only in Settings,
+    // which nobody thinks to open after clicking Log in in this menu.
+    let sign_in_error = match &app.auth {
+        crate::auth::AuthState::Failed(msg) if !signed_in => Some(msg.clone()),
+        _ => None,
+    };
     let mut choice = None;
     popup.show(|mui| {
         let p = app.palette;
@@ -381,9 +392,28 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response) {
             .or_else(|| accounts.iter().find(|a| a.selected))
             .or(accounts.first())
             .and_then(|a| a.channel_id.clone());
+        // Signed out, this item is the menu's reason to exist: the sign-in window is the one
+        // path that works when every browser on the machine is a modern Chromium.
+        if !signed_in && widgets::menu_item(mui, &p, Icon::CircleUser, "Log in", None).clicked() {
+            choice = Some(Choice::LogIn);
+            mui.close();
+        }
+        if let Some(error) = &sign_in_error {
+            mui.add_space(2.0);
+            mui.add(
+                egui::Label::new(
+                    egui::RichText::new(error)
+                        .font(theme::regular(11.0))
+                        .color(p.danger),
+                )
+                .wrap(),
+            );
+            mui.add_space(2.0);
+        }
         // The channels, inline and directly on top: photo, name, a tick on the current one. No
-        // byline — the subscriber count is noise here.
-        for account in accounts {
+        // byline — the subscriber count is noise here. Never signed out: this menu opens then
+        // too on Windows, and the account list is session data.
+        for account in accounts.into_iter().filter(|_| signed_in) {
             let current = current_id == account.page_id;
             let (rect, resp) =
                 mui.allocate_exact_size(vec2(mui.available_width(), 40.0), Sense::click());
@@ -463,12 +493,24 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response) {
             choice = Some(Choice::Help);
             mui.close();
         }
-        if widgets::menu_item(mui, &p, Icon::LogOut, "Sign out", None).clicked() {
+        if signed_in && widgets::menu_item(mui, &p, Icon::LogOut, "Sign out", None).clicked() {
             choice = Some(Choice::SignOut);
             mui.close();
         }
     });
     match choice {
+        Some(Choice::LogIn) => {
+            #[cfg(target_os = "windows")]
+            {
+                // Deliberately not `auth = Checking`: that state means "verifying a stored
+                // session at startup", which is what tells `AuthChanged` whether the loaded home
+                // feed was already personalised or is the anonymous one this sign-in just
+                // invalidated. Same reason as the Settings buttons.
+                app.backend.sign_in_from_window();
+            }
+            #[cfg(not(target_os = "windows"))]
+            app.navigate(Route::Settings);
+        }
         Some(Choice::Profile(id)) => app.navigate(Route::Artist(id)),
         Some(Choice::Switch(page_id)) => {
             let ctx = ui.ctx().clone();

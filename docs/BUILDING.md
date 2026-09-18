@@ -69,14 +69,22 @@ The script fetches the current [mpv Windows dev
 package](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/) (cached under
 `.windows-tools/`, since — unlike yt-dlp's GitHub releases — there's no stable "latest" URL for
 it) to link against, cross-builds with `mingw-w64-gcc`, fetches a fresh `yt-dlp.exe`, zips
-`refryt.exe` + `libmpv-2.dll` + `yt-dlp.exe` into
+`refryt.exe` + `libmpv-2.dll` + `WebView2Loader.dll` + `NotoColorEmoji.ttf` + `yt-dlp.exe` into
 `dist/refryt-<version>-windows-x86_64.zip`, and — when Wine + Inno Setup are set up — compiles
 `scripts/windows-installer.iss` (via `ISCC.exe` under Wine) into
 `dist/refryt-<version>-windows-x86_64-setup.exe`: Program Files, a Start Menu entry, an optional
 desktop shortcut, and a real uninstaller.
 
-Every other Windows dependency (`tray-icon`, `rfd`, window blur via DWM) resolves to DLLs that
-ship with Windows itself — `libmpv-2.dll` is the only one that has to be bundled by hand.
+Every other Windows dependency (`tray-icon`, `rfd`, and the WebView2 *runtime* the sign-in window
+runs on) resolves to DLLs that ship with Windows itself — `libmpv-2.dll` and `WebView2Loader.dll`
+are the only two that have to be bundled by hand. The loader is only a loader: the GNU target
+links it dynamically, so it must sit next to `refryt.exe`, and a native Windows dev build needs
+the same copy beside `target/debug/refryt.exe` (it is in the `webview2-com-sys` crate's source
+tree under `~/.cargo/registry/src/...`; `scripts/build-windows.sh` finds it there for the packaged
+zip). `NotoColorEmoji.ttf` is not a library at all: it is the one colour emoji font with the PNG
+bitmap strikes the emoji painter reads (`emoji.rs`) — Windows' own Segoe UI Emoji is COLR — so it
+is copied from `assets/fonts` into the package (a native dev run finds the same file through the
+repository path compiled into `emoji.rs`).
 
 The `.exe` carries its own icon (`assets/icons/app/refryt.ico`, generated from the same master
 PNG the Linux icon set comes from) via `build.rs` + `embed-resource` — Windows-only, and gated

@@ -132,10 +132,21 @@ pub fn spawn() -> Tray {
     #[cfg(not(target_os = "linux"))]
     {
         let icon = icon().and_then(|icon| {
-            TrayIconBuilder::new()
+            // Windows opens the context menu on left-click by default; left as-is, one click
+            // would both open the menu and toggle the window (`poll` reads the left release as
+            // show/hide). Right-click still opens the menu, the Windows convention.
+            #[cfg(target_os = "windows")]
+            let builder = TrayIconBuilder::new()
                 .with_menu(Box::new(menu()))
                 .with_icon(icon)
                 .with_tooltip("Refryt")
+                .with_menu_on_left_click(false);
+            #[cfg(not(target_os = "windows"))]
+            let builder = TrayIconBuilder::new()
+                .with_menu(Box::new(menu()))
+                .with_icon(icon)
+                .with_tooltip("Refryt");
+            builder
                 .build()
                 .inspect_err(|e| tracing::warn!(%e, "could not create the tray icon"))
                 .ok()

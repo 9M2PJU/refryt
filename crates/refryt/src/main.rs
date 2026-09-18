@@ -85,6 +85,22 @@ fn main() -> eframe::Result {
     // the A/B of a queue with and without its tail should not need a click to set up.
     let no_autoplay = args.iter().any(|a| a == "--no-autoplay");
 
+    // The child half of the in-app sign-in window: `webview_login::capture` starts this same
+    // binary with `--sign-in-window <file>`, because tao's event loop cannot be created beside
+    // eframe's winit one in the same process (it faults natively). Handled here — before any of
+    // the app is set up — so the child is nothing but the sign-in window.
+    #[cfg(target_os = "windows")]
+    if let Some(at) = args.iter().position(|a| a == refryt::webview_login::ARG) {
+        let path = args.get(at + 1).cloned().unwrap_or_default();
+        return match refryt::webview_login::capture_here(std::path::Path::new(&path)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+        };
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Refryt")
         .with_app_id("refryt")
@@ -103,7 +119,14 @@ fn main() -> eframe::Result {
     }
 
     if !decorated {
-        viewport = viewport.with_decorations(false).with_transparent(true);
+        viewport = viewport.with_decorations(false);
+        // Windows does not get asked at all: the shell is opaque there (see `app::App::new`),
+        // and a transparent request there only ever put the window in front of DWM's flat
+        // material. Every other compositor is asked for the see-through shell it can blend.
+        #[cfg(not(target_os = "windows"))]
+        {
+            viewport = viewport.with_transparent(true);
+        }
     }
 
     eframe::run_native(

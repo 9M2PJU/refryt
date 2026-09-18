@@ -1,10 +1,10 @@
 //! In-app music video, on every platform.
 //!
-//! mpv's render API has only an OpenGL backend, which the app cannot use on Windows — it runs
-//! egui on `wgpu` there for per-pixel transparency, and the two cannot share a surface. So this
-//! drives mpv's **software** render context instead: mpv writes each frame into a CPU buffer that
-//! is uploaded as an egui texture. One code path on every OS, at the cost of a copy per frame;
-//! the view is opt-in and the resolution is capped.
+//! mpv's render API has only an OpenGL backend, which would tie this view to whichever GPU
+//! renderer egui happens to be using and to mpv sharing a surface with it. So this drives mpv's
+//! **software** render context instead: mpv writes each frame into a CPU buffer that is uploaded
+//! as an egui texture. One code path on every OS and under any renderer, at the cost of a copy
+//! per frame; the view is opt-in and the resolution is capped.
 //!
 //! `libmpv2`'s safe wrapper only exposes the OpenGL params, so this uses `libmpv2-sys` directly.
 

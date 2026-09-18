@@ -45,6 +45,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 [Files]
 Source: "{#StageDir}\refryt.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\libmpv-2.dll"; DestDir: "{app}"; Flags: ignoreversion
+; The colour emoji font: Windows' own is COLR, which the emoji painter cannot read.
+Source: "{#StageDir}\NotoColorEmoji.ttf"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\WebView2Loader.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\yt-dlp.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -53,7 +56,13 @@ Name: "{autodesktop}\refryt"; Filename: "{app}\refryt.exe"; Tasks: desktopicon
 Name: "{group}\Uninstall refryt"; Filename: "{uninstallexe}"
 
 [Run]
-Filename: "{app}\refryt.exe"; Description: "Launch refryt"; Flags: nowait postinstall skipifsilent
+; `runasoriginaluser`: the setup is elevated (Program Files), and without this the post-install
+; launch inherits that elevation. An elevated refryt is not just unnecessary — it breaks yt-dlp:
+; its startup PATH scan for ffmpeg dies with `[WinError 448] ... untrusted mount point` the
+; moment it meets a scoop-style junction, because Windows marks junctions made by a
+; non-elevated process as untrusted for elevated ones. That read as "all resolvers failed" on
+; the first launch after installing, and only that one.
+Filename: "{app}\refryt.exe"; Description: "Launch refryt"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallDelete]
 ; Nothing under {app} to clean up beyond the files listed above — settings and the signed-in

@@ -357,6 +357,7 @@ fn action_row(app: &mut App, ui: &mut egui::Ui) {
             palette,
             artist,
             library,
+            accounts,
             ..
         } = app;
         let p = *palette;
@@ -391,7 +392,18 @@ fn action_row(app: &mut App, ui: &mut egui::Ui) {
                 play_target = Some(target.clone());
             }
             ui.add_space(6.0);
-            if let Some(subscribed) = a.actions.subscribed {
+            // Your own channel has no subscription to toggle — YouTube refuses the write with a
+            // 400 either way, and its own page still marks the channel "Subscribed". The button
+            // is hidden rather than offered and then reverted.
+            let own_channel = accounts
+                .iter()
+                .find(|account| account.selected)
+                .and_then(|account| account.channel_id.as_deref());
+            if let Some(subscribed) = a
+                .actions
+                .subscribed
+                .filter(|_| own_channel != Some(a.id.as_str()))
+            {
                 // The count rides the button only while the audience line above shows something
                 // else (a monthly listener total). When the line *is* the subscriber count,
                 // repeating it here read as a bug: "965 subscribers" over "Subscribe · 965".
@@ -405,7 +417,16 @@ fn action_row(app: &mut App, ui: &mut egui::Ui) {
                     _ => "Subscribe".to_owned(),
                 };
                 if widgets::outline_button(ui, &p, &label).clicked() {
-                    subscribe_to = Some(!subscribed);
+                    // The token the button carries is per direction, so the one taken is the
+                    // one the click will actually use.
+                    subscribe_to = Some((
+                        !subscribed,
+                        if subscribed {
+                            a.actions.unsubscribe_params.clone()
+                        } else {
+                            a.actions.subscribe_params.clone()
+                        },
+                    ));
                 }
                 ui.add_space(6.0);
             }
@@ -469,8 +490,8 @@ fn action_row(app: &mut App, ui: &mut egui::Ui) {
     if let Some(target) = play_target {
         app.play_target(id.clone(), target);
     }
-    if let Some(subscribe) = subscribe_to {
-        app.toggle_subscribed(&id, subscribe);
+    if let Some((subscribe, params)) = subscribe_to {
+        app.toggle_subscribed(&id, subscribe, params);
     }
     match menu_action {
         Some(crate::ui::RowAction::PageInfo) => app.page_info = menu_description,
@@ -545,13 +566,19 @@ fn top_songs(app: &mut App, ui: &mut egui::Ui) {
             .map(|a| a.top_songs.as_slice())
             .unwrap_or(&[]);
         let artist_id = artist.as_ref().map(|a| a.id.as_str()).unwrap_or_default();
+        // YouTube's own heading — "Top songs" on every capture so far — with "Popular" only
+        // where the response had none (the typed fallback).
+        let heading = artist
+            .as_ref()
+            .and_then(|a| a.top_songs_title.as_deref())
+            .unwrap_or("Popular");
         track_shelf_pages(
             ui,
             palette,
             images,
             backend,
             stats,
-            "Popular",
+            heading,
             true,
             now,
             tracks,

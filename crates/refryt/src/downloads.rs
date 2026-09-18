@@ -53,6 +53,25 @@ impl Index {
         self.entries.get(video_id).map(|r| Path::new(&r.path))
     }
 
+    /// Point entries whose file moved — or whose path was recorded before the printed-path bug
+    /// was understood — back at the file actually on disk. In memory only; the next save
+    /// persists it. Takes the directory so the repair is testable without touching the real
+    /// `~/Music/refryt`.
+    /// Whether anything changed.
+    pub(crate) fn repair_paths(&mut self, dir: &Path) -> bool {
+        let mut changed = false;
+        for (id, record) in &mut self.entries {
+            if Path::new(&record.path).is_file() {
+                continue;
+            }
+            if let Some(found) = find_downloaded(dir, id) {
+                record.path = found.to_string_lossy().into_owned();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The downloaded tracks, for the Library's Downloads list.
     pub fn tracks(&self) -> Vec<Track> {
         self.entries
@@ -69,7 +88,15 @@ pub fn load() -> Index {
     let Ok(bytes) = std::fs::read(path) else {
         return Index::default();
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    let mut index: Index = serde_json::from_slice(&bytes).unwrap_or_default();
+    if let Ok(dir) = dir()
+        && index.repair_paths(&dir)
+    {
+        // Persist the repair: otherwise every launch rescans, and Remove download keeps aiming
+        // at a path that is not there.
+        let _ = save(&index);
+    }
+    index
 }
 
 pub fn save(index: &Index) -> Result<()> {
@@ -83,11 +110,16 @@ pub fn save(index: &Index) -> Result<()> {
         .with_context(|| format!("could not write {}", path.display()))
 }
 
-/// The yt-dlp arguments for one track: the audio format, a per-track output template that cannot
-/// collide, and a final `--print` so the caller can read the produced path off the last line.
+/// The yt-dlp arguments for one track: the audio format and a per-track output template that
+/// cannot collide.
 ///
 /// `--no-playlist` always: an album or playlist is downloaded by iterating its tracks, so a
 /// single invocation is ever only one song.
+///
+/// No `--print after_move:filepath`: yt-dlp's stdout is not a safe channel for a path on
+/// Windows. Its own sanitization turns a `:` into `：`, and that character does not survive the
+/// pipe — PyInstaller's stream drops it whatever the Python encoding says, so the recorded path
+/// pointed at a file that did not exist (`find_downloaded` is how the file is located instead).
 pub fn yt_dlp_args(track: &Track, format: &str, dir: &Path) -> Vec<String> {
     let template = dir.join("%(title)s [%(id)s].%(ext)s");
     vec![
@@ -98,10 +130,33 @@ pub fn yt_dlp_args(track: &Track, format: &str, dir: &Path) -> Vec<String> {
         format.to_owned(),
         "-o".into(),
         template.to_string_lossy().into_owned(),
-        "--print".into(),
-        "after_move:filepath".into(),
         crate::model::track_url(&track.video_id),
     ]
+}
+
+/// The file `yt-dlp` just wrote for `video_id` under `dir`.
+///
+/// The output template puts the id in brackets, so this is the one thing in the name that is
+/// ours and stable — the title can be anything, and its sanitized form is not something to
+/// reconstruct from stdout. Newest match wins, so a re-download supersedes the old file.
+pub fn find_downloaded(dir: &Path, video_id: &str) -> Option<PathBuf> {
+    let marker = format!("[{video_id}]");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().contains(&marker) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(when, _)| modified > *when) {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 /// Write the tags and cover into a downloaded file. Best-effort: a format `lofty` cannot tag
@@ -198,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn the_yt_dlp_args_are_single_track_and_print_a_path() {
+    fn the_yt_dlp_args_are_single_track_and_marked_with_the_id() {
         let args = yt_dlp_args(
             &sample_track(),
             "bestaudio[acodec=opus]/bestaudio",
@@ -206,13 +261,67 @@ mod tests {
         );
         assert!(args.iter().any(|a| a == "--no-playlist"));
         assert!(
-            args.windows(2)
-                .any(|w| w == ["--print", "after_move:filepath"])
+            !args.iter().any(|a| a == "--print"),
+            "the printed path is not trustworthy; the file is found by its id marker instead"
         );
-        assert!(args.iter().any(|a| a.contains("%(id)s")));
+        assert!(args.iter().any(|a| a.contains("[%(id)s]")));
         assert!(
             args.last()
                 .is_some_and(|a| a.contains("watch?v=9RfVp-GhKfs"))
         );
+    }
+
+    /// The printed path is not trustworthy on Windows, so the file is found by the one stable
+    /// part of the name: the id in brackets from the output template.
+    #[test]
+    fn finds_the_download_by_its_id_marker() {
+        let dir = std::env::temp_dir().join(format!("refryt-dl-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Something else [nope].webm"), b"x").unwrap();
+        std::fs::write(
+            dir.join("Macacoa 2000 (from GTAVI： The Album) [DShU-ly9BdM].webm"),
+            b"x",
+        )
+        .unwrap();
+        let found = find_downloaded(&dir, "DShU-ly9BdM").expect("the matching file");
+        assert_eq!(
+            found.file_name().unwrap(),
+            "Macacoa 2000 (from GTAVI： The Album) [DShU-ly9BdM].webm"
+        );
+        assert!(find_downloaded(&dir, "missing").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recorded path that no longer matches the file on disk is healed at load, so a download
+    /// recorded through the old stdout path cannot become unplayable.
+    #[test]
+    fn a_stale_path_is_repaired_from_the_id_marker() {
+        let dir = std::env::temp_dir().join(format!("refryt-dl-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Macacoa 2000 (from GTAVI： The Album) [DShU-ly9BdM].webm"),
+            b"x",
+        )
+        .unwrap();
+        let mut index = Index::default();
+        index.entries.insert(
+            "DShU-ly9BdM".into(),
+            Record {
+                path: dir
+                    .join("Macacoa 2000 (from GTAVI The Album) [DShU-ly9BdM].webm")
+                    .to_string_lossy()
+                    .into_owned(),
+                track: PersistedTrack::from_track(&sample_track()),
+            },
+        );
+        assert!(index.repair_paths(&dir), "the stale path must be repaired");
+        assert!(Path::new(&index.entries["DShU-ly9BdM"].path).is_file());
+        assert!(
+            !index.repair_paths(&dir),
+            "a repaired index needs no second repair"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

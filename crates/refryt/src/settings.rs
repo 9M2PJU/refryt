@@ -278,6 +278,11 @@ pub struct Settings {
     /// icon that appears the first time someone closes the window, with no prior warning that
     /// closing no longer quits, would look like the close button broke.
     pub hide_tray_on_close: bool,
+    /// Publish what is playing to Discord as a Rich Presence. Off by default: it tells everyone
+    /// who can see your profile what you are listening to, which is worth an explicit yes. It
+    /// connects as refryt's own Discord application — the id is fixed in `crate::discord` — so
+    /// turning it on is the only setup there is.
+    pub discord_rich_presence: bool,
     /// Folders scanned for local audio files, shown in the Library's Local tab. Absolute paths,
     /// same shape as `playlist_order`.
     pub local_folders: Vec<String>,
@@ -302,6 +307,7 @@ impl Default for Settings {
             playlist_order: Vec::new(),
             start_on_boot: false,
             hide_tray_on_close: false,
+            discord_rich_presence: false,
             local_folders: Vec::new(),
         }
     }

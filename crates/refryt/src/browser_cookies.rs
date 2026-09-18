@@ -111,7 +111,23 @@ fn home() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|d| d.home_dir().to_owned())
 }
 
-/// The browsers that have a profile directory on this machine.
+/// Whether `yt-dlp` can read this browser's cookies on this OS at all.
+///
+/// On Windows every Chromium browser seals its cookie key to its own process (App-Bound
+/// Encryption, Chromium 127+), so the import fails with "Failed to decrypt with DPAPI" no matter
+/// what the user does — `yt-dlp` #10927. `webview_login` is the path that works there, and
+/// offering these browsers anyway would only produce the failure that window exists to avoid.
+/// Firefox has no such scheme, and is offered everywhere.
+fn readable_on_this_os(key: &str) -> bool {
+    if cfg!(target_os = "windows") {
+        !matches!(key, "brave" | "chrome" | "chromium" | "vivaldi" | "edge")
+    } else {
+        let _ = key;
+        true
+    }
+}
+
+/// The browsers that have a profile directory on this machine and a store `yt-dlp` can read.
 ///
 /// Presence of a profile is not proof that `yt-dlp` can read it — a locked keyring or a sandboxed
 /// profile will still fail — so the import surfaces its error rather than this pretending to know.
@@ -121,6 +137,7 @@ pub fn detected() -> Vec<Browser> {
     };
     KNOWN
         .iter()
+        .filter(|(b, _)| readable_on_this_os(b.key))
         .filter(|(_, paths)| paths.iter().any(|p| home.join(p).is_dir()))
         .map(|(b, _)| *b)
         .collect()
