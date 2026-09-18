@@ -87,9 +87,9 @@ fn main() -> eframe::Result {
 
     // The child half of the in-app sign-in window: `webview_login::capture` starts this same
     // binary with `--sign-in-window <file>`, because tao's event loop cannot be created beside
-    // eframe's winit one in the same process (it faults natively). Handled here — before any of
-    // the app is set up — so the child is nothing but the sign-in window.
-    #[cfg(target_os = "windows")]
+    // eframe's winit one in the same process (it faults natively on Windows). Handled here —
+    // before any of the app is set up — so the child is nothing but the sign-in window.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     if let Some(at) = args.iter().position(|a| a == refryt::webview_login::ARG) {
         let path = args.get(at + 1).cloned().unwrap_or_default();
         return match refryt::webview_login::capture_here(std::path::Path::new(&path)) {

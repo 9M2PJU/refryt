@@ -1691,11 +1691,11 @@ impl Backend {
         });
     }
 
-    /// Sign in through the app's own sign-in window (Windows only).
+    /// Sign in through the app's own sign-in window (Windows' WebView2, Linux's WebKitGTK).
     ///
-    /// The path for a machine whose only browser is a modern Chromium: the window owns the
-    /// session it creates, so App-Bound Encryption never stands between us and the cookie.
-    #[cfg(target_os = "windows")]
+    /// The path for a machine whose only browser is a modern Chromium, and on Linux simply the
+    /// one that needs no browser at all: the window owns the session it creates.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn sign_in_from_window(&self) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {

@@ -74,10 +74,27 @@ gtk = "0.18.2"
 wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+# The in-app sign-in window (`webview_login.rs`) on Linux: WebKitGTK through wry's `build_gtk`,
+# which embeds the widget in an ordinary GTK window. Not the default `x11` feature — that is the
+# tao/foreign-X11-window path, which is X11-only and comes up blank on some driver stacks; see
+# the module doc. Building needs `webkit2gtk-4.1` and `libsoup-3.0` development packages, which
+# most desktops already carry; the AppImage does not bundle WebKitGTK, so the host's is used.
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+
+
 
 # Pinned to 0.52, the version winit itself already resolves to on Windows, so this is an edge
 # onto an already-compiled crate rather than a second copy of it.
 [target.'cfg(target_os = "windows")'.dependencies]
+# The in-app sign-in window (`webview_login.rs`). WebView2 is the one browser whose cookie store
+# this app is allowed to read on Windows: Chromium's App-Bound Encryption makes Chrome/Edge/Brave's
+# own stores unreadable to any other process (yt-dlp#10927), and Google no longer accepts OAuth on
+# the YouTube Music API (ytmusicapi#676, yt-dlp#11462), so asking a browser we own stays the only
+# path. `tao` is the event loop its window needs. WebView2 itself is a Windows component, but the
+# GNU target links the loader dynamically, so `WebView2Loader.dll` ships next to the exe the same
+# way `libmpv-2.dll` already does.
+wry = "0.57"
+tao = "0.37"
 # `-System_Registry`/`-Security` are `autostart`'s per-user `Run` key; `-UI_Shell` /
 # `-UI_WindowsAndMessaging` are `open_url`'s `ShellExecuteW`. There is no `-Graphics_Dwm`: the
 # backdrop call it used to carry is gone with the transparency option (see `blur.rs`).
@@ -88,16 +105,6 @@ windows-sys = { version = "=0.52.0", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# The in-app sign-in window (`webview_login.rs`). WebView2 is the one browser whose cookie store
-# this app is allowed to read on Windows: Chromium's App-Bound Encryption makes Chrome/Edge/Brave's
-# own stores unreadable to any other process (yt-dlp#10927), and Google no longer accepts OAuth on
-# the YouTube Music API (ytmusicapi#676, yt-dlp#11462), so asking a browser we own stays the only
-# path. `wry` is the WebView2 binding, `tao` the event loop its window needs — both Windows-only,
-# nothing reaches the Linux or AppImage builds. WebView2 itself is a Windows component, but the
-# GNU target links the loader dynamically, so `WebView2Loader.dll` ships next to the exe the same
-# way `libmpv-2.dll` already does.
-wry = "0.57"
-tao = "0.37"
 # Windows renders through wgpu. Not for transparency — the shell is opaque there now (`blur.rs`
 # has no Windows backend) — but for stability: the glow/WGL path presents whole-window black
 # frames under load on Windows (reproduced: scrolling an artist page while covers upload gives

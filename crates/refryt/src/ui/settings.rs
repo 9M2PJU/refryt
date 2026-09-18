@@ -558,7 +558,7 @@ fn sign_in(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.add_space(14.0);
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         window_sign_in(app, ui);
         ui.add_space(16.0);
@@ -566,10 +566,11 @@ fn sign_in(app: &mut App, ui: &mut egui::Ui) {
     browser_import(app, ui);
 }
 
-/// The path that works where the browser import cannot: a modern Chromium's cookie store is
-/// sealed with App-Bound Encryption, so the only process that can read it is the browser itself
-/// — and this window is one. See [`crate::webview_login`].
-#[cfg(target_os = "windows")]
+/// The path that needs no browser already signed in: the app's own window owns the session it
+/// creates. On Windows that is also the only path that works at all — a modern Chromium's cookie
+/// store is sealed with App-Bound Encryption, so the only process that can read it is the browser
+/// itself, and this window is one. See [`crate::webview_login`].
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn window_sign_in(app: &mut App, ui: &mut egui::Ui) {
     ui.label(
         RichText::new("Sign in with a browser window")
@@ -600,7 +601,7 @@ fn window_sign_in(app: &mut App, ui: &mut egui::Ui) {
 /// The path that works: read the cookies out of a browser that is already signed in.
 fn browser_import(app: &mut App, ui: &mut egui::Ui) {
     ui.label(
-        RichText::new(if cfg!(target_os = "windows") {
+        RichText::new(if cfg!(any(target_os = "linux", target_os = "windows")) {
             "Or import from a browser"
         } else {
             "Import from a browser"

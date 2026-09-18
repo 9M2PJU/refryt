@@ -221,14 +221,15 @@ impl Api {
         self.install_cookie(cookie, Some(browser)).await
     }
 
-    /// Sign in through the app's own WebView2 window (Windows only).
+    /// Sign in through the app's own browser window (Windows' WebView2, Linux's WebKitGTK).
     ///
-    /// The browser import's counterpart for the case that path cannot serve: Chromium's
-    /// App-Bound Encryption makes a modern Chrome/Edge/Brave store unreadable to anything but
-    /// the browser itself, so this window reads its own cookies and hands them over. The window
-    /// lives in a child process of this same binary — see `webview_login`'s module doc — so this
-    /// only awaits it.
-    #[cfg(target_os = "windows")]
+    /// The browser import's counterpart for the case that path cannot serve: on Windows,
+    /// Chromium's App-Bound Encryption makes a modern Chrome/Edge/Brave store unreadable to
+    /// anything but the browser itself, so this window reads its own cookies and hands them over.
+    /// On Linux it is simply the path that needs no browser already signed in. The window lives
+    /// in a child process of this same binary — see `webview_login`'s module doc — so this only
+    /// awaits it.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub async fn sign_in_from_window(&self) -> Result<String> {
         let cookie = crate::webview_login::capture().await?;
         self.install_cookie(cookie, Some(crate::webview_login::SOURCE))
@@ -392,7 +393,7 @@ impl Api {
         let refreshed = match source.as_str() {
             // Not a browser `--cookies-from-browser` knows about: reopening the sign-in window
             // finds Google's session still in its profile, so this is normally a plain capture.
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             crate::webview_login::SOURCE => self.sign_in_from_window().await,
             _ => self.sign_in_from_browser(&source).await,
         };

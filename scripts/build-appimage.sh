@@ -68,11 +68,20 @@ curl -fsSL -o "$appdir/usr/bin/yt-dlp" \
 chmod +x "$appdir/usr/bin/yt-dlp"
 
 echo "bundling libraries"
+# WebKitGTK is deliberately *not* bundled. The sign-in window (`webview_login.rs`) uses the
+# host's own, because WebKit is not one library: it needs matching helper processes
+# (`WebKitWebProcess`, `WebKitNetworkProcess`) and injected bundles at paths compiled into the
+# .so, and a bundled copy would find the host's helpers or none at all. Most desktops ship
+# webkit2gtk-4.1 already; where it is missing, the window fails with its own message and the
+# browser import still works. libsoup is excluded with it so the pair stays the host's.
 "$tools/linuxdeploy" --appimage-extract-and-run \
     --appdir "$appdir" \
     -e "$appdir/usr/bin/refryt" \
     -d "$appdir/usr/share/applications/refryt.desktop" \
-    -i "$appdir/refryt.png" > /dev/null
+    -i "$appdir/refryt.png" \
+    --exclude-library 'libwebkit2gtk-4.*' \
+    --exclude-library 'libjavascriptcoregtk-4.*' \
+    --exclude-library 'libsoup-3.0.so*' > /dev/null
 
 mkdir -p dist
 echo "packing $out"

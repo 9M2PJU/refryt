@@ -37,8 +37,9 @@ pub mod theme;
 pub mod tray;
 pub mod ui;
 pub mod video;
-/// The in-app sign-in window — Windows only, see the module's own doc comment.
-#[cfg(target_os = "windows")]
+/// The in-app sign-in window — WebView2 on Windows, WebKitGTK on Linux; see the module's own
+/// doc comment.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod webview_login;
 pub mod widgets;
 

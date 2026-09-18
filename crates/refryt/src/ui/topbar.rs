@@ -50,23 +50,16 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
     }
     let signed_in = app.signed_in();
     let chip = account_chip(app, &mut right);
-    // Signed out, the chip is the way in. On Windows it opens the menu below, whose first item
-    // starts the sign-in window; everywhere else the browser import lives in Settings, so it
-    // goes there directly, as it always did.
-    if chip.clicked() && !signed_in && !cfg!(target_os = "windows") {
-        app.navigate(Route::Settings);
-    }
-    // Signed in, the avatar opens the account menu — View profile, Switch account, Settings,
-    // Sign out. Signed out on Windows it opens too, led by Log in. Button-anchored: `Toggle`
-    // records no pointer position, so a pointer-anchored popup would never render.
-    if signed_in || cfg!(target_os = "windows") {
-        account_menu(app, &mut right, &chip, signed_in);
-    }
+    // The chip opens the account menu in every state and on every platform — View profile,
+    // Switch account, Settings, Sign out when signed in; Log in and Settings when not. Log in
+    // leads to the sign-in window on Windows and to Settings' browser import elsewhere, but
+    // the menu itself no longer differs by platform. Button-anchored: `Toggle` records no
+    // pointer position, so a pointer-anchored popup would never render.
+    account_menu(app, &mut right, &chip, signed_in);
     right.add_space(2.0);
     // Listening history beside the chip, as a clock — it is a page, not a setting.
-    // Settings itself lives only under the chip: signed out, the chip *is* the way in
-    // (it navigates straight to Settings); signed in, the account menu carries it. One
-    // door, one keyhole — a second gear beside the chip was two doors to the same room.
+    // Settings itself lives only under the chip, which carries it in every state. One door,
+    // one keyhole — a second gear beside the chip was two doors to the same room.
     if widgets::icon_button(&mut right, &p, Icon::History, 18.0, false).clicked() {
         app.navigate(Route::History);
     }
@@ -349,8 +342,9 @@ fn avatar_circle(app: &mut App, ui: &mut Ui, name: Option<&str>) -> egui::Respon
 }
 
 /// What the chip opens: signed in, the channels this Google account can browse as — each with
-/// its photo and a tick on the current one — then Settings and Sign out; signed out on Windows,
-/// Log in (the sign-in window) and Settings.
+/// its photo and a tick on the current one — then Settings and Sign out; signed out, Log in and
+/// Settings. Log in opens the sign-in window on Windows and navigates to Settings' browser
+/// import everywhere else.
 fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response, signed_in: bool) {
     let popup = egui::Popup::new(
         ui.id().with("ytm-account-menu"),
@@ -392,8 +386,9 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response, signed_in: bo
             .or_else(|| accounts.iter().find(|a| a.selected))
             .or(accounts.first())
             .and_then(|a| a.channel_id.clone());
-        // Signed out, this item is the menu's reason to exist: the sign-in window is the one
-        // path that works when every browser on the machine is a modern Chromium.
+        // Signed out, this item is the menu's reason to exist: on Windows the sign-in window is
+        // the one path that works when every browser on the machine is a modern Chromium, and
+        // on Linux and macOS it is the door to Settings' browser import.
         if !signed_in && widgets::menu_item(mui, &p, Icon::CircleUser, "Log in", None).clicked() {
             choice = Some(Choice::LogIn);
             mui.close();
@@ -500,7 +495,7 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response, signed_in: bo
     });
     match choice {
         Some(Choice::LogIn) => {
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 // Deliberately not `auth = Checking`: that state means "verifying a stored
                 // session at startup", which is what tells `AuthChanged` whether the loaded home
@@ -508,7 +503,7 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response, signed_in: bo
                 // invalidated. Same reason as the Settings buttons.
                 app.backend.sign_in_from_window();
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             app.navigate(Route::Settings);
         }
         Some(Choice::Profile(id)) => app.navigate(Route::Artist(id)),
