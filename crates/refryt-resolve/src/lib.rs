@@ -17,11 +17,11 @@ mod chain;
 mod native;
 mod ytdlp;
 
-pub use cache::StreamCache;
+pub use cache::{StreamCache, VideoStreamCache};
 pub use chain::ChainResolver;
 #[cfg(feature = "native-resolver")]
 pub use native::{NativeConfig, NativeResolver};
-pub use ytdlp::YtDlpResolver;
+pub use ytdlp::{VIDEO_FORMAT, YtDlpResolver};
 
 /// Audio codec of a resolved stream.
 ///
@@ -117,6 +117,41 @@ impl AudioStream {
             None => true,
         }
     }
+}
+
+/// A resolved music video: a video stream, plus its audio when YouTube served the two as
+/// separate adaptive streams — which is what `bestvideo+bestaudio` selects, and what mpv then
+/// plays as one file with the audio attached as an external track.
+#[derive(Debug, Clone)]
+pub struct VideoStream {
+    pub video: Url,
+    pub audio: Option<Url>,
+    pub duration: Option<Duration>,
+    /// From the video URL's `expire` parameter, like [`AudioStream::expires_at`].
+    pub expires_at: Option<SystemTime>,
+    pub resolved_by: &'static str,
+}
+
+impl VideoStream {
+    /// Whether this stream is still safe to hand to the player. Same margin rule as
+    /// [`AudioStream::is_fresh`]: expiring mid-video is worse than re-resolving early.
+    pub fn is_fresh(&self, margin: Duration) -> bool {
+        match self.expires_at {
+            Some(exp) => SystemTime::now() + margin < exp,
+            None => true,
+        }
+    }
+}
+
+/// Resolves a video id to a playable video stream.
+///
+/// Deliberately not part of [`StreamResolver`]: the shape is different (two URLs, not one), and
+/// the native path cannot do video at all — `yt-dlp` is the only resolver that can.
+#[async_trait::async_trait]
+pub trait VideoResolver: Send + Sync {
+    async fn resolve_video(&self, id: &VideoId) -> Result<VideoStream>;
+    /// Stable short name, used in logs.
+    fn name(&self) -> &'static str;
 }
 
 /// Parse the `expire` query parameter (unix seconds) out of a googlevideo URL.

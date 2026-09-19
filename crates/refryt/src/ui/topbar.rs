@@ -181,11 +181,10 @@ fn search_field(app: &mut App, ui: &mut Ui, width: f32) {
         .font(theme::regular(13.0));
     let field_response = field_ui.add(field);
     if field_response.changed() {
-        // Typing refetches autocomplete only; the search waits for a submit. `suggestion_navigated`
-        // resets so a stale arrow selection cannot attach to new text.
+        // Typing refetches autocomplete only; the search waits for a submit. The cursor resets
+        // so a stale arrow selection cannot attach to new text.
         app.query_changed_at = Some(std::time::Instant::now());
-        app.suggestion_cursor = 0;
-        app.suggestion_navigated = false;
+        app.suggestion_cursor = None;
     }
 
     // Submit on a bare Enter. When the suggestion list is open it consumes Enter above, so this
@@ -200,7 +199,9 @@ fn search_field(app: &mut App, ui: &mut Ui, width: f32) {
     // The items are cloned out so the popup closure does not borrow `app` while the actions
     // below still need it. `p` is a copy for the same reason.
     let items = app.suggestions.clone();
-    let cursor = app.suggestion_cursor.min(items.len().saturating_sub(1));
+    // `None` until an arrow key picks a row: the list opens with nothing highlighted, so Enter
+    // searches what was typed and the first Down lands on the first suggestion.
+    let cursor = app.suggestion_cursor.filter(|i| *i < items.len());
     let mut picked = None;
     egui::Popup::from_response(&response)
         .id(ui.id().with("ytm-search-suggestions"))
@@ -216,7 +217,7 @@ fn search_field(app: &mut App, ui: &mut Ui, width: f32) {
                 let (row, resp) =
                     mui.allocate_exact_size(vec2(mui.available_width(), 30.0), Sense::click());
                 if mui.is_rect_visible(row) {
-                    let selected = i == cursor;
+                    let selected = cursor == Some(i);
                     let t = widgets::lit(mui, &resp).max(if selected { 1.0 } else { 0.0 });
                     if t > 0.001 {
                         mui.painter().rect_filled(
@@ -225,11 +226,21 @@ fn search_field(app: &mut App, ui: &mut Ui, width: f32) {
                             widgets::mix(p.surface, p.surface_hover, t),
                         );
                     }
+                    // Suggestions are arbitrary strings from YouTube; a long one would paint
+                    // straight through the popup's right edge. Ellipsise it to the row, the
+                    // same way a row's own title is shortened.
+                    let font = theme::regular(13.0);
+                    let label = widgets::truncate_to(
+                        mui,
+                        item,
+                        font.clone(),
+                        (row.width() - 24.0).max(0.0),
+                    );
                     crate::emoji::paint_line(
                         mui,
                         row.left_center() + vec2(14.0, 0.0),
-                        item,
-                        theme::regular(13.0),
+                        &label,
+                        font,
                         p.text,
                     );
                 }
@@ -247,19 +258,39 @@ fn search_field(app: &mut App, ui: &mut Ui, width: f32) {
         app.clear_suggestions();
         app.submit_search();
     } else if enter {
-        if app.suggestion_navigated && !items.is_empty() {
-            app.query = items[cursor].clone();
+        // The highlighted suggestion wins when there is one; otherwise this is the typed text.
+        if let Some(i) = cursor {
+            app.query = items[i].clone();
         }
         app.clear_suggestions();
         app.submit_search();
     } else if esc {
         app.clear_suggestions();
     } else if up {
-        app.suggestion_cursor = cursor.saturating_sub(1);
-        app.suggestion_navigated = true;
+        app.suggestion_cursor = step_cursor(cursor, false, items.len());
     } else if down {
-        app.suggestion_cursor = (cursor + 1).min(items.len() - 1);
-        app.suggestion_navigated = true;
+        app.suggestion_cursor = step_cursor(cursor, true, items.len());
+    }
+}
+
+/// Move the suggestion highlight: Down from nothing picks the first row, Up from nothing the
+/// last; Up from the first clears the highlight again, so it can always be dismissed without
+/// touching the text. `None` means nothing is highlighted — the state the list opens in.
+fn step_cursor(cursor: Option<usize>, down: bool, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    if down {
+        Some(match cursor {
+            None => 0,
+            Some(i) => (i + 1).min(len - 1),
+        })
+    } else {
+        match cursor {
+            None => Some(len - 1),
+            Some(0) => None,
+            Some(i) => Some(i - 1),
+        }
     }
 }
 
@@ -516,5 +547,37 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response, signed_in: bo
         Some(Choice::Help) => app.help_open = true,
         Some(Choice::SignOut) => app.backend.sign_out(),
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this fixes: the list opened with its first row highlighted, so Enter used the
+    /// typed text while Down skipped the first suggestion entirely. Nothing is highlighted
+    /// until an arrow key asks for it.
+    #[test]
+    fn the_first_down_reaches_the_first_suggestion() {
+        assert_eq!(step_cursor(None, true, 3), Some(0));
+        assert_eq!(step_cursor(Some(0), true, 3), Some(1));
+        assert_eq!(step_cursor(Some(2), true, 3), Some(2), "the end holds");
+    }
+
+    #[test]
+    fn up_walks_back_and_can_clear_the_highlight() {
+        assert_eq!(
+            step_cursor(None, false, 3),
+            Some(2),
+            "from nothing, the last"
+        );
+        assert_eq!(step_cursor(Some(1), false, 3), Some(0));
+        assert_eq!(step_cursor(Some(0), false, 3), None);
+    }
+
+    #[test]
+    fn an_empty_list_has_nothing_to_highlight() {
+        assert_eq!(step_cursor(None, true, 0), None);
+        assert_eq!(step_cursor(None, false, 0), None);
     }
 }

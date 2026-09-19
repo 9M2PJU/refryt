@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::{AudioStream, StreamResolver, VideoId};
+use crate::{AudioStream, StreamResolver, VideoId, VideoResolver, VideoStream};
 
 /// Re-resolve this long before actual expiry: a URL that dies mid-track is worse than one
 /// refreshed slightly early.
@@ -75,6 +75,63 @@ impl<R: StreamResolver> StreamResolver for StreamCache<R> {
             return Ok(hit);
         }
         let stream = self.inner.resolve(id).await?;
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(id.clone(), stream.clone());
+        Ok(stream)
+    }
+}
+
+/// The same cache for [`VideoStream`]s, kept separate because a video URL and an audio URL for
+/// the same id are different answers to different questions — and the video path is prefetched
+/// while the audio one may be playing.
+pub struct VideoStreamCache<R> {
+    inner: R,
+    entries: Mutex<HashMap<VideoId, VideoStream>>,
+}
+
+impl<R: VideoResolver> VideoStreamCache<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The resolver underneath, so callers can retune it.
+    pub fn inner(&self) -> &R {
+        &self.inner
+    }
+
+    pub fn get_cached(&self, id: &VideoId) -> Option<VideoStream> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .get(id)
+            .filter(|s| s.is_fresh(FRESHNESS_MARGIN))
+            .cloned()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[async_trait::async_trait]
+impl<R: VideoResolver> VideoResolver for VideoStreamCache<R> {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    async fn resolve_video(&self, id: &VideoId) -> Result<VideoStream> {
+        if let Some(hit) = self.get_cached(id) {
+            return Ok(hit);
+        }
+        let stream = self.inner.resolve_video(id).await?;
         self.entries
             .lock()
             .unwrap()
@@ -162,5 +219,56 @@ mod tests {
         assert_eq!(cache.len(), 1);
         cache.evict_stale();
         assert!(cache.is_empty());
+    }
+
+    struct CountingVideo {
+        calls: AtomicUsize,
+        expires_in: Option<Duration>,
+    }
+
+    #[async_trait::async_trait]
+    impl VideoResolver for std::sync::Arc<CountingVideo> {
+        fn name(&self) -> &'static str {
+            "counting-video"
+        }
+        async fn resolve_video(&self, _id: &VideoId) -> Result<VideoStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(VideoStream {
+                video: Url::parse("https://example.com/v").unwrap(),
+                audio: Some(Url::parse("https://example.com/a").unwrap()),
+                duration: None,
+                expires_at: self.expires_in.map(|d| SystemTime::now() + d),
+                resolved_by: "counting-video",
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_video_resolve_is_served_from_cache_the_second_time() {
+        let inner = std::sync::Arc::new(CountingVideo {
+            calls: AtomicUsize::new(0),
+            expires_in: Some(Duration::from_secs(6 * 3600)),
+        });
+        let cache = VideoStreamCache::new(inner.clone());
+
+        let first = cache.resolve_video(&id()).await.unwrap();
+        let second = cache.resolve_video(&id()).await.unwrap();
+
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.audio, second.audio);
+    }
+
+    #[tokio::test]
+    async fn a_video_url_near_expiry_is_re_resolved() {
+        let inner = std::sync::Arc::new(CountingVideo {
+            calls: AtomicUsize::new(0),
+            expires_in: Some(Duration::from_secs(60)),
+        });
+        let cache = VideoStreamCache::new(inner.clone());
+
+        cache.resolve_video(&id()).await.unwrap();
+        cache.resolve_video(&id()).await.unwrap();
+
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
     }
 }

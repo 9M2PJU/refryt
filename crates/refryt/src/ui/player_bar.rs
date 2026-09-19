@@ -18,6 +18,18 @@ const FIELD_MAX_W: f32 = 320.0;
 /// The transport's width: shuffle, previous, play, next, repeat. Centred on the window, and
 /// shared with the title cap so the two never overlap.
 const TRANSPORT_W: f32 = 250.0;
+/// The right-hand control cluster, pinned to the window's edge: the 14pt inset, the volume
+/// slider, Queue, Lyrics and the video toggle, with their separations. The seek bar's duration
+/// label must clear this, or a narrow window paints the video toggle over the number.
+const CONTROL_CLUSTER_W: f32 = 14.0 + 76.0 + 8.0 + 30.0 + 8.0 + 30.0 + 8.0 + 30.0;
+
+/// The seek bar's width: a third of the bar, capped at 420pt, and never so wide that the
+/// duration label hanging right of it reaches the control cluster.
+fn seek_width(width: f32, cluster_left: f32, total_w: f32, center_x: f32) -> f32 {
+    // The label is painted 10pt past the bar's right end; the 6pt is the gap it must leave.
+    let room = cluster_left - 6.0 - 10.0 - total_w - center_x;
+    (width * 0.34).min(420.0).min(2.0 * room.max(0.0))
+}
 
 pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     let rect = ui.available_rect_before_wrap();
@@ -67,13 +79,18 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     // or long titles sit underneath it. The total stands in for the elapsed (at least as
     // wide, and stable while time advances), and the thumbs clear it too. The 24pt floor
     // keeps a degenerate window an ellipsis rather than the full title over everything.
-    let bar_w = (rect.width() * 0.34).min(420.0);
-    let bar_min_x = rect.center().x - bar_w / 2.0;
     let total_w = widgets::text_width(
         ui,
         &widgets::fmt_duration(state.duration as u64),
         &theme::regular(11.0),
     );
+    let bar_w = seek_width(
+        rect.width(),
+        rect.right() - CONTROL_CLUSTER_W,
+        total_w,
+        rect.center().x,
+    );
+    let bar_min_x = rect.center().x - bar_w / 2.0;
     // The field hugs its own content — the wider of the title and the credits — so the
     // rating column rides next to the text instead of at a fixed 320pt from the title, which
     // on a short song left the thumbs drifting in space and is the whole reason this line is
@@ -318,9 +335,10 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         }
     }
 
-    // Volume.
+    // Volume. The child Ui spans the whole cluster, not just the slider: it packs from the
+    // right, and a narrower rect would only hide the room the buttons already use.
     let vol_rect = Rect::from_min_max(
-        egui::pos2(rect.right() - 150.0, rect.top()),
+        egui::pos2(rect.right() - CONTROL_CLUSTER_W, rect.top()),
         rect.right_bottom(),
     );
     let mut vui = ui.new_child(
@@ -376,5 +394,35 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         if let Some(action) = action {
             app.row_action(action);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wide window keeps the bar's designed width; a narrow one shrinks it so the duration
+    /// label stops short of the control cluster, where the video toggle used to sit on it.
+    #[test]
+    fn the_seek_bar_shrinks_before_its_label_reaches_the_controls() {
+        // 1100pt window: a third is ~374, well under the cap and the cluster.
+        let wide = seek_width(1100.0, 1100.0 - 14.0 - CONTROL_CLUSTER_W, 30.0, 550.0);
+        assert!((wide - 374.0).abs() < 0.01, "{wide}");
+
+        // 760pt window with a long duration: the cluster is the binding limit.
+        let narrow = seek_width(760.0, 760.0 - 14.0 - CONTROL_CLUSTER_W, 45.0, 380.0);
+        assert!(narrow < 760.0 * 0.34, "{narrow}");
+        // The label's right edge — half the bar, the 10pt offset and its own width — clears
+        // the cluster with the 6pt gap intact.
+        let label_right = 380.0 + narrow / 2.0 + 10.0 + 45.0;
+        let cluster_left = 760.0 - 14.0 - CONTROL_CLUSTER_W;
+        assert!(label_right <= cluster_left - 6.0 + 0.01, "{label_right}");
+
+        // A window narrower than the controls can afford: the bar collapses rather than
+        // painting under them.
+        assert_eq!(
+            seek_width(400.0, 400.0 - 14.0 - CONTROL_CLUSTER_W, 30.0, 200.0),
+            0.0
+        );
     }
 }

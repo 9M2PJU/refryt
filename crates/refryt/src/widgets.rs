@@ -2668,6 +2668,33 @@ pub fn chip(ui: &mut Ui, palette: &Palette, label: &str, selected: bool) -> egui
     )
 }
 
+/// The icon-only sibling of [`chip`]: a quiet pill the same height and roundness as the chips
+/// beside it, holding a single glyph. The home feed's mood bar puts one after the chips so
+/// clearing the filter is a visible choice rather than a second click on the lit chip.
+pub fn icon_chip(ui: &mut Ui, palette: &Palette, icon: Icon, glyph: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let t = lit(ui, &response);
+        let fill = mix(palette.surface, palette.surface_hover, t);
+        let fill = if held(&response) {
+            fill.gamma_multiply(0.85)
+        } else {
+            fill
+        };
+        ui.painter().rect_filled(rect, CornerRadius::same(16), fill);
+        icon.image(mix(palette.secondary, palette.text, t), glyph)
+            .paint_at(
+                ui,
+                Rect::from_center_size(rect.center() + press_offset(&response), vec2(glyph, glyph)),
+            );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    response
+}
+
 /// A chip with a colour dot ahead of its label — the scheme picker, where the label alone says
 /// nothing about what choosing it does. Same two states as [`chip`], same sizing and press
 /// feel, just wider by the dot.

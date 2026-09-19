@@ -151,6 +151,9 @@ pub struct Store {
     pub shuffle: bool,
     #[serde(default)]
     pub volume: f64,
+    /// Whether the in-app video view was open. Only ever restored for a track that has a video.
+    #[serde(default)]
+    pub video_open: bool,
 }
 
 /// Write the store, creating the config dir if needed.
@@ -236,5 +239,24 @@ mod tests {
         for mode in [RepeatMode::Off, RepeatMode::All, RepeatMode::One] {
             assert_eq!(RepeatMode::from(RepeatKind::from(mode)), mode);
         }
+    }
+
+    /// `video_open` rides the store so a relaunch comes back in the video view, and an older
+    /// file without the field still reads.
+    #[test]
+    fn the_video_flag_round_trips_and_defaults_to_closed() {
+        let mut store: Store = serde_json::from_str(
+            r#"{"version":1,"queue":[],"position":0.0,"shuffle":false,"volume":70.0}"#,
+        )
+        .unwrap();
+        assert!(
+            !store.video_open,
+            "an older store must not restore the view"
+        );
+
+        store.video_open = true;
+        let json = serde_json::to_string(&store).unwrap();
+        let back: Store = serde_json::from_str(&json).unwrap();
+        assert!(back.video_open);
     }
 }

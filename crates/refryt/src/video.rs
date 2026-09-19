@@ -25,6 +25,53 @@ use sys::{
 /// Bytes per pixel `rgb0` writes.
 const BPP: usize = 4;
 
+/// mpv's software renderer wants both the stride and the pixel pointer to be multiples of 64
+/// bytes for its fast SIMD paths; below that it can fall back to copying the entire frame. The
+/// surface width is padded to 16 pixels, which makes the stride a multiple of 64, and the buffer
+/// itself is allocated 64-byte aligned.
+const ALIGN: usize = 64;
+const PAD_PIXELS: usize = ALIGN / BPP;
+
+/// A heap buffer whose pointer is 64-byte aligned. `Vec<u8>` guarantees only 1.
+struct Aligned {
+    ptr: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+impl Aligned {
+    fn new(len: usize) -> Self {
+        let layout =
+            std::alloc::Layout::from_size_align(len.max(1), ALIGN).expect("valid buffer layout");
+        // SAFETY: the layout has non-zero size.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        Self {
+            ptr: std::ptr::NonNull::new(ptr).expect("video buffer allocation failed"),
+            layout,
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: the allocation is live for `self.layout.size()` bytes.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` makes this the only reference.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl Drop for Aligned {
+    fn drop(&mut self) {
+        // SAFETY: the pointer and layout came from the same `alloc` call.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+    }
+}
+
 /// The callback mpv fires from its own thread when a frame is ready.
 struct Callback {
     dirty: Arc<AtomicBool>,
@@ -42,7 +89,8 @@ pub struct Video {
     ctx: *mut sys::mpv_render_context,
     callback: *mut Callback,
     dirty: Arc<AtomicBool>,
-    pixels: Vec<u8>,
+    pixels: Aligned,
+    /// The surface size last rendered, in padded pixels.
     size: (usize, usize),
     texture: Option<egui::TextureHandle>,
 }
@@ -86,7 +134,7 @@ impl Video {
             ctx: render,
             callback,
             dirty,
-            pixels: Vec::new(),
+            pixels: Aligned::new(0),
             size: (0, 0),
             texture: None,
         })
@@ -100,6 +148,9 @@ impl Video {
         if w == 0 || h == 0 {
             return self.texture.clone();
         }
+        // Pad the surface width so the stride is 64-byte aligned; mpv scales the video into
+        // the slightly wider surface, which is invisible (a few pixels at most).
+        let w = w.next_multiple_of(PAD_PIXELS);
         let update = unsafe { sys::mpv_render_context_update(self.ctx) };
         let ready = update & u64::from(sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME) != 0;
         let resized = self.size != (w, h);
@@ -109,8 +160,9 @@ impl Video {
         }
 
         let stride = w * BPP;
-        if self.pixels.len() != stride * h {
-            self.pixels.resize(stride * h, 0);
+        let len = stride * h;
+        if self.pixels.as_slice().len() != len {
+            self.pixels = Aligned::new(len);
         }
         self.size = (w, h);
         let mut surface = [w as i32, h as i32];
@@ -142,11 +194,18 @@ impl Video {
             return self.texture.clone();
         }
 
-        // `rgb0` leaves the fourth byte unused; egui wants an opaque alpha there.
-        for alpha in self.pixels.iter_mut().skip(BPP - 1).step_by(BPP) {
+        // `rgb0` leaves the fourth byte unused; egui wants an opaque alpha there. With alpha at
+        // 255, premultiplied and straight are the same, so egui's conversion pass is skipped.
+        for alpha in self
+            .pixels
+            .as_mut_slice()
+            .iter_mut()
+            .skip(BPP - 1)
+            .step_by(BPP)
+        {
             *alpha = 255;
         }
-        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &self.pixels);
+        let image = egui::ColorImage::from_rgba_premultiplied([w, h], self.pixels.as_slice());
         match &mut self.texture {
             Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
             None => {

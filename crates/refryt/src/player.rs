@@ -31,9 +31,10 @@ pub struct Player {
     /// `state()` reports idle in that case — the same as a fresh eager context did.
     mpv: Option<Arc<Mpv>>,
     volume: f64,
-    /// Set if the one-time libmpv init failed. Surfaced exactly where an eager failure was —
+    /// Set if the last libmpv init attempt failed. Surfaced exactly where an eager failure was —
     /// `App::player_error` and the sidebar's "audio unavailable" note — just at first play
-    /// instead of at startup.
+    /// instead of at startup. Not latched: a later play tries again, so a transient failure
+    /// (an OOM, a locale another library moved) does not kill playback for the whole session.
     init_error: Option<String>,
 }
 
@@ -53,6 +54,14 @@ impl Player {
     }
 
     fn init() -> Result<Mpv> {
+        // GTK — which the tray brings up on its own thread (`tray.rs`) — calls
+        // `setlocale(LC_ALL, "")` when it initialises, moving `LC_NUMERIC` off the "C" locale.
+        // libmpv refuses to create a context unless it is "C": `mpv_create` returns NULL, mpv
+        // prints "Non-C locale detected" to stderr, and playback can never start. The tray comes
+        // up during startup, before any play, so this is the `setlocale(LC_NUMERIC, "C")` mpv
+        // asks its embedders for, put back before the context is created.
+        #[cfg(target_os = "linux")]
+        restore_c_locale();
         Mpv::with_initializer(|init| {
             // Audio only: never spend bandwidth or decode time on video.
             init.set_property("vid", "no")?;
@@ -93,11 +102,15 @@ impl Player {
 
     /// A handle safe to move into a background task, initialising libmpv on the first call.
     /// `Mpv` is `Send + Sync`, so playback can be started from whichever thread finished
-    /// resolving. `None` (with [`Self::init_error`] set) if libmpv could not be brought up.
+    /// resolving. `None` (with [`Self::init_error`] set) if libmpv could not be brought up;
+    /// a later call retries rather than latching that first failure.
     pub fn handle(&mut self) -> Option<Arc<Mpv>> {
-        if self.mpv.is_none() && self.init_error.is_none() {
+        if self.mpv.is_none() {
             match Self::init() {
-                Ok(mpv) => self.mpv = Some(Arc::new(mpv)),
+                Ok(mpv) => {
+                    self.mpv = Some(Arc::new(mpv));
+                    self.init_error = None;
+                }
                 Err(e) => {
                     let msg = format!("{e:#}");
                     tracing::error!(error = %msg, "libmpv initialisation failed");
@@ -130,6 +143,15 @@ impl Player {
         }
     }
 
+    /// The loaded video's display size, in pixels. `None` for audio, or before the first frame
+    /// has reported one. The software renderer draws at this size so mpv does no scaling.
+    pub fn video_size(&self) -> Option<(usize, usize)> {
+        let mpv = self.mpv.as_ref()?;
+        let w: i64 = mpv.get_property("dwidth").ok()?;
+        let h: i64 = mpv.get_property("dheight").ok()?;
+        (w > 0 && h > 0).then_some((w as usize, h as usize))
+    }
+
     pub fn set_paused(&self, paused: bool) {
         if let Some(mpv) = &self.mpv {
             let _ = mpv.set_property("pause", paused);
@@ -158,6 +180,21 @@ impl Player {
     }
 }
 
+/// Put `LC_NUMERIC` back to "C" — see `Player::init` for why. Declared here rather than through
+/// `libc` so this stays a single, dependency-free call.
+#[cfg(target_os = "linux")]
+fn restore_c_locale() {
+    use std::os::raw::{c_char, c_int};
+    // glibc and musl number the locale categories identically; `LC_NUMERIC` is 1 in both.
+    const LC_NUMERIC: c_int = 1;
+    unsafe extern "C" {
+        fn setlocale(category: c_int, locale: *const c_char) -> *mut c_char;
+    }
+    unsafe {
+        setlocale(LC_NUMERIC, c"C".as_ptr());
+    }
+}
+
 /// Hand a resolved URL to mpv and start playing it.
 ///
 /// Separate from `Player` so it can be called from a background task that owns only a handle.
@@ -167,6 +204,7 @@ pub fn load(
     volume: f64,
     loudness_db: Option<f32>,
     normalise: bool,
+    start_at: Option<f64>,
 ) -> Result<()> {
     // Apply YouTube's own loudness measurement so tracks don't jump in level. mpv's `volume`
     // is a percentage, so the correction is folded into it rather than set as a filter.
@@ -179,14 +217,38 @@ pub fn load(
     // Audio-only again, in case the video view just handed playback back. `vo` stays `libmpv`
     // from the video path, but with `vid=no` there is no video for it to initialise.
     let _ = mpv.set_property("vid", "no");
+    // The video path raises this; a song does not need the memory.
+    let _ = mpv.set_property("demuxer-max-bytes", "32MiB");
+    set_start(mpv, start_at);
     mpv.command("loadfile", &[url, "replace"])
         .context("mpv refused the stream URL")
 }
 
-/// Load a music video. Unlike [`load`], mpv fetches it itself through its yt-dlp hook — armed
-/// once in [`Player::init`], since mpv ignores `ytdl` set any later. The app's resolver only
-/// returns audio-only streams, so the video has to come from the hook.
-pub fn load_video(mpv: &Mpv, watch_url: &str, volume: f64) -> Result<()> {
+/// Apply a resume position as a per-file `start`, or clear it (`none`) for a fresh play.
+///
+/// At load time mpv takes the position after the whole file is opened, which is the only point
+/// at which an externally attached audio stream exists to be seeked along with the video.
+/// Seeking after the load instead moved the video and left the audio at zero — the two then
+/// drifted apart for the rest of the track.
+fn set_start(mpv: &Mpv, start_at: Option<f64>) {
+    let start = start_at.map_or_else(|| "none".to_owned(), |s| format!("+{s:.3}"));
+    let _ = mpv.set_property("start", start.as_str());
+}
+
+/// Load a music video.
+///
+/// `video_url` is normally a direct stream the app resolved itself, with `audio_url` its
+/// separate adaptive audio track when YouTube served one — mpv plays the pair as a single file.
+/// When `video_url` is instead a watch page, mpv's yt-dlp hook fetches it (armed once in
+/// [`Player::init`], since mpv ignores `ytdl` set any later); that is the fallback when
+/// resolving failed.
+pub fn load_video(
+    mpv: &Mpv,
+    video_url: &str,
+    audio_url: Option<&str>,
+    volume: f64,
+    start_at: Option<f64>,
+) -> Result<()> {
     // The software render context was created before this call, and `libmpv` is the vo that
     // hands frames to it. Without this the file plays into nothing and every frame is black.
     let _ = mpv.set_property("vo", "libmpv");
@@ -194,7 +256,29 @@ pub fn load_video(mpv: &Mpv, watch_url: &str, volume: f64) -> Result<()> {
     let _ = mpv.set_property("audio-display", "no");
     let _ = mpv.set_property("volume", volume.clamp(0.0, 130.0));
     let _ = mpv.set_property("pause", false);
-    mpv.command("loadfile", &[watch_url, "replace"])
+    // Decode on the GPU when the platform can, copying frames back into the software surface;
+    // mpv falls back to software decoding when it cannot. The buffer is what makes this
+    // affordable, not the renderer.
+    let _ = mpv.set_property("hwdec", "auto-safe");
+    // The hook fallback (a watch page) must ask yt-dlp for the same capped format the direct
+    // resolver uses, or it picks whatever is best — a 4K AV1 stream the software path cannot
+    // afford. The direct path never consults this.
+    let _ = mpv.set_property("ytdl-format", refryt_resolve::VIDEO_FORMAT);
+    // A video reads further ahead than a song: a stall in the middle is far more visible.
+    let _ = mpv.set_property("demuxer-max-bytes", "64MiB");
+    // Insurance for the frames that do get scaled — the native-size path normally avoids the
+    // scaler entirely, and bilinear is a fraction of Lanczos' cost when it cannot.
+    let _ = mpv.set_property("sws-scaler", "bilinear");
+    set_start(mpv, start_at);
+    // The fourth `loadfile` argument is a per-file option list, so the external audio applies
+    // to this file only and is gone when the next one loads. Commas inside the URL are safe:
+    // the option parser takes the value to the end of the entry.
+    let options = audio_url.map(|a| format!("audio-files-append={a}"));
+    let mut args: Vec<&str> = vec![video_url, "replace", "-1"];
+    if let Some(options) = &options {
+        args.push(options);
+    }
+    mpv.command("loadfile", &args)
         .context("mpv refused the video URL")
 }
 
@@ -239,5 +323,28 @@ mod tests {
         let loud = 10f64.powf(-6.0 / 20.0).clamp(0.25, 2.0); // loudness_db = +6
         assert!(quiet > 1.0);
         assert!(loud < 1.0);
+    }
+
+    /// The tray's GTK init calls `setlocale(LC_ALL, "")` in-process, which is exactly how
+    /// playback once died with "could not initialise libmpv: Null". Creating a context must
+    /// survive a non-C locale being in force.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn libmpv_initialises_with_a_non_c_locale_in_force() {
+        use std::os::raw::{c_char, c_int};
+        const LC_ALL: c_int = 6;
+        unsafe extern "C" {
+            fn setlocale(category: c_int, locale: *const c_char) -> *mut c_char;
+        }
+        // What GTK does when it comes up: take the environment's locale wholesale.
+        unsafe {
+            setlocale(LC_ALL, c"".as_ptr());
+        }
+        assert!(
+            super::Player::init().is_ok(),
+            "libmpv must create a context after another library moved the locale"
+        );
+        // Leave the process as the rest of the suite expects it.
+        super::restore_c_locale();
     }
 }

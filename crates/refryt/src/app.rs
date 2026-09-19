@@ -63,6 +63,11 @@ const PLAY_HISTORY: usize = 12;
 /// How many replaced queues are kept for `Previous` to bring back, so starting an album does not
 /// erase the playlist you were in.
 const QUEUE_HISTORY: usize = 5;
+/// How far into a track the transport's Previous restarts it rather than stepping back to the
+/// previous one: within this window of the start a press goes back a track, so consecutive
+/// presses walk backwards, while past it the press returns to the top of the current track.
+/// The convention the streaming apps use, so a press never loses the track being listened to.
+const PREVIOUS_RESTART_AFTER: Duration = Duration::from_secs(2);
 /// Every local track's folder-path segments paired with its position in `App::local_tracks` —
 /// `ui::library::local_entries`'s own return/cache shape, named here so `App::local_entries_cache`
 /// doesn't need to spell out the nested tuple-of-tuples.
@@ -108,6 +113,13 @@ enum Rewind {
 }
 
 /// What the transport does at the end of the queue.
+/// Whether a Previous press restarts the current track instead of stepping back to the previous
+/// one: with the track underway it restarts, and only within [`PREVIOUS_RESTART_AFTER`] of its
+/// start does it step back. Pure so the rule is testable without a player.
+fn previous_restarts(position: f64) -> bool {
+    position >= PREVIOUS_RESTART_AFTER.as_secs_f64()
+}
+
 /// The next index in a queue when not shuffling: the following track, wrapping to the start only
 /// under Repeat All. `None` means the transport stops (or, for Repeat One, replays).
 fn sequential_next(current: usize, len: usize, repeat_all: bool) -> Option<usize> {
@@ -853,10 +865,10 @@ pub struct App {
     /// like `searched`), and where the keyboard cursor sits among them.
     pub(crate) suggestions: Vec<String>,
     pub(crate) suggestions_for: Option<String>,
-    pub(crate) suggestion_cursor: usize,
-    /// Set once the arrow keys have moved the suggestion highlight, so Enter accepts that
-    /// suggestion; untouched, Enter searches exactly what was typed.
-    pub(crate) suggestion_navigated: bool,
+    /// Where the arrow keys have moved the suggestion highlight, if anywhere. `None` — the
+    /// state the list opens in — means nothing is highlighted and Enter searches exactly what
+    /// was typed, so the first Down reaches the *first* suggestion rather than skipping it.
+    pub(crate) suggestion_cursor: Option<usize>,
     /// A search waiting for `poll_search` to fire it. Search is submit-driven — Enter, a chosen
     /// suggestion, or the `--search` CLI — never a keystroke.
     pending_search: bool,
@@ -1031,6 +1043,10 @@ pub struct App {
     /// been superseded (Next/Previous, another queue row, the video toggle, all firing again
     /// before the first one's yt-dlp resolve finished) and must not overwrite `now`.
     play_generation: u64,
+    /// Whether the most recent start went through `Backend::play_video` rather than `play`.
+    /// `PlaybackFailed` uses it to fall back to the song's audio instead of leaving the video
+    /// view over a frozen frame when the video path is the one that broke.
+    play_is_video: bool,
     /// Autoplay river state, opened by Start Mix. `None` for a hand-picked queue.
     pub(crate) radio: Option<Radio>,
     /// Hidden "previous" history for the transport. Bounded; see [`PlayHistory`].
@@ -1194,6 +1210,16 @@ pub struct App {
     pub(crate) video: Option<crate::video::Video>,
 }
 
+impl Drop for App {
+    /// mpv's render context must be freed *before* the mpv core is destroyed — `render.h` calls
+    /// the other order undefined behavior — and `video` is declared after `player`, so without
+    /// this the player's context would go first. Clearing the field here runs before any field
+    /// is dropped.
+    fn drop(&mut self) {
+        self.video = None;
+    }
+}
+
 /// The window's native handle for the OS media service — SMTC attaches to a window on Windows.
 /// `None` everywhere else, where `playwire` needs no handle.
 #[cfg(target_os = "windows")]
@@ -1221,6 +1247,13 @@ fn history_needs_load(
     epoch: u64,
 ) -> bool {
     signed_in && !loading && !failed && loaded_epoch != epoch
+}
+
+/// Whether a start belongs to the video view: the view is open and the track has a video to
+/// show. Split out so the rule every track change rides is pinned by a test — it used to be
+/// only the toggle's own reload, which left a frozen frame under the new song's audio.
+fn plays_as_video(video_open: bool, wide: bool) -> bool {
+    video_open && wide
 }
 
 /// Whether two lists are the same queue, track for track. `start_from` needs the *whole* list,
@@ -1334,8 +1367,7 @@ impl App {
             query_changed_at: None,
             suggestions: Vec::new(),
             suggestions_for: None,
-            suggestion_cursor: 0,
-            suggestion_navigated: false,
+            suggestion_cursor: None,
             pending_search: search.is_some(),
             searched: String::new(),
             searching: false,
@@ -1399,6 +1431,7 @@ impl App {
             current: None,
             playback_started: false,
             play_generation: 0,
+            play_is_video: false,
             radio: None,
             play_history: PlayHistory::default(),
             repeat: RepeatMode::Off,
@@ -1926,6 +1959,9 @@ impl App {
         self.resume = (store.position > 1.0)
             .then(|| self.current.map(|i| (i, store.position)))
             .flatten();
+        // The video view only comes back for a track that has a video to show; the flag can be
+        // stale against a queue that has since moved to an audio-only track.
+        self.video_open = store.video_open && self.now.track.as_ref().is_some_and(|t| t.wide);
     }
 
     /// The queue and transport, as the on-disk store shape — `None` when there is nothing worth
@@ -1954,6 +1990,7 @@ impl App {
             repeat: Some(self.repeat.into()),
             shuffle: self.shuffle,
             volume: self.last_volume,
+            video_open: self.video_open,
         })
     }
 
@@ -2083,8 +2120,8 @@ impl App {
     }
 
     /// Show or hide the in-app music video. Opening creates the software render surface (once)
-    /// and reloads the current track as video through mpv's yt-dlp hook; closing hands playback
-    /// back to the audio resolver — both at the current position.
+    /// and reloads the current track as video; closing hands playback back to the audio resolver
+    /// — both at the current position.
     pub(crate) fn toggle_video(&mut self) {
         if self.video_open {
             self.video_open = false;
@@ -2094,16 +2131,63 @@ impl App {
         if !self.now.track.as_ref().is_some_and(|t| t.wide) {
             return;
         }
+        if !self.ensure_video_surface() {
+            self.toast_error("Could not open the video view");
+            return;
+        }
+        self.video_open = true;
+        self.reload_current();
+    }
+
+    /// Make sure the software render surface exists, creating it once libmpv is up.
+    ///
+    /// The surface must be created *before* a video is loaded: `vo=libmpv` with no render
+    /// context makes mpv fall back to opening a window of its own. False when it cannot be
+    /// created, in which case the caller must play audio.
+    fn ensure_video_surface(&mut self) -> bool {
         if self.video.is_none()
             && let Some(player) = self.player.as_mut()
             && let Some(handle) = player.handle()
         {
             self.video = crate::video::Video::new(&handle, self.ctx.clone());
         }
-        self.video_open = self.video.is_some();
-        if self.video_open {
-            self.reload_current();
+        self.video.is_some()
+    }
+
+    /// Hand `track` to mpv in the mode the video view is in.
+    ///
+    /// The video view only ever plays a track that has a video: anything else closes it and
+    /// plays the song's audio, which is the one path `play_index_restore` and the toggle share.
+    /// Without this, every start but the toggle's own reload went to `Backend::play`, which sets
+    /// `vid=no` — the new song's audio played over the previous video's last frame.
+    fn start_track(
+        &mut self,
+        track: Track,
+        handle: Arc<libmpv2::Mpv>,
+        volume: f64,
+        start_at: Option<f64>,
+    ) -> u64 {
+        tracing::debug!(
+            video_open = self.video_open,
+            wide = track.wide,
+            id = %track.video_id,
+            ?start_at,
+            "starting track"
+        );
+        if plays_as_video(self.video_open, track.wide) && self.ensure_video_surface() {
+            self.play_is_video = true;
+            return self.backend.play_video(track, handle, volume, start_at);
         }
+        // An audio-only track cannot stay in the video view.
+        self.video_open = false;
+        self.play_is_video = false;
+        self.backend.play(
+            track,
+            handle,
+            volume,
+            self.settings.normalise_volume,
+            start_at,
+        )
     }
 
     /// Reload the current track in the mode the video toggle is now in, keeping the position.
@@ -2129,15 +2213,11 @@ impl App {
         // new one starts — which is why handing playback back restarted from zero. Same guard
         // `play_index_restore` uses: wait for the new file to actually report playing.
         self.playback_started = false;
-        self.play_generation = if self.video_open {
-            self.backend.play_video(track, handle, volume)
-        } else {
-            self.backend
-                .play(track, handle, volume, self.settings.normalise_volume)
-        };
-        if position > 1.0 {
-            self.resume = Some((index, position));
-        }
+        // The position rides the load itself (`start`), applied once every track — including a
+        // video's external audio — is open; a seek after the load moved only the video.
+        let start_at = (position > 1.0).then_some(position);
+        self.resume = start_at.map(|p| (index, p));
+        self.play_generation = self.start_track(track, handle, volume, start_at);
     }
 
     /// Pause or resume, or start the queue if nothing has played yet.
@@ -2749,8 +2829,7 @@ impl App {
     pub(crate) fn clear_suggestions(&mut self) {
         self.suggestions.clear();
         self.suggestions_for = None;
-        self.suggestion_cursor = 0;
-        self.suggestion_navigated = false;
+        self.suggestion_cursor = None;
     }
 
     /// Fire a submitted search. Returns how long until the next check is due, so the caller can
@@ -2785,7 +2864,7 @@ impl App {
         if self.query.trim().is_empty() {
             self.suggestions.clear();
             self.suggestions_for = None;
-            self.suggestion_cursor = 0;
+            self.suggestion_cursor = None;
             return None;
         }
         if !ctx.memory(|m| m.has_focus(crate::ui::topbar::search_id())) {
@@ -2892,7 +2971,7 @@ impl App {
                     if self.query == query {
                         self.suggestions = items;
                         self.suggestions_for = Some(query);
-                        self.suggestion_cursor = 0;
+                        self.suggestion_cursor = None;
                     }
                 }
                 Event::SuggestionsFailed { query, error } => {
@@ -3810,6 +3889,8 @@ impl App {
                         %error,
                         "playback failed"
                     );
+                    let was_video = self.play_is_video;
+                    self.play_is_video = false;
                     self.now = NowPlaying {
                         track: Some(track),
                         resolving: false,
@@ -3818,6 +3899,15 @@ impl App {
                         playlist_playing: self.now.playlist_playing.clone(),
                     };
                     self.playback_started = false;
+                    // The video path is the fragile one (yt-dlp, a direct stream); when it is
+                    // what failed, play the song's audio rather than leaving the view over a
+                    // frozen frame. `reload_current` picks the audio path now that the flag is
+                    // clear, and its own generation supersedes this failed attempt.
+                    if was_video {
+                        self.video_open = false;
+                        self.toast("Video failed — playing the song instead");
+                        self.reload_current();
+                    }
                 }
                 Event::PlaybackFailed { .. } => {}
             }
@@ -3898,11 +3988,18 @@ impl App {
             self.player_error = init_error;
             return;
         };
+        // A retry that worked clears the note an earlier failure put up.
+        self.player_error = None;
         self.current = Some(index);
         self.playback_started = false;
-        self.play_generation =
-            self.backend
-                .play(track, handle, volume, self.settings.normalise_volume);
+        // A restored queue — or a scrub before play — carries a position for this very track;
+        // it rides the load as a per-file `start`, and is consumed here so a later frame does
+        // not seek the newly opened file a second time.
+        let start_at = self.resume.filter(|(i, _)| *i == index).map(|(_, p)| p);
+        if start_at.is_some() {
+            self.resume = None;
+        }
+        self.play_generation = self.start_track(track, handle, volume, start_at);
     }
 
     /// Remember the track the transport is leaving, so `Previous` can rewind to it.
@@ -3941,7 +4038,14 @@ impl App {
             return;
         }
         if let Some(next) = self.current.and_then(|i| self.queue.get(i + 1)) {
-            self.backend.prefetch(next.clone());
+            // The video view will hand the next track to `play_video`, which needs the video
+            // resolver's URLs — an audio resolve would be thrown away. An audio-only track still
+            // gets the audio resolve, since that is what it will play.
+            if self.video_open && next.wide {
+                self.backend.prefetch_video(next.clone());
+            } else {
+                self.backend.prefetch(next.clone());
+            }
         }
     }
 
@@ -4050,10 +4154,15 @@ impl App {
         self.rng
     }
 
-    /// Go back: first within this queue, then to the queue that preceded it. Going back rewinds
-    /// the queue state itself — an autoplay tail added since is dropped, and a replaced queue is
-    /// restored — rather than only moving the cursor.
+    /// Go back: first within the track, then within this queue, then to the queue that preceded
+    /// it. A press while the track is underway restarts it (see [`previous_restarts`]); only a
+    /// press near its start steps back a track. Going back a track rewinds the queue state
+    /// itself — an autoplay tail added since is dropped, and a replaced queue is restored —
+    /// rather than only moving the cursor.
     pub(crate) fn previous(&mut self) {
+        if self.restart_current() {
+            return;
+        }
         match self.play_history.rewind() {
             Some(Rewind::WithinQueue { index, queue_len }) => {
                 self.queue.truncate(queue_len);
@@ -4082,6 +4191,43 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Restart the current track when Previous is pressed with it underway, returning whether it
+    /// did — the caller then leaves the queue alone. A track that has not loaded yet (a restored
+    /// session) has no mpv position, so its saved resume position stands in, exactly as
+    /// `publish_media` substitutes it.
+    fn restart_current(&mut self) -> bool {
+        let Some(current) = self.current else {
+            return false;
+        };
+        let position = if self.playback_started {
+            self.player
+                .as_ref()
+                .map(|p| p.state().position)
+                .unwrap_or(0.0)
+        } else {
+            self.resume
+                .filter(|(i, _)| Some(*i) == self.current)
+                .map(|(_, p)| p)
+                .unwrap_or(0.0)
+        };
+        if !previous_restarts(position) {
+            return false;
+        }
+        if self.playback_started && !self.play_is_video {
+            if let Some(player) = self.player.as_ref() {
+                player.seek(0.0);
+            }
+        } else {
+            // A video carries its audio as a separately attached stream, and a post-load seek
+            // moves only the video (see `player::set_start`), so restarting one means loading it
+            // again from the top. A restored, not-yet-loaded track is the same: it has to load,
+            // and starting over makes its saved position wrong.
+            self.resume = None;
+            self.play_index_restore(current);
+        }
+        true
     }
 
     /// Open or close the lyrics panel. Independent of the queue, which shares the same panel.
@@ -6062,6 +6208,17 @@ mod tests {
         );
     }
 
+    /// Previous restarts the track once it is underway, and only steps back within the first
+    /// few seconds — so pressing it repeatedly walks backwards from the start.
+    #[test]
+    fn previous_restarts_the_track_once_it_is_underway() {
+        assert!(!previous_restarts(0.0));
+        assert!(!previous_restarts(1.0), "the first second still steps back");
+        assert!(!previous_restarts(1.999));
+        assert!(previous_restarts(2.0));
+        assert!(previous_restarts(10.0));
+    }
+
     /// A forward move is remembered and `Previous` steps back to it, newest first; when nothing
     /// is left the history reports nothing so the caller can fall back to a positional step.
     #[test]
@@ -6247,6 +6404,16 @@ mod tests {
         assert!(!history_needs_load(false, false, false, 0, 1));
         // The next visit.
         assert!(history_needs_load(true, false, false, 1, 2));
+    }
+
+    /// The video view is only for tracks that have a video: a song without one hands the view
+    /// back and plays as audio, and a closed view never opens itself for a wide track.
+    #[test]
+    fn only_a_wide_track_plays_as_video() {
+        assert!(plays_as_video(true, true));
+        assert!(!plays_as_video(true, false));
+        assert!(!plays_as_video(false, true));
+        assert!(!plays_as_video(false, false));
     }
 
     /// Start Mix on the song playing now: the mix's queue opens with that song, so a guard that

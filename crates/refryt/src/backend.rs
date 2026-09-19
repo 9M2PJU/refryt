@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use libmpv2::Mpv;
-use refryt_resolve::{ChainResolver, StreamCache, StreamResolver, VideoId, YtDlpResolver};
+use refryt_resolve::{
+    ChainResolver, StreamCache, StreamResolver, VideoId, VideoResolver, VideoStreamCache,
+    YtDlpResolver,
+};
 use tracing::{debug, info, warn};
 
 use crate::api::Api;
@@ -657,6 +660,10 @@ pub struct Backend {
     http: reqwest::Client,
     api: Arc<Api>,
     resolver: Arc<StreamCache<ChainResolver>>,
+    /// The video view's own resolver and cache. `yt-dlp` is the only path that can produce a
+    /// video URL, so this is not a chain — and it is a separate cache because the video URL for
+    /// an id is a different answer from the audio one, which the queue may be playing.
+    video_resolver: Arc<VideoStreamCache<YtDlpResolver>>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
     ctx: egui::Context,
@@ -687,6 +694,11 @@ impl Backend {
         let resolver = StreamCache::new(ChainResolver::default_order(
             YtDlpResolver::new().with_program(yt_dlp_program()),
         ));
+        let video_resolver = VideoStreamCache::new(
+            YtDlpResolver::new()
+                .with_program(yt_dlp_program())
+                .with_format(refryt_resolve::VIDEO_FORMAT),
+        );
 
         Ok(Self {
             rt,
@@ -696,6 +708,7 @@ impl Backend {
                 .map_err(|e| anyhow::anyhow!("could not build the image client: {e}"))?,
             api,
             resolver: Arc::new(resolver),
+            video_resolver: Arc::new(video_resolver),
             tx,
             rx,
             ctx,
@@ -1773,7 +1786,14 @@ impl Backend {
 
     /// Returns the generation this attempt was started under — see `App::play_generation`'s own
     /// doc comment for why the caller needs it.
-    pub fn play(&self, track: Track, mpv: Arc<Mpv>, volume: f64, normalise: bool) -> u64 {
+    pub fn play(
+        &self,
+        track: Track,
+        mpv: Arc<Mpv>,
+        volume: f64,
+        normalise: bool,
+        start_at: Option<f64>,
+    ) -> u64 {
         let downloads = Arc::clone(&self.downloads);
         let (resolver, api, tx, ctx) = (
             Arc::clone(&self.resolver),
@@ -1808,15 +1828,21 @@ impl Backend {
                 .and_then(|guard| guard.get(&track.video_id).cloned())
                 .filter(|path| path.is_file());
             if let Some(path) = downloaded {
-                let event =
-                    match player::load(&mpv, &path.to_string_lossy(), volume, None, normalise) {
-                        Ok(()) => Event::Playing(track, generation),
-                        Err(e) => Event::PlaybackFailed {
-                            track,
-                            error: format!("{e:#}"),
-                            generation,
-                        },
-                    };
+                let event = match player::load(
+                    &mpv,
+                    &path.to_string_lossy(),
+                    volume,
+                    None,
+                    normalise,
+                    start_at,
+                ) {
+                    Ok(()) => Event::Playing(track, generation),
+                    Err(e) => Event::PlaybackFailed {
+                        track,
+                        error: format!("{e:#}"),
+                        generation,
+                    },
+                };
                 if let Event::Playing(ref track, _) = event {
                     scrobble.maybe_start(track.clone(), Arc::clone(&mpv), generation);
                 }
@@ -1827,15 +1853,21 @@ impl Backend {
             // filesystem path exactly as it takes a URL, and there is nothing to scrobble
             // (YouTube's watch-history endpoint has no idea what this path is).
             if let Some(path) = track.local_path.clone() {
-                let event =
-                    match player::load(&mpv, &path.to_string_lossy(), volume, None, normalise) {
-                        Ok(()) => Event::Playing(track, generation),
-                        Err(e) => Event::PlaybackFailed {
-                            track,
-                            error: format!("{e:#}"),
-                            generation,
-                        },
-                    };
+                let event = match player::load(
+                    &mpv,
+                    &path.to_string_lossy(),
+                    volume,
+                    None,
+                    normalise,
+                    start_at,
+                ) {
+                    Ok(()) => Event::Playing(track, generation),
+                    Err(e) => Event::PlaybackFailed {
+                        track,
+                        error: format!("{e:#}"),
+                        generation,
+                    },
+                };
                 Self::emit(&tx, &ctx, event);
                 return;
             }
@@ -1877,6 +1909,7 @@ impl Backend {
                         volume,
                         stream.loudness_db,
                         normalise,
+                        start_at,
                     ) {
                         Ok(()) => Event::Playing(track, generation),
                         Err(e) => Event::PlaybackFailed {
@@ -1909,12 +1942,57 @@ impl Backend {
     /// Shares `play`'s generation counter — it races the exact same "what should mpv have loaded
     /// last" question `Event::Playing`'s staleness guard exists for (the video toggle can fire a
     /// `play_video` right as a new track's own `play` is still resolving).
-    pub fn play_video(&self, track: Track, mpv: Arc<Mpv>, volume: f64) -> u64 {
+    pub fn play_video(
+        &self,
+        track: Track,
+        mpv: Arc<Mpv>,
+        volume: f64,
+        start_at: Option<f64>,
+    ) -> u64 {
         let generation = self.scrobble_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let resolver = Arc::clone(&self.video_resolver);
+        let scrobble = Scrobble {
+            api: Arc::clone(&self.api),
+            http: self.http.clone(),
+            generation: Arc::clone(&self.scrobble_generation),
+        };
+        // The video path spends seconds inside yt-dlp before a frame exists; `Resolving` is
+        // what tells the bar (and the video view's placeholder) to say so instead of looking
+        // stuck on the previous track.
+        Self::emit(&tx, &ctx, Event::Resolving(track.clone(), generation));
         self.rt.spawn(async move {
-            let url = crate::model::track_url(&track.video_id);
-            let event = match player::load_video(&mpv, &url, volume) {
+            // The cached direct URLs first — prefetched for the next track, or resolved earlier
+            // in the session. mpv's yt-dlp hook stays the fallback: it re-extracts on every
+            // load, which is exactly the seconds this path exists to avoid.
+            let direct = match VideoId::new(track.video_id.clone()) {
+                Ok(id) => resolver.resolve_video(&id).await,
+                Err(e) => Err(e),
+            };
+            let load = match &direct {
+                Ok(stream) => player::load_video(
+                    &mpv,
+                    stream.video.as_str(),
+                    stream.audio.as_ref().map(|a| a.as_str()),
+                    volume,
+                    start_at,
+                ),
+                Err(e) => {
+                    warn!(
+                        video_id = %track.video_id,
+                        error = %format!("{e:#}"),
+                        "video resolve failed; falling back to mpv's yt-dlp hook"
+                    );
+                    player::load_video(
+                        &mpv,
+                        &crate::model::track_url(&track.video_id),
+                        None,
+                        volume,
+                        start_at,
+                    )
+                }
+            };
+            let event = match load {
                 Ok(()) => Event::Playing(track, generation),
                 Err(e) => Event::PlaybackFailed {
                     track,
@@ -1922,9 +2000,25 @@ impl Backend {
                     generation,
                 },
             };
+            // A music video is a real YouTube play like any other; the tracker reads mpv's own
+            // position, which is the same handle the video runs on.
+            if let Event::Playing(ref track, _) = event {
+                scrobble.maybe_start(track.clone(), Arc::clone(&mpv), generation);
+            }
             Self::emit(&tx, &ctx, event);
         });
         generation
+    }
+
+    /// Warm the video resolver's cache for a track the queue is about to reach, so Next in the
+    /// video view starts on the cached URLs instead of paying yt-dlp at that moment.
+    pub fn prefetch_video(&self, track: Track) {
+        let resolver = Arc::clone(&self.video_resolver);
+        self.rt.spawn(async move {
+            if let Ok(id) = VideoId::new(track.video_id) {
+                let _ = resolver.resolve_video(&id).await;
+            }
+        });
     }
 
     /// Resolve a track without playing it, so the URL is cached before it is needed.

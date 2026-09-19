@@ -1,14 +1,16 @@
 //! The music-video view: a black content card with the software-rendered frame.
 //!
-//! The frame is letterboxed by mpv to the buffer's aspect, so the buffer is sized to the card and
-//! the texture is drawn straight into it.
+//! The frame is rendered at the video's own size — the software renderer scales on the CPU,
+//! single-threaded, so letting the GPU fit it into the card is the cheap direction — and
+//! centred inside the card with its own aspect.
 
 use crate::app::App;
+use crate::player::Player;
 use crate::theme;
 
-/// The widest buffer drawn, in physical pixels. Software video is CPU-bound, and the card is
-/// rarely larger than this on any realistic window.
-const MAX_WIDTH_PX: f32 = 1280.0;
+/// The longest side of the frame buffer, in physical pixels. The 720p selector already meets
+/// it; this bounds anything unusual that slips through.
+const MAX_PX: f32 = 1280.0;
 
 pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     let rect = ui.available_rect_before_wrap();
@@ -18,20 +20,141 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         egui::Color32::BLACK,
     );
 
-    let Some(surface) = app.video.as_mut() else {
-        return;
-    };
+    // The track's wide still: the placeholder while the video resolves, and the backdrop if no
+    // frame ever arrives. Cloned out of the cache so the surface below can borrow `app`.
+    let url = app.now.track.as_ref().and_then(|t| t.thumbnail.clone());
+    let still = super::art_texture_wide(
+        &mut app.images,
+        &app.backend,
+        ui.ctx(),
+        url.as_ref(),
+        rect.width(),
+    )
+    .cloned();
+
+    // Read the size before borrowing the surface: the video's own when one is loaded, the
+    // card's otherwise (mpv letterboxes into it until the first frame reports a size).
+    let native = app.player.as_ref().and_then(Player::video_size);
     let ppp = ui.ctx().pixels_per_point();
-    let width = (rect.width() * ppp).clamp(2.0, MAX_WIDTH_PX);
-    let height = (width * (rect.height() / rect.width().max(1.0))).clamp(2.0, MAX_WIDTH_PX);
-    let Some(texture) = surface.frame(ui, (width.round() as usize, height.round() as usize)) else {
-        return;
+    let size = match native {
+        Some((w, h)) => capped(w, h),
+        None => {
+            let width = (rect.width() * ppp).clamp(2.0, MAX_PX);
+            let height = (width * (rect.height() / rect.width().max(1.0))).clamp(2.0, MAX_PX);
+            (width.round() as usize, height.round() as usize)
+        }
     };
 
-    ui.painter().image(
-        texture.id(),
-        rect.shrink(6.0),
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
+    let frame = app
+        .video
+        .as_mut()
+        .and_then(|surface| surface.frame(ui, size));
+    // While the next video resolves, the previous frame is still in the texture; the still of
+    // the track that is actually loading is the honest thing to show.
+    let painted = if app.now.resolving {
+        still.or(frame)
+    } else {
+        frame.or(still)
+    };
+    if let Some(texture) = painted {
+        let fitted = fit_rect(rect.shrink(6.0), texture.size_vec2());
+        ui.painter().image(
+            texture.id(),
+            fitted,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
+    if app.now.resolving {
+        loading_caption(app, ui, rect);
+    }
+
+    // The surface is a transport control, like the player bar's play button: click to pause,
+    // double-click for fullscreen, Escape back out of it.
+    let response = ui.interact(rect, ui.id().with("video-surface"), egui::Sense::click());
+    let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+    if response.double_clicked() {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+    } else if response.clicked() {
+        app.toggle_playback();
+    } else if fullscreen && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    }
+}
+
+/// A quiet caption while the video is being fetched, low in the card so the still stays readable.
+fn loading_caption(app: &App, ui: &egui::Ui, rect: egui::Rect) {
+    let galley = ui.painter().layout_no_wrap(
+        "Loading video…".to_owned(),
+        theme::regular(12.0),
+        app.palette.dim,
     );
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.bottom() - 20.0 - galley.size().y,
+    );
+    ui.painter().galley(pos, galley, app.palette.dim);
+}
+
+/// Scale a video size down so neither side exceeds [`MAX_PX`], keeping its aspect.
+fn capped(w: usize, h: usize) -> (usize, usize) {
+    let longest = w.max(h) as f32;
+    if longest <= MAX_PX {
+        return (w, h);
+    }
+    let scale = MAX_PX / longest;
+    (
+        ((w as f32 * scale).round() as usize).max(2),
+        ((h as f32 * scale).round() as usize).max(2),
+    )
+}
+
+/// The largest rect with `texture`'s aspect that fits inside `card`, centred.
+fn fit_rect(card: egui::Rect, texture: egui::Vec2) -> egui::Rect {
+    if texture.x <= 0.0 || texture.y <= 0.0 {
+        return card;
+    }
+    let scale = (card.width() / texture.x).min(card.height() / texture.y);
+    egui::Rect::from_center_size(card.center(), texture * scale)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A landscape video fills the card's width and letterboxes; a portrait one fills its
+    /// height. Either way the aspect is the video's, never the card's.
+    #[test]
+    fn the_frame_keeps_its_aspect_inside_the_card() {
+        let card = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+
+        let landscape = fit_rect(card, egui::vec2(1280.0, 720.0));
+        assert_eq!(landscape.width(), 800.0);
+        assert_eq!(landscape.height(), 450.0);
+        assert_eq!(landscape.center(), card.center());
+
+        let portrait = fit_rect(card, egui::vec2(720.0, 1280.0));
+        assert_eq!(portrait.height(), 600.0);
+        assert!(portrait.width() < 400.0);
+        assert_eq!(portrait.center(), card.center());
+    }
+
+    #[test]
+    fn a_frame_with_no_size_falls_back_to_the_card() {
+        let card = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        assert_eq!(fit_rect(card, egui::Vec2::ZERO), card);
+    }
+
+    /// The render buffer never exceeds the cap on either side, whichever way the video is.
+    #[test]
+    fn the_frame_buffer_is_capped_on_its_longest_side() {
+        assert_eq!(capped(1920, 1080), (1280, 720));
+        assert_eq!(capped(2560, 1440), (1280, 720));
+        // Already within the cap: untouched, portrait or not.
+        assert_eq!(capped(640, 360), (640, 360));
+        assert_eq!(capped(720, 1280), (720, 1280));
+    }
 }
