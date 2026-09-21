@@ -675,6 +675,15 @@ pub struct Backend {
     downloads: Arc<std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>>,
 }
 
+impl Drop for Backend {
+    /// One line for the exit log: dropping the runtime waits for whatever is still in flight,
+    /// so a quit that drags needs to show whether this is where it drags. The `App` drop order
+    /// runs this before the player's, so a missing `player: dropping` line names this one.
+    fn drop(&mut self) {
+        tracing::info!("backend: dropping");
+    }
+}
+
 impl Backend {
     pub fn new(ctx: egui::Context) -> anyhow::Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()

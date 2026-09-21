@@ -15,6 +15,15 @@ pub struct Media {
     events: Arc<Mutex<Vec<playwire::Event>>>,
 }
 
+impl Drop for Media {
+    /// One line for the exit log, like `Backend`'s and `Player`'s: the OS media service's
+    /// handle is torn down here, and if a quit drags with this as the last line, that teardown
+    /// is the one to bound.
+    fn drop(&mut self) {
+        tracing::info!("media: dropping");
+    }
+}
+
 impl Media {
     /// Register with the platform's media service. `None` when none is available — no session
     /// bus, an unsupported platform, or a name already claimed — which is not an error: the app

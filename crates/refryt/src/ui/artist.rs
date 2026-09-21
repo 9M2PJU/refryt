@@ -590,7 +590,7 @@ fn top_songs(app: &mut App, ui: &mut egui::Ui) {
     match clicked.click {
         Some(ListClick::Row(i)) => {
             if let Some(songs) = app.artist.as_ref().map(|a| a.top_songs.clone()) {
-                app.start_from(songs, i);
+                app.play_row(songs, i);
             }
         }
         Some(ListClick::Link(route)) => app.navigate(route),

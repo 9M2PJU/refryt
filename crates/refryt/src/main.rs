@@ -84,6 +84,23 @@ fn main() -> eframe::Result {
     // Autoplay off for one run, without touching `settings.json`: the switch is in Settings, and
     // the A/B of a queue with and without its tail should not need a click to set up.
     let no_autoplay = args.iter().any(|a| a == "--no-autoplay");
+    // Drive the tray without a mouse: hide after N seconds, show three seconds later, quit three
+    // seconds after that — each injected through the same queue-and-wake path a real tray click
+    // takes. A test aid, like `autoscroll`: a tray icon cannot be clicked from outside the
+    // process, and this is what makes quit latency measurable from a script.
+    let tray_test = args
+        .iter()
+        .position(|a| a == "--tray-test")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(std::time::Duration::from_secs_f64);
+    // Passed by the autostart entry (`autostart::ARG`): login launched this, so once the window
+    // is up it should ask the compositor to bring it forward — Wayland starts it behind whatever
+    // window already has focus, and nothing can raise a window that has not asked.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let autostart = args.iter().any(|a| a == refryt::autostart::ARG);
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let autostart = false;
 
     // The child half of the in-app sign-in window: `webview_login::capture` starts this same
     // binary with `--sign-in-window <file>`, because tao's event loop cannot be created beside
@@ -99,6 +116,24 @@ fn main() -> eframe::Result {
                 std::process::exit(1);
             }
         };
+    }
+
+    // One instance per profile: a plain second launch — the desktop entry, the AppImage file —
+    // tells the running instance to show its window and exits instead of starting a second
+    // player. A launch with any other argument is scripted (`--page`, `--search`, a test aid),
+    // which is not a user clicking the app again, so it runs unguarded. See `instance`'s own
+    // module doc.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        let plain = args.iter().skip(1).all(|a| a == refryt::autostart::ARG);
+        if plain
+            && matches!(
+                refryt::instance::claim(),
+                refryt::instance::Claim::Secondary
+            )
+        {
+            return Ok(());
+        }
     }
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -129,7 +164,7 @@ fn main() -> eframe::Result {
         }
     }
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "refryt",
         eframe::NativeOptions {
             viewport,
@@ -154,6 +189,8 @@ fn main() -> eframe::Result {
                         opacity,
                         no_blur,
                         no_autoplay,
+                        tray_test,
+                        autostart,
                     },
                 )
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -161,5 +198,10 @@ fn main() -> eframe::Result {
                 })?,
             ))
         }),
-    )
+    );
+    // The app itself was dropped inside `run_native` (eframe destroys it on `LoopExiting`), so
+    // this line is the log's proof that teardown finished: a slow quit that never reaches it is
+    // stuck in one of the drops `App::drop` starts.
+    tracing::info!("event loop exited");
+    result
 }

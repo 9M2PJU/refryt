@@ -28,6 +28,9 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         now_playing(app, ui);
         section(app, ui, 8.0, "Next up");
         let signed_in = app.signed_in();
+        // Where the algorithm's tracks begin, for the "Radio" tail those rows carry. Computed
+        // before the destructure below, which borrows `app`'s fields.
+        let radio_tail = app.radio.as_ref().and_then(|r| r.tail_start(&app.queue));
         let clicked = {
             let App {
                 palette,
@@ -59,7 +62,13 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                         album_id: t.album_id.as_deref(),
                         subtitle,
                         duration: t.duration,
-                        plays: t.plays.as_deref(),
+                        // The subtitle's tail slot: the algorithm's tracks read "Radio" where
+                        // the listener's own keep their play count.
+                        plays: if radio_tail.is_some_and(|tail| start + i >= tail) {
+                            Some("Radio")
+                        } else {
+                            t.plays.as_deref()
+                        },
                         explicit: t.explicit,
                         active: is_active(now, &t.video_id),
                         playing: is_active(now, &t.video_id) && !now.paused,

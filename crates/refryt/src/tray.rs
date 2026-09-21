@@ -11,14 +11,22 @@
 //! on — not once per toggle. `gtk::main()` never returns (nothing here ever calls
 //! `gtk_main_quit`), so an earlier version that called `spawn` again on every toggle leaked a
 //! thread, a GTK loop and a duplicate tray icon each time the setting was flipped off and back
-//! on. [`Tray::set_visible`] is the fix: it show or hides the one icon that was ever built,
+//! on. [`Tray::set_visible`] is the fix: it shows or hides the one icon that was ever built,
 //! over a channel into the GTK thread, so the thread and its `TrayIcon` live for the rest of
 //! the run regardless of how many times the setting changes.
 //!
-//! However it was built, `TrayIconEvent`/`MenuEvent` arrive through the crate's own global
-//! channels rather than anything this module hands back, so reading them from the main thread
-//! via [`poll`] costs nothing and needs no cross-thread plumbing: it is drained once a frame
-//! from [`crate::app::App::ui`], the same way `Backend`'s own event channel already is.
+//! `TrayIconEvent`/`MenuEvent` arrive on whichever thread the crate's backend runs on — the GTK
+//! thread on Linux, the icon's own message pump on Windows — never the render thread, and the
+//! crate's own channels do not wake winit. So [`spawn`] installs the crate's process-wide event
+//! handlers instead of leaving the events to be polled: each handler queues a [`TrayAction`]
+//! and calls `egui::Context::request_repaint`. The repaint is the half that matters: an idle
+//! window schedules no frames of its own, so without it a tray click sat in the queue until
+//! something unrelated happened to paint — which is what made Quit take as long as it took for
+//! that something to arrive. [`poll`] drains the queue once a frame, the same way `Backend`'s
+//! own event channel already is.
+
+use std::collections::VecDeque;
+use std::sync::Mutex;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -26,10 +34,102 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 const SHOW_HIDE_ID: &str = "ytm-tray-show-hide";
 const QUIT_ID: &str = "ytm-tray-quit";
 
-/// What choosing a tray menu item means for the app.
+/// What choosing a tray menu item — or clicking the icon itself — means for the app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayAction {
+    /// Flip the window between hidden and shown.
     ToggleVisible,
+    /// Unhide the window and focus it. A double-click's meaning; it never hides.
+    Show,
     Quit,
+}
+
+/// Actions queued by the crate's event handlers, drained by [`poll`].
+///
+/// The handlers run on the tray backend's thread, never the render thread, so the handoff is a
+/// plain queue; the `request_repaint` in [`inject`] is what makes the render thread look at it.
+static ACTIONS: Mutex<VecDeque<TrayAction>> = Mutex::new(VecDeque::new());
+
+/// Hand `action` to the render thread: queue it, then wake the UI.
+///
+/// `pub(crate)` for the `--tray-test` diagnostic, which has to reach the same queue a real
+/// click does — there is no way to click a tray icon from outside the process.
+pub(crate) fn inject(ctx: &egui::Context, action: TrayAction) {
+    if let Ok(mut queue) = ACTIONS.lock() {
+        queue.push_back(action);
+    }
+    ctx.request_repaint();
+}
+
+/// Install the process-wide handlers that turn the crate's events into [`TrayAction`]s.
+///
+/// Called from [`spawn`], which runs at most once per process: the crate's handlers are
+/// first-set-only, so a second call would silently keep the first closure — and with it the
+/// first `egui::Context` — anyway.
+fn install_handlers(ctx: &egui::Context) {
+    let menu_ctx = ctx.clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if let Some(action) = menu_action(event.id.0.as_str()) {
+            inject(&menu_ctx, action);
+        }
+    }));
+    let icon_ctx = ctx.clone();
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        if let Some(action) = icon_action(&event) {
+            inject(&icon_ctx, action);
+        }
+    }));
+}
+
+/// What a menu id means, if it is one of ours.
+fn menu_action(id: &str) -> Option<TrayAction> {
+    match id {
+        SHOW_HIDE_ID => Some(TrayAction::ToggleVisible),
+        QUIT_ID => Some(TrayAction::Quit),
+        _ => None,
+    }
+}
+
+/// What a click on the icon itself means, if anything.
+///
+/// A left release toggles the window on Linux, where a status-notifier host may offer no other
+/// interaction at all. On Windows it means nothing: a left click there is the first half of a
+/// double-click — the crate emits `Click(Up)`, then `DoubleClick`, then a second `Click(Up)` —
+/// so a toggle on the first release would fight the double-click's own show (hide, show, hide).
+///
+/// `DoubleClick` shows the window on every platform that reports one. `Click` also fires on
+/// press and for a right-click; only the release of the left button is considered — a
+/// status-notifier host already turns a right-click into the context menu on its own, and
+/// reacting to it here as well would toggle the window at the same time.
+fn icon_action(event: &TrayIconEvent) -> Option<TrayAction> {
+    match event {
+        TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } => Some(TrayAction::Show),
+        TrayIconEvent::Click {
+            button,
+            button_state,
+            ..
+        } => click_action(*button, *button_state),
+        _ => None,
+    }
+}
+
+/// [`icon_action`]'s click rule on plain values, so each platform's answer is a unit test
+/// rather than something only checkable by clicking a tray icon.
+fn click_action(button: MouseButton, state: MouseButtonState) -> Option<TrayAction> {
+    if button != MouseButton::Left || state != MouseButtonState::Up {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(TrayAction::ToggleVisible)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// The icon, decoded once per call from the same PNG [`crate::window_icon`] uses for the
@@ -77,7 +177,10 @@ impl Tray {
 /// Build the tray icon. Call once, the first time "Hide tray on close" is turned on — not on
 /// every toggle after that, which is exactly the mistake this module's doc comment describes;
 /// use [`Tray::set_visible`] for every toggle from then on.
-pub fn spawn() -> Tray {
+pub fn spawn(ctx: &egui::Context) -> Tray {
+    // Installed even if the icon itself never gets built: the handlers are what wake the UI,
+    // and they are harmless with no icon to click.
+    install_handlers(ctx);
     #[cfg(target_os = "linux")]
     {
         // Rendezvous with the GTK thread once, to hand back the channel that will control it
@@ -132,9 +235,10 @@ pub fn spawn() -> Tray {
     #[cfg(not(target_os = "linux"))]
     {
         let icon = icon().and_then(|icon| {
-            // Windows opens the context menu on left-click by default; left as-is, one click
-            // would both open the menu and toggle the window (`poll` reads the left release as
-            // show/hide). Right-click still opens the menu, the Windows convention.
+            // Windows opens the context menu on left-click by default; left as-is, the menu
+            // would open on the first click of a double-click, which now means "show". Right
+            // click still opens the menu, the Windows convention, and a single left click does
+            // nothing — see `click_action`.
             #[cfg(target_os = "windows")]
             let builder = TrayIconBuilder::new()
                 .with_menu(Box::new(menu()))
@@ -155,27 +259,72 @@ pub fn spawn() -> Tray {
     }
 }
 
-/// Drain one tray/menu event, if any arrived since the last call.
+/// Drain one tray action, if any arrived since the last call.
 pub fn poll() -> Option<TrayAction> {
-    if let Ok(event) = MenuEvent::receiver().try_recv() {
-        return match event.id.0.as_str() {
-            SHOW_HIDE_ID => Some(TrayAction::ToggleVisible),
-            QUIT_ID => Some(TrayAction::Quit),
-            _ => None,
-        };
+    ACTIONS.lock().ok()?.pop_front()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_ids_map_to_their_actions() {
+        assert_eq!(menu_action(SHOW_HIDE_ID), Some(TrayAction::ToggleVisible));
+        assert_eq!(menu_action(QUIT_ID), Some(TrayAction::Quit));
+        assert_eq!(menu_action("some-other-item"), None);
     }
-    // A left-click on the icon itself (no menu involved) toggles the window too — the ordinary
-    // convention, and the only interaction some Linux status-notifier hosts offer at all. Only
-    // the release, and only the left button: `Click` also fires on press, and fires for a
-    // right-click too — which a status-notifier host already turns into opening the context
-    // menu on its own, so reacting to it here as well would toggle the window at the same time.
-    if let Ok(TrayIconEvent::Click {
-        button: MouseButton::Left,
-        button_state: MouseButtonState::Up,
-        ..
-    }) = TrayIconEvent::receiver().try_recv()
-    {
-        return Some(TrayAction::ToggleVisible);
+
+    #[test]
+    fn only_the_left_release_is_a_click() {
+        assert_eq!(click_action(MouseButton::Right, MouseButtonState::Up), None);
+        assert_eq!(
+            click_action(MouseButton::Middle, MouseButtonState::Up),
+            None
+        );
+        assert_eq!(
+            click_action(MouseButton::Left, MouseButtonState::Down),
+            None
+        );
     }
-    None
+
+    /// On Linux the left click is the only interaction some status-notifier hosts offer, so it
+    /// keeps toggling the window.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_left_release_toggles_on_linux() {
+        assert_eq!(
+            click_action(MouseButton::Left, MouseButtonState::Up),
+            Some(TrayAction::ToggleVisible)
+        );
+    }
+
+    /// On Windows a left release is the first half of a double-click, whose own action is the
+    /// show — see `icon_action`.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_left_release_means_nothing_where_double_click_shows() {
+        assert_eq!(click_action(MouseButton::Left, MouseButtonState::Up), None);
+    }
+
+    fn double_click(button: MouseButton) -> TrayIconEvent {
+        TrayIconEvent::DoubleClick {
+            id: tray_icon::TrayIconId::new("test"),
+            position: tray_icon::Rect::default().position,
+            rect: tray_icon::Rect::default(),
+            button,
+        }
+    }
+
+    /// The gesture this module's Windows rule exists for: a left double-click shows the window,
+    /// and a right one — the context menu's own double-click, if a host sends one — does not.
+    #[test]
+    fn a_left_double_click_shows_the_window() {
+        assert_eq!(
+            icon_action(&double_click(MouseButton::Left)),
+            Some(TrayAction::Show)
+        );
+        assert_eq!(icon_action(&double_click(MouseButton::Right)), None);
+        assert_eq!(icon_action(&double_click(MouseButton::Middle)), None);
+    }
 }

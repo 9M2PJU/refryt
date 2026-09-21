@@ -57,13 +57,13 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         frame.or(still)
     };
     if let Some(texture) = painted {
-        let fitted = fit_rect(rect.shrink(6.0), texture.size_vec2());
-        ui.painter().image(
-            texture.id(),
-            fitted,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+        let fitted = fit_rect(rect, texture.size_vec2());
+        egui::Image::from_texture(&texture)
+            .fit_to_exact_size(fitted.size())
+            // Rounded like the card, letterboxed or not: the black behind shows through the
+            // cut corners, so the video reads as a rounded card rather than a square slab.
+            .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
+            .paint_at(ui, fitted);
     }
 
     if app.now.resolving {

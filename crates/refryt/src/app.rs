@@ -86,6 +86,20 @@ const MAX_PLAYED_PREFIX: usize = 200;
 /// an unresponsive window — up indefinitely.
 const SPLASH_MAX: Duration = Duration::from_secs(10);
 
+/// How many times an attempt that never produced audio is reloaded before it is called a failure.
+const MAX_STALL_RETRIES: u32 = 3;
+/// The wait before each reload, indexed by the retry it precedes. An audio device can take a
+/// moment to come up after login, and reloading every frame would burn the cap before it does.
+const STALL_BACKOFF: [Duration; MAX_STALL_RETRIES as usize] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+/// How far past its own start position an attempt must get before it counts as playing. mpv
+/// reports the `start` seek target as the position, so a resumed track that never advanced would
+/// otherwise look exactly like one that played.
+const PLAYED_EPSILON: f64 = 0.25;
+
 /// A step back within the current queue: where the transport was, and how long the queue was.
 /// Restoring truncates any autoplay tail appended after that point.
 struct PlayPoint {
@@ -118,6 +132,117 @@ enum Rewind {
 /// start does it step back. Pure so the rule is testable without a player.
 fn previous_restarts(position: f64) -> bool {
     position >= PREVIOUS_RESTART_AFTER.as_secs_f64()
+}
+
+/// Which mix row is the seed, when the mix should be adopted under the song already playing
+/// rather than started from the top: the seed must be the loaded track, playback must have
+/// actually started, and the mix must carry the seed itself. Pure so the rule is testable.
+fn mix_seed_index(
+    playback_started: bool,
+    now_id: Option<&str>,
+    seed: &str,
+    tracks: &[Track],
+) -> Option<usize> {
+    if !playback_started || now_id != Some(seed) {
+        return None;
+    }
+    tracks.iter().position(|t| t.video_id == seed)
+}
+
+/// What an idle transition means for the attempt that just ended.
+#[derive(Debug, PartialEq)]
+enum IdleEnd {
+    /// The track played and finished (or was stopped): behave as before.
+    Ended,
+    /// Nothing was ever heard: reload the track once the delay has passed.
+    Retry(Duration),
+    /// The retries are used up: surface the failure and leave the queue alone.
+    GiveUp,
+}
+
+/// Tells "the track ended" apart from "the attempt never played" across mpv's idle transition.
+///
+/// `playback_started` is set when mpv accepts the load, so a device that never opened still ends
+/// up idle, and the queue-advance check reads that as a finished track. The retry count belongs
+/// to a *track*, not an attempt: `Event::Playing` fires again on every reload, so resetting it
+/// there would make the cap unreachable.
+#[derive(Default)]
+struct StallGuard {
+    /// Set once a frame saw this attempt at a position past its start.
+    played_any: bool,
+    /// Retries used for the current track.
+    retries: u32,
+    /// When the next reload is due; `None` when none is pending.
+    retry_at: Option<Instant>,
+    /// The track the retries belong to.
+    track: Option<String>,
+    /// The attempt's own start position, for judging progress and resuming a reload.
+    start_at: Option<f64>,
+}
+
+impl StallGuard {
+    /// A load is being issued for `video_id`, resuming at `start_at`. A different track starts
+    /// fresh; the same track keeps its retries, since this is one of our own reloads.
+    fn on_load(&mut self, video_id: &str, start_at: Option<f64>) {
+        self.played_any = false;
+        self.retry_at = None;
+        if self.track.as_deref() != Some(video_id) {
+            self.track = Some(video_id.to_owned());
+            self.retries = 0;
+        }
+        self.start_at = start_at;
+    }
+
+    /// A frame's position while the attempt is loaded.
+    fn observe(&mut self, position: f64) {
+        if position > self.start_at.unwrap_or(0.0) + PLAYED_EPSILON {
+            self.played_any = true;
+        }
+    }
+
+    /// mpv went idle: did the track end, or did the attempt never play?
+    fn on_idle(&mut self, now: Instant) -> IdleEnd {
+        if self.played_any {
+            self.reset();
+            return IdleEnd::Ended;
+        }
+        if self.retries < MAX_STALL_RETRIES {
+            let delay = STALL_BACKOFF[self.retries as usize];
+            self.retries += 1;
+            self.retry_at = Some(now + delay);
+            return IdleEnd::Retry(delay);
+        }
+        self.reset();
+        IdleEnd::GiveUp
+    }
+
+    /// Take a pending reload once its backoff has passed. False before then, or when none waits.
+    fn take_due(&mut self, now: Instant) -> bool {
+        match self.retry_at {
+            Some(at) if now >= at => {
+                self.retry_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// When the pending reload is due, so the app can ask for a frame at that time. An idle app
+    /// paints nothing, and the reload would otherwise never be reached.
+    fn pending_at(&self) -> Option<Instant> {
+        self.retry_at
+    }
+
+    /// The attempt's start position, so a reload resumes where the first try did.
+    fn start_position(&self) -> Option<f64> {
+        self.start_at
+    }
+
+    fn reset(&mut self) {
+        self.played_any = false;
+        self.retries = 0;
+        self.retry_at = None;
+    }
 }
 
 /// The next index in a queue when not shuffling: the following track, wrapping to the start only
@@ -541,6 +666,16 @@ pub struct Options {
     /// `scheme`: the switch lives in Settings, and a comparison run needs the off state without
     /// clicking through to it.
     pub no_autoplay: bool,
+    /// Exercise the tray path without a mouse: after this long, hide the window, show it three
+    /// seconds later, then quit three seconds after that — each step injected through the same
+    /// queue-and-wake path a real tray event takes. A test aid, like `autoscroll`: there is no
+    /// way to click a tray icon from outside the process, and the point is to time each step.
+    pub tray_test: Option<Duration>,
+    /// Login started this run (`autostart::ARG`): once the window is up, ask the compositor to
+    /// bring it forward. Wayland maps an autostarted window behind whatever already has focus
+    /// and cannot be asked to raise itself later, so the request has to be made up front; on
+    /// X11 and Windows it is the same `Focus` a launcher would have given the window anyway.
+    pub autostart: bool,
 }
 
 /// How far a river has flowed.
@@ -582,7 +717,7 @@ impl Radio {
 
     /// Where the river's tail begins: the first queued track the listener did not choose.
     /// `None` while every track is theirs.
-    fn tail_start(&self, queue: &[Track]) -> Option<usize> {
+    pub(crate) fn tail_start(&self, queue: &[Track]) -> Option<usize> {
         queue
             .iter()
             .position(|t| !self.chosen.iter().any(|id| id == &t.video_id))
@@ -809,6 +944,23 @@ pub(crate) fn is_wayland() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
+/// Ask the compositor to bring the window forward.
+///
+/// `ViewportCommand::Focus` is a no-op on Wayland (winit's own `focus_window` says so outright),
+/// so the only lever there is `RequestUserAttention`: winit turns it into an `xdg_activation`
+/// request, which KWin answers by activating the window when it can — no user interaction since
+/// the session started, no other active window — and by making the taskbar entry demand
+/// attention when it cannot. On every other platform `Focus` works, and an attention request
+/// would only flash the taskbar on top of a successful focus.
+pub(crate) fn request_foreground(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    if is_wayland() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Critical,
+        ));
+    }
+}
+
 /// The command that actually hides or shows the window, on whichever platform this is.
 ///
 /// `ViewportCommand::Visible` is a *documented no-op on Wayland* — winit's own Wayland backend
@@ -851,6 +1003,9 @@ pub struct App {
     /// The tray's own Quit was chosen: the next close request must actually go through rather
     /// than being caught by the hide-on-close veto, which would otherwise just hide it again.
     quitting: bool,
+    /// Armed by `--autostart` for the first frame: ask the compositor to bring the window
+    /// forward (see `request_foreground`). Disarmed after that one attempt.
+    autostart_attention: bool,
 
     pub(crate) backend: Backend,
     pub(crate) player: Option<Player>,
@@ -1037,6 +1192,8 @@ pub struct App {
     pub(crate) current: Option<usize>,
     /// Set once we have asked mpv to play, so we can tell "not started yet" from "track ended".
     pub(crate) playback_started: bool,
+    /// Distinguishes a finished track from an attempt that never produced audio; see [`StallGuard`].
+    stall: StallGuard,
     /// The generation of the most recent `Backend::play`/`play_video` call — every
     /// `Event::Resolving`/`Playing`/`PlaybackFailed` carries the generation it was started
     /// under, and one whose generation doesn't match this is a reply to a play that has since
@@ -1216,7 +1373,11 @@ impl Drop for App {
     /// this the player's context would go first. Clearing the field here runs before any field
     /// is dropped.
     fn drop(&mut self) {
+        // Brackets the teardown in the log: the exit line in `main` comes after every field has
+        // dropped, so a quit that still drags can be pinned on whichever drop stops logging.
+        tracing::info!("app: dropping");
         self.video = None;
+        tracing::info!("app: video surface freed");
     }
 }
 
@@ -1289,8 +1450,13 @@ impl App {
             opacity,
             no_blur,
             no_autoplay,
+            tray_test,
+            autostart,
         } = options;
         theme::install(&cc.egui_ctx);
+        // Let the single-instance listener thread wake this UI (`instance`'s own doc comment).
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        crate::instance::attach(&cc.egui_ctx);
         let mut settings = crate::settings::load();
         // Session-only, and applied before the first palette build so the very first frame
         // already shows what was asked for. Never saved: `update_settings` only ever writes
@@ -1357,9 +1523,12 @@ impl App {
             startup_timing,
             // A tray icon from a previous run's setting shows up again this run without
             // needing the toggle re-flipped.
-            tray: settings.hide_tray_on_close.then(crate::tray::spawn),
+            tray: settings
+                .hide_tray_on_close
+                .then(|| crate::tray::spawn(&cc.egui_ctx)),
             hidden: false,
             quitting: false,
+            autostart_attention: autostart,
             backend,
             player,
             player_error: None,
@@ -1430,6 +1599,7 @@ impl App {
             queue: Vec::new(),
             current: None,
             playback_started: false,
+            stall: StallGuard::default(),
             play_generation: 0,
             play_is_video: false,
             radio: None,
@@ -1527,7 +1697,38 @@ impl App {
         // Start the presence here too, not only from a Settings change: a launch with the setting
         // already on should show up without the user having to toggle it off and back on.
         app.sync_discord();
+        // Heal the autostart entry an earlier version left behind — a stale path, or one without
+        // the `--autostart` flag this version's startup request needs — and drop one the setting
+        // no longer wants. The Settings toggle writes it directly; this is the once-a-launch
+        // check, and it deliberately leaves a working entry that points at another install.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Err(e) = crate::autostart::sync(app.settings.start_on_boot) {
+            tracing::warn!(error = %format!("{e:#}"), "could not update the autostart entry");
+        }
+        if let Some(after) = tray_test {
+            app.spawn_tray_test(after);
+        }
         Ok(app)
+    }
+
+    /// The `--tray-test` thread: hide, show, quit — each injected through [`crate::tray::inject`],
+    /// the same queue-and-wake path a real tray click takes. The log lines carry the timestamps
+    /// the steps actually landed on, so a slow quit can be attributed to the event being acted
+    /// on late (line long after injection) or to teardown (line, then a long silence).
+    fn spawn_tray_test(&self, after: Duration) {
+        use crate::tray::{TrayAction, inject};
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            tracing::info!("tray test: hiding");
+            inject(&ctx, TrayAction::ToggleVisible);
+            std::thread::sleep(Duration::from_secs(3));
+            tracing::info!("tray test: showing");
+            inject(&ctx, TrayAction::ToggleVisible);
+            std::thread::sleep(Duration::from_secs(3));
+            tracing::info!("tray test: quitting");
+            inject(&ctx, TrayAction::Quit);
+        });
     }
 
     /// Keyboard shortcuts. Space is play/pause, unless a text field has focus — otherwise it
@@ -1656,7 +1857,7 @@ impl App {
             match &self.tray {
                 Some(tray) => tray.set_visible(self.settings.hide_tray_on_close),
                 None if self.settings.hide_tray_on_close => {
-                    self.tray = Some(crate::tray::spawn());
+                    self.tray = Some(crate::tray::spawn(ctx));
                 }
                 None => {}
             }
@@ -1707,10 +1908,22 @@ impl App {
         }
     }
 
-    /// Drain tray-icon and tray-menu events, and veto a genuine OS close request into a hide
-    /// when "Hide tray on close" is on. Called once a frame regardless of whether a tray icon
-    /// currently exists — `tray::poll` is a cheap non-blocking read of a channel that is simply
-    /// empty when there is nothing to show a tray icon at all.
+    /// Bring the window back from hidden or minimized, best-effort. Shared by the tray's Show,
+    /// the OS media widget's Raise, and a second launch asking the running instance to come
+    /// forward — all three want the same thing, and on Wayland all three hit the same protocol
+    /// gap (`request_foreground`).
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(hide_command(false));
+        request_foreground(ctx);
+    }
+
+    /// Drain the actions the tray's event handlers queued, and veto a genuine OS close request
+    /// into a hide when "Hide tray on close" is on. Called once a frame regardless of whether a
+    /// tray icon currently exists — `tray::poll` is a cheap non-blocking pop off a queue that is
+    /// simply empty when there is nothing to show a tray icon at all. The handlers themselves
+    /// wake this frame up (`request_repaint`), so an idle app acts on a click at once instead of
+    /// at the next unrelated repaint.
     fn poll_tray(&mut self, ctx: &egui::Context) {
         while let Some(action) = crate::tray::poll() {
             match action {
@@ -1718,12 +1931,18 @@ impl App {
                     self.hidden = !self.hidden;
                     ctx.send_viewport_cmd(hide_command(self.hidden));
                     if !self.hidden {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        request_foreground(ctx);
                     }
+                }
+                crate::tray::TrayAction::Show => {
+                    // A double-click shows and focuses, never hides — the Show/Hide menu item
+                    // remains the way to hide on purpose.
+                    self.show_window(ctx);
                 }
                 crate::tray::TrayAction::Quit => {
                     // Bypasses the veto below on the same or a following frame — Quit means
                     // quit, not "hide again".
+                    tracing::info!("tray: quit chosen");
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1802,11 +2021,7 @@ impl App {
                         playwire::Repeat::All => RepeatMode::All,
                     };
                 }
-                playwire::Event::Raise => {
-                    self.hidden = false;
-                    ctx.send_viewport_cmd(hide_command(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
+                playwire::Event::Raise => self.show_window(ctx),
                 playwire::Event::Quit => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2174,6 +2389,7 @@ impl App {
             ?start_at,
             "starting track"
         );
+        self.stall.on_load(&track.video_id, start_at);
         if plays_as_video(self.video_open, track.wide) && self.ensure_video_surface() {
             self.play_is_video = true;
             return self.backend.play_video(track, handle, volume, start_at);
@@ -3169,8 +3385,8 @@ impl App {
                     self.playlist_error = Some(error);
                 }
                 // The open artist's own top-songs prefetch, not the playlist page: replace the
-                // page's 5 embedded songs with up to 15 of the real list, so Top Songs can page
-                // through them (see `track_shelf_pages`) instead of sitting at just the 5.
+                // page's 5 embedded songs with up to 15 of the real list, so Top Songs shows the
+                // fuller list instead of sitting at just the 5.
                 Event::PlaylistLoaded { id, playlist }
                     if self
                         .artist
@@ -3606,14 +3822,38 @@ impl App {
                     {
                         t.like = like;
                     }
-                    self.start_from(queue.tracks, 0);
-                    // Set after `start_from`: a hand-picked start opens a latent river, a mix
-                    // opens a flowing one. No token means the mix itself was one page long.
-                    self.radio = Some(Radio {
-                        state: queue.next.map_or(River::Dead, River::Open),
-                        chosen: vec![seed.clone()],
-                        seed,
-                    });
+                    // Starting a mix on the song already playing must not restart it: the queue
+                    // is swapped under the running audio instead. Another song, or nothing
+                    // loaded, starts the mix from its seed as before.
+                    let seed_index = {
+                        let now_id = self.now.track.as_ref().map(|t| t.video_id.as_str());
+                        mix_seed_index(self.playback_started, now_id, &seed, &queue.tracks)
+                    };
+                    if let Some(seed_index) = seed_index {
+                        tracing::info!(%seed, "start mix: keeping the playing track");
+                        self.replace_queue(queue.tracks);
+                        self.current = Some(seed_index);
+                        // The mix's own row carries fresher state than the one now playing (its
+                        // rating came with the mix); the audio is the same file either way.
+                        if let Some(t) = self.queue.get(seed_index).cloned() {
+                            self.now.track = Some(t);
+                        }
+                        self.radio = Some(Radio {
+                            state: queue.next.map_or(River::Dead, River::Open),
+                            chosen: vec![seed.clone()],
+                            seed,
+                        });
+                        self.prefetch_next();
+                    } else {
+                        self.start_from(queue.tracks, 0);
+                        // Set after `start_from`: a hand-picked start opens a latent river, a mix
+                        // opens a flowing one. No token means the mix itself was one page long.
+                        self.radio = Some(Radio {
+                            state: queue.next.map_or(River::Dead, River::Open),
+                            chosen: vec![seed.clone()],
+                            seed,
+                        });
+                    }
                 }
                 Event::MixFailed { seed, error } => {
                     tracing::warn!(%seed, %error, "start mix failed");
@@ -3932,6 +4172,17 @@ impl App {
             self.toggle_playback();
             return;
         }
+        self.replace_queue(tracks);
+        // Every hand-picked queue carries a latent river; `Event::MixLoaded` overwrites it
+        // with a flowing one. The Autoplay setting decides whether either is asked for a
+        // page, so switching it on mid-queue works.
+        self.radio = Radio::pending(&self.queue);
+        self.play_index_restore(index);
+    }
+
+    /// Swap the queue under whatever is (or is not) playing, without loading anything. The old
+    /// queue is remembered for `Previous`, and the panel is asked to show the new queue's start.
+    fn replace_queue(&mut self, tracks: Vec<Track>) {
         // Leaving one queue for another: keep the whole old queue so `Previous` can bring it
         // back. The within-queue history indexes the old queue, so it is cleared here.
         if let Some(current) = self.current {
@@ -3939,20 +4190,30 @@ impl App {
             self.play_history
                 .leaving_queue(old, current, self.radio.take());
         }
-        // Every hand-picked queue carries a latent river; `Event::MixLoaded` overwrites it
-        // with a flowing one. The Autoplay setting decides whether either is asked for a
-        // page, so switching it on mid-queue works.
-        self.radio = Radio::pending(&tracks);
         self.queue = tracks;
         // A new queue has different tracks; the shuffle seen-set does not carry over.
         self.shuffle_seen.clear();
-        self.play_index_restore(index);
         // A brand new queue, so the panel should show its start — matching what the queue
         // panel's own row click already does for the in-queue case. Set here rather than in
         // `play_index_restore` itself, which is also what natural end-of-track auto-advance and
         // Previous/Next share: neither of those should jerk the scroll position around on every
         // track change.
         self.queue_scroll_reset = true;
+    }
+
+    /// A row click: play the clicked track the way a song click means it now. A YouTube track
+    /// gets its own radio — the queue is that song, and the generated next-up is appended as it
+    /// arrives — while a local file keeps the list it was clicked in, since there is no radio to
+    /// seed from a filesystem path.
+    pub(crate) fn play_row(&mut self, tracks: Vec<Track>, index: usize) {
+        match tracks.get(index) {
+            Some(t) if t.local_path.is_none() => {
+                let track = t.clone();
+                self.start_from(vec![track], 0);
+            }
+            Some(_) => self.start_from(tracks, index),
+            None => {}
+        }
     }
 
     /// Start the queue item at `index`, remembering the track we are leaving for `Previous`.
@@ -5384,6 +5645,24 @@ impl eframe::App for App {
         self.handle_events(&ctx);
         self.poll_tray(&ctx);
         self.poll_media(&ctx);
+        // A second plain launch asked the running instance to show itself (see `instance`).
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if crate::instance::poll() {
+            tracing::info!("second launch: showing the window");
+            self.show_window(&ctx);
+        }
+        // Login started this run: it is on screen now, so this is the moment to ask. Wayland
+        // maps an autostarted window behind whatever already has focus and refuses to raise a
+        // window that did not ask; asking on the first frame is also the best chance of getting
+        // a real activation, before the first user input invalidates the token. Skipped when the
+        // window already has focus — a request then would only flash the taskbar.
+        if self.autostart_attention {
+            self.autostart_attention = false;
+            if !ctx.input(|i| i.viewport().focused.unwrap_or(false)) {
+                tracing::info!("autostart: asking the compositor to bring the window forward");
+                request_foreground(&ctx);
+            }
+        }
         // Publish the playback click model for the row and card widgets this frame, so no page
         // has to thread the setting through.
         crate::widgets::set_double_click_play(&ctx, self.settings.double_click_to_play);
@@ -5573,15 +5852,22 @@ impl eframe::App for App {
             }
         }
 
+        // The video view takes the whole card: no inner margin, so its frame meets the card's
+        // own rounded edge instead of sitting inset behind a black border.
+        let content = if self.video_open {
+            egui::Frame::NONE
+                .fill(Color32::BLACK)
+                .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
+        } else {
+            card(p.card_fill(), egui::Margin::symmetric(16, 10))
+        };
         egui::CentralPanel::default()
-            .frame(
-                card(p.card_fill(), egui::Margin::symmetric(16, 10)).outer_margin(egui::Margin {
-                    left: g,
-                    right: g,
-                    top: 0,
-                    bottom: 0,
-                }),
-            )
+            .frame(content.outer_margin(egui::Margin {
+                left: g,
+                right: g,
+                top: 0,
+                bottom: 0,
+            }))
             .show(ui, |ui| {
                 // Captured first: `available_rect_before_wrap` only means "the top" before
                 // the page allocates. It is the card's *content* rect — the panel less its
@@ -5644,16 +5930,51 @@ impl eframe::App for App {
         // Restore the saved position once its track is loaded, and keep `playback.json` fresh.
         self.poll_playback(&state);
         self.apply_crossfade(&state);
+        if self.playback_started {
+            self.stall.observe(state.position);
+        }
         if self.playback_started && state.idle && !self.now.resolving {
             self.playback_started = false;
-            // Repeat One replays the track that just ended; anything else advances normally.
-            if self.repeat == RepeatMode::One {
-                if let Some(current) = self.current {
-                    self.play_index(current);
+            match self.stall.on_idle(Instant::now()) {
+                // Repeat One replays the track that just ended; anything else advances normally.
+                IdleEnd::Ended => {
+                    if self.repeat == RepeatMode::One {
+                        if let Some(current) = self.current {
+                            self.play_index(current);
+                        }
+                    } else {
+                        self.skip(1);
+                    }
                 }
-            } else {
-                self.skip(1);
+                IdleEnd::Retry(delay) => {
+                    tracing::warn!(
+                        position = state.position,
+                        duration = state.duration,
+                        retry = self.stall.retries,
+                        ?delay,
+                        "playback went idle without ever playing; reloading the track"
+                    );
+                }
+                IdleEnd::GiveUp => {
+                    tracing::error!(
+                        track = %self.now.track.as_ref().map_or("?", |t| t.title.as_str()),
+                        "playback never started after the retries; leaving the queue where it is"
+                    );
+                    self.player_error =
+                        Some("Playback did not start. Check the audio output device.".to_owned());
+                    self.toast_error("Playback did not start");
+                }
             }
+        }
+        // A stalled attempt is reloaded here once its backoff has passed. `play_index_restore`,
+        // not `play_index`: a retry is not a play, and must not write the history.
+        if self.stall.take_due(Instant::now())
+            && let Some(index) = self.current
+        {
+            if let Some(start) = self.stall.start_position() {
+                self.resume = Some((index, start));
+            }
+            self.play_index_restore(index);
         }
 
         // Autoplay: one `next` call returns ~50 tracks. A hand-picked queue seeds its tail as
@@ -5704,6 +6025,10 @@ impl eframe::App for App {
             } else if advancing {
                 ctx.request_repaint_after(PLAYING_REPAINT);
             }
+        }
+        // A pending stall reload needs a frame at its due time; nothing else will ask for one.
+        if let Some(at) = self.stall.pending_at() {
+            ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
         }
 
         // `scroll_to_top` is NOT cleared here: it is consumed by `page_scroll` itself, so a
@@ -5833,6 +6158,101 @@ mod tests {
         assert_eq!(crossfade_factor(true, 1.0, d, Some(CROSSFADE_SECS)), 1.0);
         // Both ramps at once: the lower one wins (a very short track).
         assert_eq!(crossfade_factor(true, 0.0, 2.0, Some(0.5)), 0.1);
+    }
+
+    /// A track that got past its start is one that played, so its end is an end.
+    #[test]
+    fn a_track_that_played_ends_normally() {
+        let mut guard = StallGuard::default();
+        guard.on_load("a", None);
+        guard.observe(0.5);
+        assert_eq!(guard.on_idle(Instant::now()), IdleEnd::Ended);
+        assert_eq!(guard.retries, 0);
+        assert!(guard.pending_at().is_none());
+    }
+
+    /// The bug this exists for: idle with nothing ever played retries instead of skipping.
+    #[test]
+    fn an_attempt_that_never_played_is_retried_to_the_cap_then_gives_up() {
+        let mut guard = StallGuard::default();
+        guard.on_load("a", None);
+        let t0 = Instant::now();
+        guard.observe(0.0);
+        assert_eq!(
+            guard.on_idle(t0),
+            IdleEnd::Retry(Duration::from_millis(500))
+        );
+        assert_eq!(guard.on_idle(t0), IdleEnd::Retry(Duration::from_secs(1)));
+        assert_eq!(guard.on_idle(t0), IdleEnd::Retry(Duration::from_secs(2)));
+        assert_eq!(guard.on_idle(t0), IdleEnd::GiveUp);
+        assert_eq!(guard.retries, 0);
+    }
+
+    /// mpv reports the `start` seek target as the position; a resume that never advanced is not
+    /// playback, or a restored queue on a failed device would be skipped like a finished track.
+    #[test]
+    fn a_resumed_track_sitting_at_its_start_position_stalls() {
+        let mut guard = StallGuard::default();
+        guard.on_load("a", Some(210.0));
+        guard.observe(210.0);
+        assert_eq!(
+            guard.on_idle(Instant::now()),
+            IdleEnd::Retry(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn a_resumed_track_that_advanced_ends_normally() {
+        let mut guard = StallGuard::default();
+        guard.on_load("a", Some(210.0));
+        guard.observe(211.0);
+        assert_eq!(guard.on_idle(Instant::now()), IdleEnd::Ended);
+    }
+
+    /// A retry's own reload must not reset the count, or the cap never arrives; a real track
+    /// change must, or the next track inherits the last one's stalls.
+    #[test]
+    fn the_retry_count_belongs_to_the_track() {
+        let mut guard = StallGuard::default();
+        guard.on_load("a", None);
+        guard.on_idle(Instant::now());
+        guard.on_load("a", None);
+        assert_eq!(
+            guard.on_idle(Instant::now()),
+            IdleEnd::Retry(Duration::from_secs(1))
+        );
+        guard.on_load("b", None);
+        assert_eq!(
+            guard.on_idle(Instant::now()),
+            IdleEnd::Retry(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn a_retry_is_taken_only_once_its_backoff_has_passed() {
+        let mut guard = StallGuard::default();
+        guard.on_load("a", None);
+        let t0 = Instant::now();
+        guard.on_idle(t0);
+        assert!(!guard.take_due(t0));
+        assert!(guard.take_due(t0 + Duration::from_millis(500)));
+        assert!(!guard.take_due(t0 + Duration::from_millis(500)));
+        assert!(guard.pending_at().is_none());
+    }
+
+    /// Start Mix on the song already playing is adopted, not restarted; anything else starts
+    /// from the seed as before.
+    #[test]
+    fn a_mix_on_the_playing_song_is_adopted_not_restarted() {
+        let tracks = vec![track("a"), track("b")];
+        assert_eq!(mix_seed_index(true, Some("a"), "a", &tracks), Some(0));
+        assert_eq!(mix_seed_index(true, Some("b"), "b", &tracks), Some(1));
+        // Another song's mix starts from its seed.
+        assert_eq!(mix_seed_index(true, Some("a"), "b", &tracks), None);
+        // Nothing loaded yet: the normal start.
+        assert_eq!(mix_seed_index(false, Some("a"), "a", &tracks), None);
+        // A mix that does not carry the seed cannot be adopted under it.
+        assert_eq!(mix_seed_index(true, Some("a"), "c", &tracks), None);
     }
 
     #[test]

@@ -180,7 +180,7 @@ fn results_list(app: &mut App, ui: &mut egui::Ui) {
                 )
             };
             if let Some(index) = index {
-                app.start_from(queue, index);
+                app.play_row(queue, index);
             }
         }
         Entry::Artist(a) => {

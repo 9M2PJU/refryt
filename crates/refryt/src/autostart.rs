@@ -4,12 +4,21 @@
 //! Linux-first install path in `scripts/appimage-install.sh`), and the per-user `Run` key on
 //! Windows — the registry location Task Manager's own Startup tab reads, so the switch can be
 //! audited and turned off from outside the app the same way every other Windows app's is.
+//!
+//! Both entries pass [`ARG`], so a launch can tell it came from login and ask the compositor to
+//! bring its window forward once it is up. That matters on Wayland, where nothing can raise a
+//! window that has not asked: see `App::request_foreground`.
+
+/// The argument the autostart entry passes, telling the app this launch came from login.
+pub const ARG: &str = "--autostart";
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result};
+
+    use super::ARG;
 
     fn path() -> Result<PathBuf> {
         let dirs = directories::BaseDirs::new().context("could not find the config directory")?;
@@ -35,42 +44,142 @@ mod linux {
         })
     }
 
+    /// One `Exec` argument, quoted the way the desktop entry spec asks: the whole value in double
+    /// quotes with `\`, `"`, `` ` `` and `$` escaped, and a literal `%` doubled — a bare `%` is
+    /// the spec's field-code prefix and would be expanded by the launcher (to nothing, for any
+    /// code but `%%`).
+    fn quoted(arg: &str) -> String {
+        let mut out = String::with_capacity(arg.len() + 2);
+        out.push('"');
+        for c in arg.chars() {
+            match c {
+                '\\' | '"' | '`' | '$' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                '%' => out.push_str("%%"),
+                _ => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// The exact `Exec` line this version writes, used both to build the entry and to recognise
+    /// an entry that already matches.
+    fn exec_line(exec: &str) -> String {
+        format!("Exec={} {ARG}", quoted(exec))
+    }
+
     fn desktop_entry(exec: &str) -> String {
         format!(
             "[Desktop Entry]\n\
              Type=Application\n\
              Name=Refryt\n\
              Comment=A fast, native YouTube Music client\n\
-             Exec={exec}\n\
+             {}\n\
              Icon=refryt\n\
              Terminal=false\n\
-             X-GNOME-Autostart-enabled=true\n"
+             X-GNOME-Autostart-enabled=true\n",
+            exec_line(exec)
         )
     }
 
-    /// Write the autostart entry. Called only when "Start on boot" is turned on.
-    pub fn enable() -> Result<()> {
-        let Some(exec) = exec_path() else {
-            anyhow::bail!("could not determine this binary's own path");
+    /// The path an entry's `Exec=` line runs, unquoted. Enough of the spec for our own entries
+    /// (one quoted argument, then [`ARG`]) and for the unquoted `Exec=refryt` a hand-written
+    /// entry would carry; anything with more elaborate quoting parses to `None` and is left
+    /// alone.
+    fn entry_exec(text: &str) -> Option<String> {
+        let value = text.lines().find_map(|l| l.strip_prefix("Exec="))?.trim();
+        let arg = if let Some(rest) = value.strip_prefix('"') {
+            rest.split('"').next()?
+        } else {
+            value.split_whitespace().next()?
         };
-        let path = path()?;
+        Some(arg.replace("%%", "%"))
+    }
+
+    fn write_entry(path: &Path, exec: &str) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
-        std::fs::write(&path, desktop_entry(&exec))
+        std::fs::write(path, desktop_entry(exec))
             .with_context(|| format!("could not write {}", path.display()))
     }
 
-    /// Remove the autostart entry. Quiet if it was never there — turning the setting on and off
-    /// without ever having restarted in between should not surface an error either way.
-    pub fn disable() -> Result<()> {
-        let path = path()?;
-        match std::fs::remove_file(&path) {
+    /// Quiet if it was never there — turning the setting on and off without ever having
+    /// restarted in between should not surface an error either way.
+    fn remove_entry(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).with_context(|| format!("could not remove {}", path.display())),
         }
+    }
+
+    /// Write the autostart entry. Called when "Start on boot" is turned on.
+    pub fn enable() -> Result<()> {
+        let Some(exec) = exec_path() else {
+            anyhow::bail!("could not determine this binary's own path");
+        };
+        write_entry(&path()?, &exec)
+    }
+
+    /// Remove the autostart entry. Called when "Start on boot" is turned off.
+    pub fn disable() -> Result<()> {
+        remove_entry(&path()?)
+    }
+
+    /// Keep the entry in step with the setting, checked once at startup as well as on a toggle.
+    /// Startup is what heals an entry an earlier version wrote — a path that no longer exists, or
+    /// one without [`ARG`] — and what removes an entry the setting no longer wants.
+    ///
+    /// The entry is only rewritten when it points at *this* binary, or at nothing that still
+    /// exists: running a development build against the real profile must not hijack the
+    /// installed app's own autostart entry.
+    pub fn sync(enabled: bool) -> Result<()> {
+        let Some(exec) = exec_path() else {
+            // Nowhere to point an entry; leave whatever is there alone.
+            return Ok(());
+        };
+        sync_at(&path()?, &exec, enabled)
+    }
+
+    /// [`sync`], with the entry path and binary passed in — pure filesystem work, so the
+    /// branches are testable without touching the real profile.
+    fn sync_at(path: &Path, exec: &str, enabled: bool) -> Result<()> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return if enabled {
+                    write_entry(path, exec)
+                } else {
+                    Ok(())
+                };
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("could not read {}", path.display()));
+            }
+        };
+        let current = entry_exec(&text);
+        let points_here = current.as_deref() == Some(exec);
+        if !enabled {
+            // Only remove an entry this binary owns; someone else's is not ours to delete.
+            return if points_here {
+                remove_entry(path)
+            } else {
+                Ok(())
+            };
+        }
+        if points_here && text.contains(&exec_line(exec)) {
+            return Ok(());
+        }
+        if !points_here && current.is_some_and(|p| Path::new(&p).exists()) {
+            // A different, still-working install's entry: leave it.
+            return Ok(());
+        }
+        write_entry(path, exec)
     }
 
     #[cfg(test)]
@@ -78,11 +187,84 @@ mod linux {
         use super::*;
 
         #[test]
-        fn the_entry_names_the_given_binary() {
+        fn the_entry_names_the_binary_and_asks_for_the_window() {
             let entry = desktop_entry("/home/user/.local/bin/refryt.AppImage");
-            assert!(entry.contains("Exec=/home/user/.local/bin/refryt.AppImage"));
+            assert!(entry.contains("Exec=\"/home/user/.local/bin/refryt.AppImage\" --autostart"));
             assert!(entry.contains("Type=Application"));
             assert!(entry.contains("X-GNOME-Autostart-enabled=true"));
+        }
+
+        #[test]
+        fn exec_quoting_survives_spaces_and_field_codes() {
+            assert_eq!(
+                quoted("/home/user/My Apps/refryt"),
+                "\"/home/user/My Apps/refryt\""
+            );
+            assert_eq!(quoted("/tmp/100%/refryt"), "\"/tmp/100%%/refryt\"");
+            assert_eq!(quoted("/tmp/a\"b/refryt"), "\"/tmp/a\\\"b/refryt\"");
+            assert_eq!(quoted("/tmp/a$b/refryt"), "\"/tmp/a\\$b/refryt\"");
+        }
+
+        /// The startup heal: a missing entry is written, an entry without the flag an older
+        /// version wrote is replaced, a working entry for another install is left alone, and
+        /// turning the setting off removes only an entry this binary owns.
+        #[test]
+        fn sync_heals_the_entry_without_hijacking_another_install() {
+            let dir =
+                std::env::temp_dir().join(format!("refryt-autostart-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("refryt.desktop");
+            let ours = "/home/user/.local/bin/refryt.AppImage";
+            let other = dir.join("other-refryt");
+            std::fs::write(&other, "#!/bin/sh\n").unwrap();
+            let other = other.display().to_string();
+
+            sync_at(&path, ours, true).unwrap();
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains(&exec_line(ours))
+            );
+
+            // Written by an older version, without the flag: replaced.
+            std::fs::write(&path, desktop_entry(ours).replace(&format!(" {ARG}"), "")).unwrap();
+            sync_at(&path, ours, true).unwrap();
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains(&exec_line(ours))
+            );
+
+            // Another, still-existing install's entry: left alone, on and off.
+            std::fs::write(&path, desktop_entry(&other)).unwrap();
+            sync_at(&path, ours, true).unwrap();
+            sync_at(&path, ours, false).unwrap();
+            assert!(std::fs::read_to_string(&path).unwrap().contains(&other));
+
+            // Ours: removed when off.
+            std::fs::write(&path, desktop_entry(ours)).unwrap();
+            sync_at(&path, ours, false).unwrap();
+            assert!(!path.exists());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The parser reads back exactly what the writer wrote, quoted path and all — and the
+        /// unquoted `Exec=refryt` an entry written by hand would carry.
+        #[test]
+        fn the_exec_path_round_trips() {
+            let entry = desktop_entry("/home/user/My Apps/refryt.AppImage");
+            assert_eq!(
+                entry_exec(&entry).as_deref(),
+                Some("/home/user/My Apps/refryt.AppImage")
+            );
+            assert_eq!(entry_exec("Exec=refryt\n").as_deref(), Some("refryt"));
+            assert_eq!(
+                entry_exec("Exec=\"/tmp/100%%/refryt\" --autostart"),
+                Some("/tmp/100%/refryt".to_owned())
+            );
+            assert_eq!(entry_exec("Name=Refryt\n"), None);
         }
     }
 }
@@ -101,6 +283,8 @@ mod windows {
         RegDeleteValueW, RegSetValueExW,
     };
 
+    use super::ARG;
+
     /// The per-user Run key: this user only, which is the scope the setting is about, and no
     /// elevation needed to write it.
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -110,9 +294,10 @@ mod windows {
     /// What the Run value should say for a binary at `exe`.
     ///
     /// Quoted: a Run value is a command line, and an unquoted `C:\Program Files\...` path would
-    /// be split at the first space. Pure, so the quoting is testable without a registry.
+    /// be split at the first space. [`ARG`] rides along so the launch knows it came from login.
+    /// Pure, so the quoting is testable without a registry.
     fn run_value(exe: &Path) -> String {
-        format!("\"{}\"", exe.display())
+        format!("\"{}\" {ARG}", exe.display())
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -142,7 +327,7 @@ mod windows {
         Ok(key)
     }
 
-    /// Point the Run key at this binary. Called only when "Start on boot" is turned on.
+    /// Point the Run key at this binary. Called when "Start on boot" is turned on.
     pub fn enable() -> Result<()> {
         let exe = std::env::current_exe().context("could not determine this binary's own path")?;
         let name = wide(VALUE_NAME);
@@ -177,20 +362,30 @@ mod windows {
         Ok(())
     }
 
+    /// Keep the Run value in step with the setting, checked once at startup as well as on a
+    /// toggle. Unlike the Linux entry there is no cheap read-back of the value, so "on" simply
+    /// rewrites it (one fixed value name, so that is idempotent) and "off" removes it.
+    pub fn sync(enabled: bool) -> Result<()> {
+        if enabled { enable() } else { disable() }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
 
         #[test]
-        fn the_run_value_quotes_a_path_with_spaces() {
+        fn the_run_value_quotes_a_path_with_spaces_and_carries_the_flag() {
             let value = run_value(Path::new(r"C:\Program Files\refryt\refryt.exe"));
-            assert_eq!(value, "\"C:\\Program Files\\refryt\\refryt.exe\"");
+            assert_eq!(
+                value,
+                "\"C:\\Program Files\\refryt\\refryt.exe\" --autostart"
+            );
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{disable, enable};
+pub use linux::{disable, enable, sync};
 
 #[cfg(target_os = "windows")]
-pub use windows::{disable, enable};
+pub use windows::{disable, enable, sync};

@@ -23,6 +23,10 @@ pub mod emoji;
 pub mod icons;
 pub mod images;
 pub mod innertube;
+/// One instance per profile — a second launch shows the running one's window instead of starting
+/// a second player; see the module's own doc comment.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub mod instance;
 pub mod liked;
 pub mod local;
 pub mod local_playlists;

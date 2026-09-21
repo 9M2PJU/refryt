@@ -233,7 +233,7 @@ fn track_list(app: &mut App, ui: &mut egui::Ui) {
     match clicked.click {
         Some(ListClick::Row(i)) => {
             if let Some(tracks) = app.album.as_ref().map(|a| a.tracks.clone()) {
-                app.start_from(tracks, i);
+                app.play_row(tracks, i);
             }
         }
         Some(ListClick::Link(route)) => app.navigate(route),

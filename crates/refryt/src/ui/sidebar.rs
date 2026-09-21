@@ -42,8 +42,8 @@ pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
     playlists(app, ui);
 }
 
-/// Only shown when libmpv could not start, so the rail does not reserve space for a message
-/// that almost never appears.
+/// Only shown when playback could not start: libmpv never came up, or an attempt stalled until
+/// its retries ran out. The rail does not reserve space for a message that almost never appears.
 fn audio_warning(app: &mut App, ui: &mut egui::Ui) {
     let Some(err) = app.player_error.clone() else {
         return;

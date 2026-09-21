@@ -208,7 +208,7 @@ fn track_list(app: &mut App, ui: &mut egui::Ui, tracks: &[crate::model::Track]) 
         )
     };
     match clicked.click {
-        Some(ListClick::Row(i)) => app.start_from(tracks.to_vec(), i),
+        Some(ListClick::Row(i)) => app.play_row(tracks.to_vec(), i),
         Some(ListClick::Link(route)) => app.navigate(route),
         None => {}
     }

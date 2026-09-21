@@ -604,10 +604,20 @@ fn paint_grid_cell<'d>(
     (click, hit.action)
 }
 
+/// Rows in one page of a track grid. Three columns of five is the target; see [`spec_pages`].
+const ROWS_PER_PAGE: usize = 5;
+
+/// The queue position a paged grid cell shows. Columns fill top to bottom before the next
+/// begins, so the numbers read 1-5, 6-10, 11-15 rather than across the rows.
+fn grid_index(start: usize, col: usize, row: usize) -> usize {
+    start + col * ROWS_PER_PAGE + row
+}
+
 /// A short, bounded track list — Top Songs — capped to 5 rows with ‹ › arrows to page through
 /// the rest, rather than one open-ended wrap: at 3 columns the full 15 already
 /// fits in those 5 rows with nothing left to page through; the arrows only earn their keep on a
 /// narrower window, where fewer columns fit and 5 rows is not enough to show all 15 at once.
+/// Each column fills top to bottom before the next begins, so the position numbers read down.
 /// Not virtualised — bounded lists like this are cheap enough to lay out in full every frame —
 /// so the page itself is the only thing that decides which slice is on screen.
 #[allow(clippy::too_many_arguments)]
@@ -623,7 +633,6 @@ fn spec_pages<'d>(
     id_salt: impl std::hash::Hash + std::fmt::Debug,
     spec: impl Fn(usize) -> RowSpec<'d>,
 ) -> ListOutcome {
-    const ROWS_PER_PAGE: usize = 5;
     let per_page = (cols * ROWS_PER_PAGE).max(1);
     let pages = count.div_ceil(per_page).max(1);
 
@@ -689,11 +698,14 @@ fn spec_pages<'d>(
     let col_w = (ui.available_width() - gap * cols.saturating_sub(1) as f32) / cols as f32;
     let start = page * per_page;
     let end = (start + per_page).min(count);
-    let rows_here = (end - start).div_ceil(cols.max(1));
+    // Filled down each column, not across the rows: the numbers read 1-5 down the first
+    // column, 6-10 down the second, and so on. A row-major fill put 1,2,3 across the top, so
+    // reading a column gave 1,4,7,10.
+    let rows_here = (end - start).min(ROWS_PER_PAGE);
     for r in 0..rows_here {
         let top_left = ui.cursor().min;
         for c in 0..cols {
-            let i = start + r * cols + c;
+            let i = grid_index(start, c, r);
             if i >= end {
                 break;
             }
@@ -786,7 +798,8 @@ pub(crate) fn track_rows(
 /// 3 columns × 5 rows is the target: wide enough for that and the full 15 shows at once with no
 /// arrows at all. Only a narrower window — fewer columns fitting — needs them. `numbered` draws
 /// the position number in each row's leading slot, which the artist page's "Popular" list wants
-/// and the shelves it sits beside do not.
+/// and the shelves it sits beside do not; the columns fill downwards so those numbers run
+/// 1-5, 6-10, 11-15 rather than across.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn track_shelf_pages(
     ui: &mut egui::Ui,
@@ -2238,7 +2251,7 @@ pub(crate) fn entry_rows(app: &mut crate::app::App, ui: &mut egui::Ui, items: &[
         Some(ListClick::Row(i)) => match &items[i] {
             Entry::Song(_) | Entry::Video(_) => {
                 if let Some(index) = playable_index(items, i) {
-                    app.start_from(playable_queue(items), index);
+                    app.play_row(playable_queue(items), index);
                 }
             }
             Entry::Artist(a) => app.navigate(Route::Artist(a.id.clone())),
@@ -2282,7 +2295,7 @@ fn finish_grid(app: &mut crate::app::App, shelf: &Shelf, grid: GridOutcome) {
             Entry::Song(_) | Entry::Video(_) => {
                 let tracks = shelf.tracks();
                 if let Some(index) = shelf.track_index(i) {
-                    app.start_from(tracks, index);
+                    app.play_row(tracks, index);
                 }
                 return;
             }
@@ -2294,11 +2307,11 @@ fn finish_grid(app: &mut crate::app::App, shelf: &Shelf, grid: GridOutcome) {
     {
         match entry_route(item) {
             Some(route) => app.navigate(route),
-            // A video card in a card shelf still plays; it queues that shelf's playables.
+            // A video card in a card shelf still plays; it starts the song and its radio.
             None => {
                 let tracks = shelf.tracks();
                 if let Some(index) = shelf.track_index(i) {
-                    app.start_from(tracks, index);
+                    app.play_row(tracks, index);
                 }
             }
         }
@@ -2588,5 +2601,16 @@ mod tests {
             part_texts(&track_subtitle(&t)),
             part_texts(&track_subtitle_no_album(&t))
         );
+    }
+
+    /// The paged grid numbers down its columns: 1-5 in the first, 6-10 in the second.
+    #[test]
+    fn the_paged_grid_numbers_down_its_columns() {
+        assert_eq!(grid_index(0, 0, 0), 0);
+        assert_eq!(grid_index(0, 0, 4), 4);
+        assert_eq!(grid_index(0, 1, 0), 5);
+        assert_eq!(grid_index(0, 2, 4), 14);
+        // The next page continues where the last column ended.
+        assert_eq!(grid_index(15, 0, 0), 15);
     }
 }

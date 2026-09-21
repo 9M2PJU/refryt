@@ -201,7 +201,7 @@ fn downloads_list(app: &mut App, ui: &mut egui::Ui) {
         app.row_action(action);
     }
     match out.click {
-        Some(crate::ui::ListClick::Row(i)) => app.start_from(tracks, i),
+        Some(crate::ui::ListClick::Row(i)) => app.play_row(tracks, i),
         Some(crate::ui::ListClick::Link(route)) => app.navigate(route),
         None => {}
     }
@@ -285,7 +285,7 @@ fn song_list(app: &mut App, ui: &mut egui::Ui) {
     match clicked.click {
         Some(ListClick::Row(i)) => {
             let songs = app.library.songs.items.clone();
-            app.start_from(songs, i);
+            app.play_row(songs, i);
         }
         Some(ListClick::Link(route)) => app.navigate(route),
         None => {}
@@ -769,7 +769,7 @@ fn local_track_list(app: &mut App, ui: &mut egui::Ui, indices: Vec<usize>) {
     };
     match clicked.click {
         Some(ListClick::Row(i)) => {
-            app.start_from(tracks, i);
+            app.play_row(tracks, i);
         }
         Some(ListClick::Link(route)) => app.navigate(route),
         None => {}

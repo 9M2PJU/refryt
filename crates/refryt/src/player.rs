@@ -44,6 +44,15 @@ impl Default for Player {
     }
 }
 
+impl Drop for Player {
+    /// One line for the exit log: destroying the mpv core waits for its playloop, and a stream
+    /// stuck on the network is the one thing that can make that wait long. If a quit drags and
+    /// the log stops here, this is the drop to bound.
+    fn drop(&mut self) {
+        tracing::info!("player: dropping");
+    }
+}
+
 impl Player {
     pub fn new() -> Self {
         Self {
