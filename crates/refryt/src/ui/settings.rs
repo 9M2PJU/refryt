@@ -18,7 +18,7 @@ use crate::theme::{self, Scheme, Variant};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     ui.label(
         RichText::new("Settings")
             .font(theme::semibold(18.0))

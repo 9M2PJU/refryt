@@ -5,10 +5,14 @@
 
 use crate::app::App;
 use crate::theme;
+use crate::widgets;
 
 pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     let p = app.palette;
-    ui.add_space(4.0);
+    // The card's own rect, before the header and list consume the ui: the corner repaint at
+    // the end needs its rounded edges.
+    let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
+    ui.add_space(8.0);
     // The panel's own title, a hair right of the lyrics below it by eye — the same nudge the
     // queue's own header takes.
     ui.horizontal(|ui| {
@@ -88,4 +92,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(4.0);
         }
     });
+    // The card's rounded corners, over everything the lyrics drew: the list runs to the card's
+    // bottom edge now.
+    widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, p.window);
 }

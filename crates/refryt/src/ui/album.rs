@@ -18,7 +18,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             PAGE_ART_SIZE,
             widgets::SkeletonHeaderKind::Detail { description: false },
         );
-        widgets::skeleton_track_rows(ui, &app.palette, 8);
+        widgets::skeleton_track_rows(ui, &app.palette, 8, true);
         return;
     }
     if let Some(err) = app.album_error.clone() {
@@ -94,10 +94,11 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                 second_plain: None,
                 meta: Some(&meta),
                 owner: None,
-                // Tighter than the default 36: the artist is the album's identity, and reads
-                // better sitting close under the title than floating a full line below it.
-                credit_gap: 28.0,
-                play_size: Some(44.0),
+                // No air beyond the header's own: the artist is the album's identity and
+                // belongs right under the name. The header measures from the title's painted
+                // ink, so a name with no descenders pulls it up close and a tail keeps it clear.
+                credit_air: 0.0,
+                play_size: Some(crate::ui::DETAIL_PLAY_PT),
                 playing,
                 // No like id, no button: the page gave no play button, and a control that
                 // cannot do anything should not be drawn.
@@ -227,6 +228,8 @@ fn track_list(app: &mut App, ui: &mut egui::Ui) {
             None,
             &library.playlists.items,
             signed_in,
+            true,
+            // No cover on any row: every one of them is the header's own art.
             true,
         )
     };

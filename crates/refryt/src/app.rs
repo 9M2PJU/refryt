@@ -5755,7 +5755,7 @@ impl eframe::App for App {
             .resizable(false)
             .show_separator_line(false)
             .frame(
-                card(p.card_fill(), egui::Margin::symmetric(8, 10)).outer_margin(egui::Margin {
+                card(p.card_fill(), theme::CARD_INSET).outer_margin(egui::Margin {
                     left: g,
                     right: 0,
                     top: g,
@@ -5789,14 +5789,9 @@ impl eframe::App for App {
                 .max(200.0);
             let show_queue = self.upnext_open;
             let show_lyrics = self.lyrics_open;
-            // The card insets: the top gap keeps the first section off the rounded corner, the
-            // sides hold the content off the edge.
-            let margins = egui::Margin {
-                left: 8,
-                right: 8,
-                top: 12,
-                bottom: 10,
-            };
+            // The card insets: a small side padding, and none top or bottom — content runs to
+            // the card's own top and bottom edges.
+            let margins = theme::CARD_INSET;
             if show_queue && show_lyrics {
                 // Two *cards* sharing the column, not one card split by a hairline: the right
                 // panel itself is transparent, and each half is rounded with the shell's gutter
@@ -5859,7 +5854,7 @@ impl eframe::App for App {
                 .fill(Color32::BLACK)
                 .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
         } else {
-            card(p.card_fill(), egui::Margin::symmetric(16, 10))
+            card(p.card_fill(), theme::CARD_INSET)
         };
         egui::CentralPanel::default()
             .frame(content.outer_margin(egui::Margin {
@@ -5900,6 +5895,12 @@ impl eframe::App for App {
                     Route::Playlist(_) => ui::playlist::page(self, ui),
                     Route::Mood(_) => ui::mood::page(self, ui),
                 }
+                // The card's rounded corners, painted after the page: content runs to the card's
+                // own top and bottom edges, and the part of it outside the rounded silhouette is
+                // covered with the gutter. The video view returns above — its frame is already
+                // rounded — so this never touches it.
+                let card = widgets::card_rect(top, theme::CARD_INSET);
+                widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, p.window);
             });
         // On the foreground layer, so draw order relative to the panels above doesn't matter —
         // see `widgets::progress_bar`'s own doc comment for why it moved here from the content

@@ -19,7 +19,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
 
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     ui.label(
         egui::RichText::new(&mood.title)
             .font(theme::semibold(18.0))

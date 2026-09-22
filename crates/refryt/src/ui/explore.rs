@@ -24,7 +24,7 @@ fn link_target(link: &crate::model::ExploreLink) -> Option<(Icon, Route)> {
 }
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     ui.label(
         egui::RichText::new("Explore")
             .font(theme::semibold(18.0))

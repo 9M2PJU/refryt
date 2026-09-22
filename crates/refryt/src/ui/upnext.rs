@@ -16,6 +16,9 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         centered(app, ui, "Empty queue");
         return;
     }
+    // The card's own rect, before the list consumes the ui: the corner repaint at the end
+    // needs its rounded edges.
+    let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
 
     let mut area = egui::ScrollArea::vertical()
         .id_salt("upnext")
@@ -25,6 +28,9 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         app.queue_scroll_reset = false;
     }
     area.show(ui, |ui| {
+        // The list runs to the card's top edge now; this is the header's own breathing room,
+        // and it scrolls away with it — the same distance the content has from the sides.
+        ui.add_space(8.0);
         now_playing(app, ui);
         section(app, ui, 8.0, "Next up");
         let signed_in = app.signed_in();
@@ -75,6 +81,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                         badge: None,
                         // Square: the queue shows the cover, not a cropped 16:9 still.
                         shape: ArtShape::Square,
+                        hide_art: false,
                         thumbnail: t.thumbnail.as_ref(),
                         menu: Some(widgets::RowMenu {
                             track: t,
@@ -116,6 +123,9 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
             app.queue_scroll_reset = true;
         }
     });
+    // The card's rounded corners, over everything the queue drew: the list runs to the card's
+    // top and bottom edges now.
+    widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, app.palette.window);
 }
 
 /// A small caps-ish section label, as the reference uses above each block. `gap` is the space
@@ -182,6 +192,7 @@ fn now_playing(app: &mut App, ui: &mut egui::Ui) {
                 badge: None,
                 // Square: the cover, not a cropped 16:9 still.
                 shape: ArtShape::Square,
+                hide_art: false,
                 thumbnail: track.thumbnail.as_ref(),
                 // No menu on the current track: everything it offers is already in the player
                 // bar, and a menu here would be the only row in the panel that could remove

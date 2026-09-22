@@ -13,7 +13,7 @@ use crate::ui::{
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     ui.label(
         egui::RichText::new("Your library")
             .font(theme::semibold(18.0))
@@ -195,6 +195,7 @@ fn downloads_list(app: &mut App, ui: &mut egui::Ui) {
             &library.playlists.items,
             signed_in,
             false,
+            false,
         )
     };
     if let Some(action) = out.action {
@@ -273,6 +274,7 @@ fn song_list(app: &mut App, ui: &mut egui::Ui) {
             None,
             &library.playlists.items,
             signed_in,
+            false,
             false,
         )
     };
@@ -764,6 +766,7 @@ fn local_track_list(app: &mut App, ui: &mut egui::Ui, indices: Vec<usize>) {
             None,
             &library.playlists.items,
             signed_in,
+            false,
             false,
         )
     };

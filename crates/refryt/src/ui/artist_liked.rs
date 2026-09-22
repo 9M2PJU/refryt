@@ -22,7 +22,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             PAGE_ART_SIZE,
             widgets::SkeletonHeaderKind::Artist,
         );
-        widgets::skeleton_track_rows(ui, &app.palette, 6);
+        widgets::skeleton_track_rows(ui, &app.palette, 6, false);
         return;
     }
     if let Some(err) = app.artist_error.clone() {
@@ -116,8 +116,8 @@ fn header(app: &mut App, ui: &mut egui::Ui, tracks: &[crate::model::Track]) {
                 second_plain: Some(&meta),
                 meta: None,
                 owner: None,
-                credit_gap: 36.0,
-                play_size: Some(44.0),
+                credit_air: 4.0,
+                play_size: Some(crate::ui::DETAIL_PLAY_PT),
                 playing,
                 save_in_library: None,
                 dots: false,
@@ -204,6 +204,8 @@ fn track_list(app: &mut App, ui: &mut egui::Ui, tracks: &[crate::model::Track]) 
             None,
             &library.playlists.items,
             signed_in,
+            false,
+            // Songs from across the artist's albums, so each row keeps its own cover.
             false,
         )
     };

@@ -17,7 +17,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             PAGE_ART_SIZE,
             widgets::SkeletonHeaderKind::Detail { description: true },
         );
-        widgets::skeleton_track_rows(ui, &app.palette, 8);
+        widgets::skeleton_track_rows(ui, &app.palette, 8, false);
         return;
     }
     if let Some(err) = app.playlist_error.clone() {
@@ -181,8 +181,8 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                 // The owner folds into the meta line as a linked name, so the card reads
                 // "Owner • N songs • duration • year" on one line instead of a row each.
                 owner: owner.as_ref(),
-                credit_gap: 36.0,
-                play_size: Some(44.0),
+                credit_air: 4.0,
+                play_size: Some(crate::ui::DETAIL_PLAY_PT),
                 playing,
                 save_in_library: signed_in
                     .then(|| write.is_some().then_some(in_library))
@@ -346,6 +346,8 @@ fn track_list(app: &mut App, ui: &mut egui::Ui) {
             playlist_id,
             &library.playlists.items,
             signed_in,
+            false,
+            // Each track is from its own album, so the per-row cover stays.
             false,
         )
     };

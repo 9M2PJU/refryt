@@ -14,9 +14,9 @@ use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     // No "Home" heading: the sidebar already says where you are.
-    ui.add_space(8.0);
-
     if app.home_loading && app.home.is_none() {
+        // The first row's distance from the card's top, matching the sides.
+        ui.add_space(8.0);
         // The real feed is several titled shelves, mixing grids and row-lists — never one
         // untitled block. Which shelves are coming can't be known before they load, so this is
         // a reasonable approximation of the shape, not a prediction of the exact content.
@@ -41,6 +41,10 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
     }
 
     crate::ui::page_scroll(app, "home").show(ui, |ui| {
+        // Inside the scroll content, not before the scroll area: this is the first row's own
+        // distance from the card's top — the same as from its sides — and it scrolls away with
+        // the feed. Outside the area it was a fixed band the feed was clipped under.
+        ui.add_space(8.0);
         sign_in_note(app, ui);
         filter_chips(app, ui);
 

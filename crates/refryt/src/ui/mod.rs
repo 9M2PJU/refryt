@@ -46,6 +46,13 @@ pub(crate) const HEADER_ART_PT: f32 = 160.0;
 pub(crate) const HEADER_ART_FLOOR_PT: f32 = 64.0;
 /// Album and playlist headers, drawn large like the reference. Request matches display.
 pub(crate) const PAGE_ART_SIZE: f32 = 192.0;
+/// A detail header's title: bold, and shrinking in 2pt steps from here down to
+/// [`DETAIL_TITLE_MIN`] rather than ellipsizing, so a long album or playlist name keeps its one
+/// line — the way the reference handles a name that would not fit at full size.
+pub(crate) const DETAIL_TITLE_MAX: f32 = 40.0;
+pub(crate) const DETAIL_TITLE_MIN: f32 = 24.0;
+/// The detail header's Play button, between the page's old 44 and the artist page's own 56.
+pub(crate) const DETAIL_PLAY_PT: f32 = 48.0;
 
 /// How wide a card is in a grid; its cover is inset by 8pt on each side.
 pub(crate) const CARD_W: f32 = 132.0;
@@ -249,6 +256,9 @@ pub(crate) struct RowSpec<'a> {
     pub playing: bool,
     pub badge: Option<&'a str>,
     pub shape: widgets::ArtShape,
+    /// See `widgets::TrackRow::hide_art` — the album page, whose rows would all repeat the
+    /// header's own cover.
+    pub hide_art: bool,
     pub thumbnail: Option<&'a std::sync::Arc<str>>,
     /// Right-click menu. `None` for rows that are not songs.
     pub menu: Option<widgets::RowMenu<'a>>,
@@ -457,8 +467,10 @@ pub(crate) fn spec_rows<'d>(
         // and `ListOutcome::reorder`'s own doc comments.
         let draggable = s.menu.as_ref().and_then(|m| m.playlist_id).is_some();
         // A video still is 16:9; fetch its wide crop so the row draws it at its own aspect
-        // instead of squeezing it into the square cover slot.
-        let art = if s.shape == crate::widgets::ArtShape::Wide {
+        // instead of squeezing it into the square cover slot. A hidden slot fetches nothing.
+        let art = if s.hide_art {
+            None
+        } else if s.shape == crate::widgets::ArtShape::Wide {
             art_texture_wide(
                 images,
                 backend,
@@ -487,6 +499,7 @@ pub(crate) fn spec_rows<'d>(
                 badge: s.badge,
                 art,
                 shape: s.shape,
+                hide_art: s.hide_art,
                 id_salt: i,
                 menu: s.menu,
                 like: s.like,
@@ -587,6 +600,7 @@ fn paint_grid_cell<'d>(
             badge: s.badge,
             art,
             shape: s.shape,
+            hide_art: false,
             id_salt: i,
             menu: s.menu,
             like: s.like,
@@ -740,7 +754,8 @@ fn spec_pages<'d>(
 /// from the track itself, so no page has anything to add. `playlist_id` is the open playlist
 /// when the list is its editable track list; `playlists` feeds the save picker. `hide_album`
 /// drops the album from the subtitle where it would be redundant — the album page, where
-/// every row is this album.
+/// every row is this album. `hide_art` drops the cover for the same reason: on that page it
+/// would be the header's own art repeated down the list.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn track_rows(
     ui: &mut egui::Ui,
@@ -755,6 +770,7 @@ pub(crate) fn track_rows(
     playlists: &[PlaylistRef],
     signed_in: bool,
     hide_album: bool,
+    hide_art: bool,
 ) -> ListOutcome {
     spec_rows(ui, palette, images, backend, stats, tracks.len(), |i| {
         let t = &tracks[i];
@@ -774,6 +790,7 @@ pub(crate) fn track_rows(
             // Square, always: `t.wide` marks a music video for playback, but the art in a
             // track list is the album/playlist cover and a 16:9 slot only crops it.
             shape: widgets::ArtShape::Square,
+            hide_art,
             thumbnail: t.thumbnail.as_ref(),
             menu: Some(widgets::RowMenu {
                 track: t,
@@ -849,6 +866,7 @@ pub(crate) fn track_shelf_pages(
                 // swaps in an audio-only id), but the cover art in a song list is the
                 // album/playlist art and a 16:9 slot only crops it.
                 shape: widgets::ArtShape::Square,
+                hide_art: false,
                 thumbnail: t.thumbnail.as_ref(),
                 menu: Some(widgets::RowMenu {
                     track: t,
@@ -1548,15 +1566,14 @@ fn wash_stop(panel: egui::Color32, wash: egui::Color32, t: f32, alpha: f32) -> e
 /// A wash of the active scheme's accent across the top of the content card.
 ///
 /// Painted first inside the page's scroll content, so the tint travels with the header and
-/// scrolls away instead of lingering as a background. A smooth gradient mesh, full-bleed —
-/// it reaches the card's own edges, past the content's inner margins, which needs a painter
-/// whose clip rect is grown to match: clipped to the scroll viewport it left a bare strip of
-/// panel colour above the tint, the width of the card's top margin. The topmost slice is a
-/// rounded cap in the card's own radius, so a square mesh cannot poke past the card's
-/// corners onto the gutter, and it is pinned to the card's top edge rather than to the
-/// scrolled content — scroll and the *colour* there fades, as the gradient passing upward
-/// under a fixed corner should. Tinted at the top, gone a quarter of the way down. Always
-/// painted, so it no longer waits on the cover decoding before it appears.
+/// scrolls away instead of lingering as a background. A smooth gradient mesh, full-bleed — it
+/// reaches the card's own left and right edges, past the content's side padding, which needs a
+/// painter whose clip rect is grown to match. The topmost slice is a rounded cap in the card's
+/// own radius, so a square mesh cannot poke past the card's corners onto the gutter, and it is
+/// pinned to the card's top edge rather than to the scrolled content — scroll and the *colour*
+/// there fades, as the gradient passing upward under a fixed corner should. Tinted at the top,
+/// gone a quarter of the way down. Always painted, so it no longer waits on the cover decoding
+/// before it appears.
 ///
 /// `wash` is the colour it blends from `panel` down to nothing — the fixed accent, or (see
 /// [`header_wash_colour`]) the current cover's own dominant colour.
@@ -1573,20 +1590,16 @@ pub(crate) fn header_wash(
     }
     // The tint owns the top quarter of the box and nothing more.
     let bottom = top + h * 0.25;
-    // The card's own edges: the page's content rect grown by the margin the card holds it in.
-    // `content` comes from the panel itself (`App::content_rect`) rather than from this ui's
+    // The card's own edges: the page's content rect grown by the side padding the card holds it
+    // in. `content` comes from the panel itself (`App::content_rect`) rather than from this ui's
     // clip rect, which a scroll area builds from its viewport and its parent's clip and which
     // is several points out on every side.
     let card = egui::Rect::from_min_max(
-        egui::pos2(
-            content.min.x - theme::CONTENT_INSET_X,
-            content.min.y - theme::CONTENT_INSET_TOP,
-        ),
-        egui::pos2(content.max.x + theme::CONTENT_INSET_X, content.max.y),
+        egui::pos2(content.min.x - theme::CARD_INSET_X, content.min.y),
+        egui::pos2(content.max.x + theme::CARD_INSET_X, content.max.y),
     );
-    // The card's top edge, not the content's: the strip the inner margin opens above the
-    // first row is part of the header, and leaving it panel-coloured is the seam that made
-    // the tint look like it started late. Above `top` the colour simply holds at full
+    // The card's top edge is the content's: there is no top margin left for the wash to cover,
+    // so the tint starts where the card does. Above `top` the colour simply holds at full
     // strength; scroll and the gradient travels up under a cap that stays put.
     let start = card.top();
     if card.width() <= 0.0 || bottom <= start {
@@ -1596,9 +1609,10 @@ pub(crate) fn header_wash(
     let colour = |y: f32| wash_stop(palette.panel, wash, (y - top) / span, palette.card_alpha);
 
     // A painter built from scratch, not `ui.painter().with_clip_rect(card)`: that *intersects*
-    // with the ui's clip, which inside a scroll area starts below the card's top margin — so
-    // the cap was clipped away and the strip stayed panel-coloured. This one is clipped to the
-    // card and nothing else, and the card never reaches past the panel it lives in.
+    // with the ui's clip, which inside a scroll area is the viewport, inset by the card's side
+    // padding — so the wash was clipped at the sides and left a bare strip of panel colour down
+    // each edge. This one is clipped to the card and nothing else, and the card never reaches
+    // past the panel it lives in.
     let painter = egui::Painter::new(ui.ctx().clone(), ui.layer_id(), card);
     // The cap's rounding, tessellated straight into the gradient mesh. A `rect_filled` cap
     // would not do: egui clamps a shape's corner radius to half its height, and a cap one
@@ -1611,8 +1625,7 @@ pub(crate) fn header_wash(
     const ARC_STEPS: usize = 10;
     for i in 0..=ARC_STEPS {
         let y = start + rad * i as f32 / ARC_STEPS as f32;
-        let dy = start + rad - y;
-        let inset = rad - (rad * rad - dy * dy).max(0.0).sqrt();
+        let inset = widgets::corner_inset(rad, y - start);
         rows.push((y, card.left() + inset, card.right() - inset));
     }
     let kink = top + span * 0.5;
@@ -1688,9 +1701,11 @@ pub(crate) struct PageHeader<'a> {
     /// artist/owner row above it — the playlist page's creator. `None` (album, artist) keeps
     /// the separate-line behaviour above.
     pub owner: Option<&'a crate::model::ArtistLink>,
-    /// Gap from the title down to the artist/owner/audience line below it. The album's credit
-    /// is the identity of the page in a way the playlist's stats aren't, so it sits closer.
-    pub credit_gap: f32,
+    /// Air between the title's painted ink and the artist/owner/audience line's capitals,
+    /// on top of the header's own base. The album's credit is the identity of the page in a
+    /// way the playlist's stats aren't, so it hugs the name; a page whose credit line is a
+    /// quieter aside (the playlist's owner, the artist's audience count) asks for more.
+    pub credit_air: f32,
     /// Play button diameter. `None` draws no Play — the artist page brings its own buttons.
     pub play_size: Option<f32>,
     /// Whether the track currently loaded is one of this page's own and is actively playing
@@ -1744,7 +1759,7 @@ pub(crate) fn page_header(
         .min((available - 20.0 - 8.0 - 140.0).max(HEADER_ART_FLOOR_PT));
     let art = art_texture(images, backend, ui.ctx(), h.art_url, h.art_size);
     let art_rect = egui::Rect::from_min_size(
-        ui.cursor().min + egui::vec2(0.0, 4.0),
+        ui.cursor().min + egui::vec2(0.0, theme::HEADER_TOP_PAD),
         egui::vec2(art_size, art_size),
     );
     widgets::paint_art(
@@ -1767,30 +1782,61 @@ pub(crate) fn page_header(
     // headers truncated while the window still had room, and lost their text entirely
     // once that subtraction went negative.
     let text_w = (available - art_size - gutter - 8.0).max(0.0);
+    // The title takes the largest size that still fits its column, down to a floor: a long
+    // album or playlist name steps the type down rather than ellipsizing, so a one-word name
+    // stays loud and a sentence-long one stays whole.
+    let title_size = widgets::fit_size(
+        ui,
+        h.title,
+        text_w,
+        DETAIL_TITLE_MAX,
+        DETAIL_TITLE_MIN,
+        theme::bold,
+    );
+    let title_font = theme::bold(title_size);
     // The type line costs a row where it shows; without it the title sits higher — and with a
     // large art it still starts low enough to sit in the circle rather than float above it.
+    //
+    // With a type line the title hangs off that line's baseline instead of off a size-scaled
+    // constant: the cap line then sits the same distance below the label at any size, and a
+    // bigger name grows *downward* from it rather than drifting away from the label it belongs
+    // to. (The old `8 + size * 1.08` kept the line *box* centred, so the visible air between
+    // label and name grew with the size — worst at the 40pt ceiling.)
+    //
+    // `KIND_CENTRE`: where the label's own line sits, from the art's top. `KIND_BASELINE`:
+    // that centre plus Inter's baseline, 0.364 of the size below it.
+    const KIND_CENTRE: f32 = 9.0;
+    const KIND_BASELINE: f32 = KIND_CENTRE + 12.0 * 0.364;
+    const KIND_TO_TITLE_AIR: f32 = 8.0;
     let mut y = art_rect.top()
         + if h.kind_label.is_empty() {
-            if big { 26.0 } else { 12.0 }
+            if big {
+                title_size * 1.08
+            } else {
+                title_size * 0.5
+            }
         } else {
-            34.0
+            widgets::title_centre_under_label(KIND_BASELINE, KIND_TO_TITLE_AIR, title_size)
         };
     if !h.kind_label.is_empty() {
         ui.painter().text(
-            egui::pos2(tx, art_rect.top() + 8.0),
+            egui::pos2(tx, art_rect.top() + KIND_CENTRE),
             egui::Align2::LEFT_CENTER,
-            widgets::truncate_to(ui, h.kind_label, theme::semibold(11.0), text_w),
-            theme::semibold(11.0),
+            widgets::truncate_to(ui, h.kind_label, theme::semibold(12.0), text_w),
+            theme::semibold(12.0),
             palette.dim,
         );
     }
+    let shown_title = widgets::truncate_to(ui, h.title, title_font.clone(), text_w);
     crate::emoji::paint_line(
         ui,
         egui::pos2(tx, y),
-        &widgets::truncate_to(ui, h.title, theme::semibold(24.0), text_w),
-        theme::semibold(24.0),
+        &shown_title,
+        title_font.clone(),
         palette.text,
     );
+    // Where the painted title's ink actually ends, measured from the very line just drawn.
+    let title_ink = widgets::ink_drop(ui, &shown_title, &title_font);
     // The last text line painted, so the controls' baseline stays under it whether or not
     // the header has an artist line and a meta line.
     let mut last_line = y;
@@ -1800,24 +1846,42 @@ pub(crate) fn page_header(
     // distinction from a bold owner name, not from a separate colour tier here, so the two
     // read as one calm paragraph rather than clashing tones.
     //
-    // `y` moves past the description's own row (not just `credit_gap`, which was calibrated
-    // for "title straight to the credits, no description in between") — playlists are the only
-    // page that ever fills `description`, and with `y` left untouched here the owner/meta line
-    // below used to land only 12pt under it (`credit_gap` 36 vs the description's own 24),
-    // squeezed against a real line's worth of text rather than given room for one.
+    // `y` moves past the description's own row (not just the credits' own air, which is
+    // measured for "title straight to the credits, no description in between") — playlists are
+    // the only page that ever fills `description`, and with `y` left untouched here the
+    // owner/meta line below used to land only 12pt under it, squeezed against a real line's
+    // worth of text rather than given room for one.
+    //
+    // The base air under the title's ink, and half a 13pt Inter cap height: where the credit
+    // line's capitals sit above its own centre.
+    const CREDIT_AIR: f32 = 4.0;
+    const CREDIT_CAP_HALF: f32 = 4.7;
+    // Centre gap between the two 13pt lines below the title — the artist line and the stats
+    // line on an album, a description and the credits on a playlist. A 13pt line's box carries
+    // ~9.4pt of lead, so 19pt of centres reads as ~10pt of space between the ink: one block,
+    // not two paragraphs.
+    const LINE_GAP: f32 = 19.0;
     if let Some(description) = h.description {
-        let dy = y + 24.0;
+        // The description hangs off the title's ink exactly as the credits do: the playlist is
+        // the only page that fills it, and it reads as the first line of the same block.
+        let dy = y + title_ink + CREDIT_AIR + CREDIT_CAP_HALF + h.credit_air;
         ui.painter().text(
             egui::pos2(tx, dy),
             egui::Align2::LEFT_CENTER,
-            widgets::truncate_to(ui, description, theme::regular(12.0), text_w),
-            theme::regular(12.0),
+            widgets::truncate_to(ui, description, theme::regular(13.0), text_w),
+            theme::regular(13.0),
             palette.secondary,
         );
         last_line = dy;
-        y = dy + if big { 28.0 } else { 27.0 };
+        y = dy + LINE_GAP;
     } else {
-        y += h.credit_gap;
+        // The credits hang off the title's ink, not its line box: the page's own air, but
+        // never closer than the painted name allows. A name with no descenders ends at its
+        // baseline, so the credits ride right up under it; a tail ("y", "p") reaches most of
+        // the way down the box, and the credits keep that clearance. Hanging them off the box
+        // instead floated them under a descent that was usually empty — and the bigger the
+        // title, the more of it there was to float under.
+        y += title_ink + CREDIT_AIR + CREDIT_CAP_HALF + h.credit_air;
     }
     let mut link = None;
     match (h.artists.is_empty(), h.second_plain) {
@@ -1834,24 +1898,24 @@ pub(crate) fn page_header(
                 &subtitle,
                 None,
                 h.salt,
-                theme::regular(12.0),
+                theme::regular(13.0),
                 palette.secondary,
             ) {
                 link = Some(link_route(target));
             }
             last_line = y;
-            y += if big { 28.0 } else { 27.0 };
+            y += LINE_GAP;
         }
         (true, Some(plain)) => {
             ui.painter().text(
                 egui::pos2(tx, y),
                 egui::Align2::LEFT_CENTER,
-                widgets::truncate_to(ui, plain, theme::regular(12.0), text_w),
-                theme::regular(12.0),
+                widgets::truncate_to(ui, plain, theme::regular(13.0), text_w),
+                theme::regular(13.0),
                 palette.secondary,
             );
             last_line = y;
-            y += if big { 28.0 } else { 27.0 };
+            y += LINE_GAP;
         }
         // No line between title and meta: the meta takes the artist's slot, so the gap
         // below the title is the same 36 pt on a page that has no author to show. Before
@@ -1866,22 +1930,22 @@ pub(crate) fn page_header(
         // Music's own playlist headers, the bold name is what makes this read as *the* credit
         // line rather than a continuation of the description above it.
         if let Some(owner) = h.owner {
-            let name_font = theme::semibold(12.0);
-            let stat_font = theme::regular(12.0);
+            let name_font = theme::semibold(13.0);
+            let stat_font = theme::regular(13.0);
             let shown_name = widgets::truncate_to(ui, &owner.name, name_font.clone(), text_w);
             if !shown_name.is_empty() {
                 let name_w = widgets::text_width(ui, &shown_name, &name_font);
                 if let Some(id) = owner.id.as_deref() {
                     let hit = egui::Rect::from_min_size(
-                        egui::pos2(tx, y - 8.0),
-                        egui::vec2(name_w, 16.0),
+                        egui::pos2(tx, y - 8.5),
+                        egui::vec2(name_w, 17.0),
                     );
                     let r = ui.interact(hit, ui.id().with((h.salt, "owner")), egui::Sense::click());
                     if r.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         ui.painter().hline(
                             tx..=(tx + name_w),
-                            y + 7.0,
+                            y + 7.5,
                             egui::Stroke::new(1.0, palette.text),
                         );
                     }
@@ -1937,8 +2001,8 @@ pub(crate) fn page_header(
             ui.painter().text(
                 egui::pos2(tx, y),
                 egui::Align2::LEFT_CENTER,
-                widgets::truncate_to(ui, meta, theme::regular(12.0), text_w),
-                theme::regular(12.0),
+                widgets::truncate_to(ui, meta, theme::regular(13.0), text_w),
+                theme::regular(13.0),
                 color,
             );
         }
@@ -1963,16 +2027,19 @@ pub(crate) fn page_header(
     // Play, Save, ••• on their own baseline, nudged up from the art's bottom edge. When
     // the art has shrunk to its floor (a card narrowed by the queue panel), that baseline
     // climbs into the title and the column is too narrow for the three of them anyway —
-    // so the row drops below both art and text and takes the card's full width.
-    let inline_y = art_rect.bottom() - 46.0;
+    // so the row drops below both art and text and takes the card's full width. The rect is
+    // the Play button's own height plus its 1pt of air, so a bigger button lifts the whole
+    // row instead of overflowing the box it was given.
+    let control_h = h.play_size.map_or(46.0, |size| size + 2.0);
+    let inline_y = art_rect.bottom() - control_h;
     let below = inline_y < text_bottom;
     let controls_rect = if below {
         egui::Rect::from_min_size(
             egui::pos2(art_rect.left(), text_bottom + 6.0),
-            egui::vec2(available - 8.0, 46.0),
+            egui::vec2(available - 8.0, control_h),
         )
     } else {
-        egui::Rect::from_min_size(egui::pos2(tx, inline_y), egui::vec2(text_w, 46.0))
+        egui::Rect::from_min_size(egui::pos2(tx, inline_y), egui::vec2(text_w, control_h))
     };
     let mut controls = ui.new_child(
         egui::UiBuilder::new()
@@ -2206,6 +2273,7 @@ pub(crate) fn entry_row_spec<'a>(
             _ if item.is_artist() => widgets::ArtShape::Circle,
             _ => widgets::ArtShape::Square,
         },
+        hide_art: false,
         thumbnail: item.thumbnail(),
         menu: match item {
             Entry::Song(t) | Entry::Video(t) => Some(widgets::RowMenu {

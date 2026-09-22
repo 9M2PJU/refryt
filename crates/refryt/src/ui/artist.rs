@@ -39,7 +39,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             HEADER_ART_PT,
             widgets::SkeletonHeaderKind::Artist,
         );
-        widgets::skeleton_track_rows(ui, &app.palette, 6);
+        widgets::skeleton_track_rows(ui, &app.palette, 6, false);
         widgets::skeleton_shelf(
             ui,
             &app.palette,
@@ -87,14 +87,14 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
 fn hero_header(app: &mut App, ui: &mut egui::Ui) {
     let content_top = ui.cursor().min.y;
     let content_left = ui.cursor().min.x;
-    let inset_x = crate::theme::CONTENT_INSET_X;
-    let card_top = content_top - crate::theme::CONTENT_INSET_TOP;
-    // The content column is inset from the card's edges; the hero spans the card itself.
+    let inset_x = crate::theme::CARD_INSET_X;
+    // The content column is inset from the card's sides; the hero spans the card itself. There
+    // is no top margin to add: the card's top edge is the content's.
     let width = ui.available_width() + inset_x * 2.0;
     let height = (width * crate::images::HERO_ASPECT).clamp(HERO_MIN_H, HERO_MAX_H);
     let rect = egui::Rect::from_min_size(
-        pos2(content_left - inset_x, card_top),
-        vec2(width, height + crate::theme::CONTENT_INSET_TOP),
+        pos2(content_left - inset_x, content_top),
+        vec2(width, height),
     );
 
     let (name, audience, hero) = {
@@ -125,14 +125,8 @@ fn hero_header(app: &mut App, ui: &mut egui::Ui) {
     // against `slice`, rounding included: the rounded top edge has to be the *card's*, not the
     // banner's, or the frames where the banner is half gone cut it square.
     let card = egui::Rect::from_min_max(
-        pos2(
-            app.content_rect.min.x - inset_x,
-            app.content_rect.min.y - crate::theme::CONTENT_INSET_TOP,
-        ),
-        pos2(
-            app.content_rect.max.x + inset_x,
-            app.content_rect.max.y + crate::theme::CONTENT_INSET_TOP,
-        ),
+        pos2(app.content_rect.min.x - inset_x, app.content_rect.min.y),
+        pos2(app.content_rect.max.x + inset_x, app.content_rect.max.y),
     );
     let slice = rect.intersect(card);
     let painter = egui::Painter::new(ui.ctx().clone(), ui.layer_id(), card);
@@ -317,7 +311,7 @@ fn circle_header(app: &mut App, ui: &mut egui::Ui) {
                 second_plain: Some(&audience),
                 meta: None,
                 owner: None,
-                credit_gap: 36.0,
+                credit_air: 4.0,
                 // Play, Mix, Shuffle, Subscribe and ••• are this page's own row below, not
                 // `page_header`'s Play/Save/•••.
                 play_size: None,

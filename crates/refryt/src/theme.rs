@@ -33,6 +33,9 @@ pub const WINDOW_RADIUS: u8 = 10;
 
 pub const ROW_HEIGHT: f32 = 56.0;
 pub const ART_SIZE: f32 = 40.0;
+/// A track row's title. A step above the subtitle's 12 so the song reads first and the credits
+/// under it second, without losing the list's density.
+pub const ROW_TITLE_PT: f32 = 14.0;
 /// Where a track row's number/art block starts, from the row's own left edge. Zero so the list
 /// lines up with the page header's cover, which starts at the content origin.
 pub const ROW_LEFT_INSET: f32 = 0.0;
@@ -61,11 +64,31 @@ pub const GUTTER: f32 = 8.0;
 /// the same constant, so the tint never pokes past the card's own corners.
 pub const PANEL_RADIUS: u8 = 20;
 
-/// The content card's inner margins: where the CentralPanel frame puts its content. The
-/// header wash and the progress bar paint into them, so both sit on the card's own edges
-/// rather than floating inside the content.
-pub const CONTENT_INSET_X: f32 = 16.0;
-pub const CONTENT_INSET_TOP: f32 = 10.0;
+/// Every card's inner margins: a small side padding, and none top or bottom.
+///
+/// The sides keep text off the card's own edge. The top and bottom are zero on purpose: each
+/// card's scroll viewport runs its full height, so content is clipped at the card's top and
+/// bottom edges instead of at a margin inside them — the whole card is content, and the cut
+/// lands on the card's silhouette. The rounded corners that clip cannot follow are covered by
+/// [`crate::widgets::paint_corner_notches`].
+pub const CARD_INSET: egui::Margin = egui::Margin {
+    left: 8,
+    right: 8,
+    top: 0,
+    bottom: 0,
+};
+
+/// [`CARD_INSET`]'s side padding as a scalar, for the geometry that grows a content rect back
+/// out to the card's own edges — the header wash, the artist hero, the corner repaint.
+pub const CARD_INSET_X: f32 = 8.0;
+
+/// The page header's own top gap inside the content card.
+///
+/// The card has no top margin any more, so this is the whole distance from its top edge to the
+/// header's art — the same distance the art has from the card's side, so the cover sits square
+/// in the corner rather than closer to one edge than the other. Shared by the real header and
+/// the loading skeleton, which would otherwise jump when the page arrives.
+pub const HEADER_TOP_PAD: f32 = CARD_INSET_X;
 
 /// A rail row: cover, title, author.
 pub const RAIL_ROW_HEIGHT: f32 = 60.0;
@@ -158,26 +181,6 @@ impl Palette {
     /// A card's fill as painted. Composites with [`Self::window_fill`] underneath it.
     pub fn card_fill(&self) -> Color32 {
         self.panel.gamma_multiply(self.card_alpha)
-    }
-
-    /// What a pixel inside a card actually looks like on screen: [`Self::card_fill`] blended
-    /// over [`Self::window_fill`], the same two layers the shell always paints one on the
-    /// other. Anything that needs to dissolve *into the background a row sits on* — a fade at
-    /// a scrolling title's edge, say — wants this, not `card_fill()` alone: in opaque mode the
-    /// two are identical, which is why using `card_fill()` there went unnoticed, but in acrylic
-    /// mode `card_fill()` alone is only the card's own translucent tint, not what is actually
-    /// behind the pixel.
-    ///
-    /// Deliberately still translucent, matching `fade_span`'s own reasoning for using
-    /// `gamma_multiply` instead of an unmultiplied colour: forcing this to full alpha once
-    /// looked *more* wrong, not less — the composite is dominated by whatever a real desktop
-    /// shows through the two layers (at "strong", `card_alpha` alone is under 40%), which this
-    /// has no way to know, so an opaque guess just painted a confidently wrong plate over the
-    /// text instead of a wash that at least lets the correctly-rendered pixel underneath show
-    /// through. There is no version of this that matches perfectly against an arbitrary live
-    /// blur; letting the real pixel bleed through is the closer approximation of the two.
-    pub fn row_fill(&self) -> Color32 {
-        self.window_fill().blend(self.card_fill())
     }
 
     /// Whether anything shows through. What the blur asks before it bothers.
@@ -489,10 +492,11 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     }
     // A sibling of the opacities above, on the same `scroll` struct but easy to miss: egui
     // paints its own 20px edge fade at the top/bottom of every `ScrollArea` once scrolled off
-    // the top, at 50% strength by default, with no scrollbar involved. Every page's content
-    // sits in one via `page_scroll`, so every one of them got a translucent band sliding under
-    // the viewport's edge that had nothing to do with this app's own fades (the marquee ones,
-    // `widgets::fade_span`) — easy to mistake for a bug in those instead of egui's default.
+    // the top, at 50% strength by default, with no scrollbar involved. It fades to
+    // `ui.stack().bg_color()` — a guess at what is behind the content — and content is clipped
+    // at the card's own edges here anyway (`CARD_INSET` has no top or bottom), so there is
+    // nothing for it to fade. The app's own dissolves (`widgets::fade_slices`) fade the text's
+    // own alpha where a line is cut, which needs no background guess.
     style.spacing.scroll.fade.strength = 0.0;
     // Menus are drawn by `widgets::menu_item`, which paints its own padding.
     style.spacing.menu_margin = egui::Margin::symmetric(4, 6);

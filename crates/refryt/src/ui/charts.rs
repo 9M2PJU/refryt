@@ -14,7 +14,7 @@ use crate::ui::{failed, section, shelf_carousel};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     ui.label(
         egui::RichText::new("Charts")
             .font(theme::semibold(18.0))

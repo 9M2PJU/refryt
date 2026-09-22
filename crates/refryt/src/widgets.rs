@@ -549,6 +549,11 @@ pub struct TrackRow<'a> {
     pub badge: Option<&'a str>,
     pub art: Option<&'a egui::TextureHandle>,
     pub shape: ArtShape,
+    /// Draw no cover in the leading slot: the album page, where every row would only repeat the
+    /// header's own art. The slot collapses and the number becomes the row's leading element;
+    /// while the pointer is over the row the number gives way to a play/pause glyph, since the
+    /// cover's own hover play button is not there to carry that affordance.
+    pub hide_art: bool,
     /// Distinguishes this row's interactive pieces from its neighbours'.
     pub id_salt: usize,
     /// Right-click menu. `None` for rows that are not songs.
@@ -641,6 +646,9 @@ pub fn paint_subtitle<'a>(
 
 /// How wide the dissolve at an overlong line's edge is.
 pub const FADE_W: f32 = 24.0;
+/// Slices a dissolve is painted in. The ramp is stepped rather than smooth; at this size a
+/// line's own anti-aliasing hides the steps, and every slice is another paint of the line.
+const FADE_STEPS: usize = 12;
 /// Hover this long before an overlong line starts moving.
 const MARQUEE_DWELL_SECS: f64 = 0.6;
 /// Pixels per second once moving.
@@ -651,39 +659,147 @@ const MARQUEE_HOLD_SECS: f64 = 0.4;
 /// when the text fits and `marquee_line` draws no viewport of its own.
 pub(crate) const MARQUEE_HIT_H: f32 = 18.0;
 
-/// Dissolve the trailing edge of a text viewport into `bg`, so an overlong line never
-/// touches whatever sits past it. Slices, not a mesh: epaint has no gradient fill, and 24
-/// 1px rects are cheaper than one mesh for a single edge.
+/// The strips a clipped line's viewport dissolves at: the trailing one always (the line
+/// overflows by definition), the leading one only once the line has scrolled and its head is
+/// cut off. Returns `(main, lead, trail)`, where `main` is what the solid paint keeps — either
+/// strip may come back empty, and on a viewport narrower than the fade they can overlap, which
+/// leaves `main` inverted and the caller paints nothing solid.
+fn dissolve_bands(clip: Rect, scrolled: bool, left: f32, right: f32) -> (Rect, Option<Rect>, Rect) {
+    let lead = scrolled.then(|| {
+        Rect::from_min_max(
+            clip.min,
+            egui::pos2((left + FADE_W).min(clip.max.x), clip.max.y),
+        )
+    });
+    let trail = Rect::from_min_max(
+        egui::pos2((right - FADE_W).max(clip.min.x), clip.min.y),
+        clip.max,
+    );
+    let mut main = clip;
+    if let Some(lead) = lead {
+        main.min.x = main.min.x.max(lead.max.x);
+    }
+    main.max.x = main.max.x.min(trail.min.x);
+    (main, lead, trail)
+}
+
+/// Dissolve a clipped line's cut edge by repainting it in slices, each fainter than the last,
+/// so the text itself fades out instead of a plate of some background colour being laid over
+/// it.
 ///
-/// `h` is the line's own height — the fade is clamped to it, so one line's dissolve can
-/// never bleed onto its neighbour.
-pub fn fade_edge(ui: &mut Ui, right: f32, center_y: f32, h: f32, bg: Color32) {
-    fade_span(ui, right - FADE_W, center_y, h, bg, false);
-}
-
-/// The mirror: dissolve the leading edge, shown only once the line has scrolled and its
-/// head is cut off.
-fn fade_leading(ui: &mut Ui, left: f32, center_y: f32, h: f32, bg: Color32) {
-    fade_span(ui, left, center_y, h, bg, true);
-}
-
-fn fade_span(ui: &mut Ui, from: f32, center_y: f32, h: f32, bg: Color32, mirrored: bool) {
-    let steps = FADE_W as usize;
-    for i in 0..steps {
-        let f = (i as f32 + 1.0) / steps as f32;
-        let t = if mirrored { 1.0 - f } else { f };
-        ui.painter().rect_filled(
-            Rect::from_min_size(
-                egui::pos2(from + i as f32, center_y - h / 2.0),
-                vec2(1.0, h),
-            ),
-            CornerRadius::ZERO,
-            // `gamma_multiply` scales a premultiplied colour, alpha included, so this ramps
-            // toward `bg` *as painted* — a translucent shell no longer grows an opaque plate
-            // at the end of a long title, and the old `from_rgba_unmultiplied` also mixed
-            // premultiplied channels as if they were straight.
-            bg.gamma_multiply(t),
+/// The dissolve this replaces painted the background colour over the line, which needed the
+/// background to be known: opaque mode could supply it, acrylic mode could not (a live-blurred
+/// desktop is unknowable ahead of painting), so it was skipped there and long titles hard-cut.
+/// Multiplying the line's own alpha needs no such guess — whatever is behind the text shows
+/// through the fade exactly as it shows through the text — so the dissolve works in every mode.
+///
+/// `band` is the strip the cut eats into; `cut_at_start` puts the transparent end on the
+/// band's leading edge (the case once the line has scrolled) rather than its trailing one.
+fn fade_slices(ui: &mut Ui, band: Rect, cut_at_start: bool, mut paint: impl FnMut(&mut Ui, Rect)) {
+    if band.width() < 1.0 {
+        return;
+    }
+    // Relative to whatever opacity the caller's ui already carries (a disabled ui, say), and
+    // restored after each slice so nothing downstream inherits a dissolve's alpha.
+    let prev = ui.opacity();
+    let step = band.width() / FADE_STEPS as f32;
+    for i in 0..FADE_STEPS {
+        let f = i as f32 / (FADE_STEPS - 1) as f32;
+        let t = if cut_at_start { f } else { 1.0 - f };
+        let slice = Rect::from_min_max(
+            egui::pos2(band.min.x + i as f32 * step, band.min.y),
+            egui::pos2(band.min.x + (i + 1) as f32 * step, band.max.y),
         );
+        ui.set_opacity(prev * t);
+        paint(ui, slice);
+        ui.set_opacity(prev);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Card corners
+// ---------------------------------------------------------------------------------------------
+
+/// The x-inset of a rounded corner at `d` points in from the edge, for a corner of radius
+/// `rad`: `rad` at the very edge, 0 once `d >= rad`. The quarter-circle both the header wash
+/// and the corner repaint walk, so a square shape never pokes past a card's corners.
+pub(crate) fn corner_inset(rad: f32, d: f32) -> f32 {
+    let dy = (rad - d).max(0.0);
+    rad - (rad * rad - dy * dy).max(0.0).sqrt()
+}
+
+/// A card's own rect, given the rect its content was laid out in and the frame's inner margin.
+/// The header wash, the artist hero and the corner repaint all need the card's edges; the
+/// content rect is all a `Ui` hands back.
+pub(crate) fn card_rect(inner: egui::Rect, inset: egui::Margin) -> egui::Rect {
+    egui::Rect::from_min_max(
+        inner.min - vec2(f32::from(inset.left), f32::from(inset.top)),
+        inner.max + vec2(f32::from(inset.right), f32::from(inset.bottom)),
+    )
+}
+
+/// The rows of the four corner notches a card's content can reach: `(y, x0, x1)` per row, from
+/// the corner's edge inward, spanning from the content column's edge out to the card's rounded
+/// silhouette. The content is clipped to its column, so the outer strip of each notch is left
+/// alone; the samples stop where the silhouette comes back inside the column, and the last one
+/// is degenerate there, tapering the mesh to a point rather than leaving a wedge unpainted.
+fn notch_rows(card: egui::Rect, rad: f32, inset_x: f32) -> [Vec<(f32, f32, f32)>; 4] {
+    let inset_x = inset_x.clamp(0.0, rad);
+    let mut rows: [Vec<(f32, f32, f32)>; 4] = std::array::from_fn(|_| Vec::new());
+    // Where the silhouette meets the content column: past it there is nothing left to cover.
+    let arm = rad - inset_x;
+    let close = rad - (rad * rad - arm * arm).max(0.0).sqrt();
+    if close <= 0.0 {
+        return rows;
+    }
+    const ARC_STEPS: usize = 10;
+    for i in 0..=ARC_STEPS {
+        let d = close * i as f32 / ARC_STEPS as f32;
+        let inset = corner_inset(rad, d);
+        let (top, bottom) = (card.top() + d, card.bottom() - d);
+        rows[0].push((top, card.left() + inset_x, card.left() + inset));
+        rows[1].push((top, card.right() - inset, card.right() - inset_x));
+        rows[2].push((bottom, card.left() + inset_x, card.left() + inset));
+        rows[3].push((bottom, card.right() - inset, card.right() - inset_x));
+    }
+    rows
+}
+
+/// Paint the four corner notches of a card — the region inside its square rect but outside its
+/// rounded silhouette — with `colour`.
+///
+/// Cards have no top or bottom inner margin any more, so their scroll viewports run the card's
+/// full height and content is clipped at the card's own top and bottom edges. The clip is a
+/// rectangle and the card is not, so what the content leaves outside the silhouette is painted
+/// over with the gutter: `palette.window`, exactly the colour the gutter is in opaque mode,
+/// which makes this the rounded clip egui cannot do. In acrylic mode the gutter is translucent
+/// and this sliver is not — the deliberate trade for content that fills the card; it is a few
+/// points wide, and only where the content column actually reaches a corner.
+pub(crate) fn paint_corner_notches(ui: &Ui, card: egui::Rect, inset_x: f32, colour: Color32) {
+    if card.width() <= 0.0 || card.height() <= 0.0 {
+        return;
+    }
+    let painter = egui::Painter::new(ui.ctx().clone(), ui.layer_id(), card);
+    for corner in notch_rows(card, crate::theme::PANEL_RADIUS as f32, inset_x) {
+        if corner.len() < 2 {
+            continue;
+        }
+        let mut mesh = egui::Mesh::default();
+        for &(y, x0, x1) in &corner {
+            for x in [x0, x1] {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: egui::pos2(x, y),
+                    uv: egui::epaint::WHITE_UV,
+                    color: colour,
+                });
+            }
+        }
+        for row in 0..corner.len() - 1 {
+            let a = (row * 2) as u32;
+            mesh.add_triangle(a, a + 2, a + 1);
+            mesh.add_triangle(a + 1, a + 2, a + 3);
+        }
+        painter.add(mesh);
     }
 }
 
@@ -729,10 +845,10 @@ fn pingpong(offset: f32, dir: f32, max_off: f32, advance: f32) -> (f32, f32) {
 /// overflow case creates one — so a caller can make the text itself clickable without
 /// covering the hover that drives the scroll; `None` means it fit and was painted plainly.
 ///
-/// The dissolves are clamped to the font's own row height, so a title's fade stops where
-/// its line stops and never washes the credits below. Repaint discipline: frames are
-/// asked for only while hovered-and-overflowing. At rest nothing is requested; unhovering
-/// snaps home on the pointer-move frame that caused it.
+/// The dissolves fade the line's own alpha ([`fade_slices`]), so they need no background
+/// colour and hold up over the acrylic shell as well as the opaque one. Repaint discipline:
+/// frames are asked for only while hovered-and-overflowing. At rest nothing is requested;
+/// unhovering snaps home on the pointer-move frame that caused it.
 #[allow(clippy::too_many_arguments)]
 pub fn marquee_line(
     ui: &mut Ui,
@@ -741,13 +857,6 @@ pub fn marquee_line(
     text: &str,
     font: egui::FontId,
     color: Color32,
-    // `None` skips the dissolve entirely rather than guessing: a shell-translucent background
-    // is dominated by whatever a real, live-blurred desktop shows through it, which cannot be
-    // known ahead of painting — an opaque guess there paints a confidently wrong plate, and a
-    // still-translucent guess washes an extra, still-wrong tint over the correctly-rendered
-    // pixel. The text is already hard-clipped at this same boundary regardless (below), so
-    // skipping just loses the decorative dissolve, not any actual coverage.
-    bg: Option<Color32>,
     id_salt: impl std::hash::Hash + Clone + std::fmt::Debug,
     sense: egui::Sense,
     // Whether the caller's wider row (art, duration, blank space — not just this text strip)
@@ -805,33 +914,21 @@ pub fn marquee_line(
     ui.ctx().data_mut(|d| d.insert_temp(id, state.clone()));
 
     let clip = ui.clip_rect().intersect(viewport);
-    crate::emoji::paint_clipped_line(
-        ui,
-        clip,
-        egui::pos2(pos.x - state.offset, pos.y),
-        text,
-        font.clone(),
-        color,
-    );
-    if let Some(bg) = bg {
-        let line_h = ui.fonts_mut(|f| f.row_height(&font));
-        fade_edge(ui, pos.x + max_width, pos.y, line_h, bg);
-        if state.offset > 0.5 {
-            fade_leading(ui, pos.x, pos.y, line_h, bg);
-        }
+    let line_pos = egui::pos2(pos.x - state.offset, pos.y);
+    let (main, lead, trail) = dissolve_bands(clip, state.offset > 0.5, pos.x, pos.x + max_width);
+    let mut paint = |ui: &mut Ui, slice: Rect| {
+        crate::emoji::paint_clipped_line(ui, slice, line_pos, text, font.clone(), color);
+    };
+    if main.width() > 0.5 {
+        paint(ui, main);
     }
+    if let Some(lead) = lead {
+        fade_slices(ui, lead, true, &mut paint);
+    }
+    fade_slices(ui, trail, false, &mut paint);
     Some(response)
 }
 
-/// The player bar's credits line: like [`paint_subtitle`], but scrolling on hover when the
-/// credits are wider than the room — which is exactly the short-title-long-artists case.
-///
-/// Fits and this *is* `paint_subtitle`: same paint, same hit rects, no state. Overflows and
-/// the whole line scrolls ping-pong under a clipped viewport with dissolves on both cut
-/// edges. Link hit rects ride the same offset as the paint, so artists stay clickable
-/// mid-scroll; a link hovered last frame counts as viewport hover, because stacked links
-/// take the hover flag from the viewport beneath them and the scroll would otherwise stop
-/// dead under the pointer.
 /// The full laid-out width of a subtitle, separators included — what the marquee would measure
 /// if nothing clipped it. The player bar's rating column hugs this, so the thumbs sit beside
 /// the text rather than beside an empty field.
@@ -855,15 +952,22 @@ pub fn subtitle_width(ui: &Ui, subtitle: &Subtitle<'_>, tail: Option<&str>) -> f
         .sum()
 }
 
+/// The player bar's credits line: like [`paint_subtitle`], but scrolling on hover when the
+/// credits are wider than the room — which is exactly the short-title-long-artists case.
+///
+/// Fits and this *is* `paint_subtitle`: same paint, same hit rects, no state. Overflows and
+/// the whole line scrolls ping-pong under a clipped viewport with a dissolve on each cut
+/// edge, fading the line's own alpha ([`fade_slices`]) so it holds up over the acrylic shell
+/// as well as the opaque one. Link hit rects ride the same offset as the paint, so artists
+/// stay clickable mid-scroll; a link hovered last frame counts as viewport hover, because
+/// stacked links take the hover flag from the viewport beneath them and the scroll would
+/// otherwise stop dead under the pointer.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_subtitle_marquee<'a>(
     ui: &mut Ui,
     palette: &Palette,
     pos: egui::Pos2,
     max_width: f32,
-    // See `marquee_line`'s own doc on this parameter: `None` skips the dissolve rather than
-    // guessing a colour a live-blurred shell background has no way to actually match.
-    bg: Option<Color32>,
     subtitle: &Subtitle<'a>,
     tail: Option<&'a str>,
     id_salt: impl std::hash::Hash + Clone + std::fmt::Debug,
@@ -949,62 +1053,69 @@ pub fn paint_subtitle_marquee<'a>(
     state.full_w = full;
 
     let clip = ui.clip_rect().intersect(viewport);
-    let painter = ui.painter().with_clip_rect(clip);
-    // No early break: the clip rect does the cutting, scrolled or not.
+    let (main, lead, trail) = dissolve_bands(clip, state.offset > 0.5, pos.x, pos.x + max_width);
+    // Layout and interaction first: the paint below re-runs the layout once per dissolve slice,
+    // and the links must not be re-registered for each one. No early break — the clip rect does
+    // the cutting, scrolled or not.
     let mut x = pos.x - state.offset;
     let mut clicked = None;
     let mut link_hovered = false;
+    // (x, text, width, colour, underlined): the underline only while its link is hovered.
+    let mut pieces: Vec<(f32, &str, f32, Color32, bool)> = Vec::with_capacity(parts.len() * 2);
     for (i, part) in parts.iter().enumerate() {
         if i > 0 && !part.sep.is_empty() {
-            painter.text(
-                egui::pos2(x, pos.y),
-                egui::Align2::LEFT_CENTER,
-                part.sep,
-                font.clone(),
-                palette.dim,
-            );
-            x += text_width(ui, part.sep, &font);
+            let w = text_width(ui, part.sep, &font);
+            pieces.push((x, part.sep, w, palette.dim, false));
+            x += w;
         }
         let w = text_width(ui, part.text, &font);
         let mut colour = base_colour;
+        let mut underlined = false;
         if let Some(target) = part.target {
             let hit = Rect::from_min_size(egui::pos2(x, pos.y - 8.0), vec2(w, 16.0));
             let r = ui.interact(hit, ui.id().with((id, i)), Sense::click());
             if r.hovered() {
                 link_hovered = true;
                 colour = palette.text;
+                underlined = true;
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                painter.hline(
-                    x..=(x + w),
-                    pos.y + 7.0,
-                    egui::Stroke::new(1.0, palette.text),
-                );
             }
             if r.clicked() {
                 clicked = Some(target);
             }
         }
-        crate::emoji::paint_clipped_line(
-            ui,
-            clip,
-            egui::pos2(x, pos.y),
-            part.text,
-            font.clone(),
-            colour,
-        );
+        pieces.push((x, part.text, w, colour, underlined));
         x += w;
     }
     state.link_hovered = link_hovered;
-    let offset = state.offset;
     ui.ctx().data_mut(|d| d.insert_temp(id, state));
 
-    if let Some(bg) = bg {
-        let line_h = ui.fonts_mut(|f| f.row_height(&font));
-        fade_edge(ui, pos.x + max_width, pos.y, line_h, bg);
-        if offset > 0.5 {
-            fade_leading(ui, pos.x, pos.y, line_h, bg);
+    let mut paint = |ui: &mut Ui, slice: Rect| {
+        for &(x, text, w, colour, underlined) in &pieces {
+            crate::emoji::paint_clipped_line(
+                ui,
+                slice,
+                egui::pos2(x, pos.y),
+                text,
+                font.clone(),
+                colour,
+            );
+            if underlined {
+                ui.painter().with_clip_rect(slice).hline(
+                    x..=(x + w),
+                    pos.y + 7.0,
+                    egui::Stroke::new(1.0, palette.text),
+                );
+            }
         }
+    };
+    if main.width() > 0.5 {
+        paint(ui, main);
     }
+    if let Some(lead) = lead {
+        fade_slices(ui, lead, true, &mut paint);
+    }
+    fade_slices(ui, trail, false, &mut paint);
     clicked
 }
 
@@ -1113,7 +1224,10 @@ pub fn skeleton_rows(ui: &mut Ui, palette: &Palette, n: usize) {
 /// [`skeleton_rows`] for a numbered track list (Album/Playlist): adds the number column
 /// `skeleton_rows` leaves out and a right-aligned duration slot, matching what [`track_row`]
 /// actually paints for those pages rather than a generic row.
-pub fn skeleton_track_rows(ui: &mut Ui, palette: &Palette, n: usize) {
+/// Grey placeholder track rows while a list loads. `hide_art` mirrors the real rows' own flag
+/// (the album page, where every cover would be the header's), so the skeleton is the same shape
+/// the rows arrive in and the list does not shift when they do.
+pub fn skeleton_track_rows(ui: &mut Ui, palette: &Palette, n: usize, hide_art: bool) {
     let duration_w = 44.0;
     let right_pad = 20.0;
     for _ in 0..n {
@@ -1141,12 +1255,18 @@ pub fn skeleton_track_rows(ui: &mut Ui, palette: &Palette, n: usize) {
             ),
             vec2(theme::ART_SIZE, theme::ART_SIZE),
         );
-        ui.painter().rect_filled(
-            art,
-            CornerRadius::same(theme::RADIUS_SMALL),
-            palette.surface_hover,
-        );
-        let tx = art.right() + 12.0;
+        if !hide_art {
+            ui.painter().rect_filled(
+                art,
+                CornerRadius::same(theme::RADIUS_SMALL),
+                palette.surface_hover,
+            );
+        }
+        let tx = if hide_art {
+            rect.left() + theme::ROW_LEFT_INSET + theme::ROW_NUMBER_W + 12.0
+        } else {
+            art.right() + 12.0
+        };
         let text_w = (rect.right() - right_pad - duration_w - 8.0 - tx).max(40.0);
         ui.painter().rect_filled(
             Rect::from_min_size(
@@ -1326,6 +1446,8 @@ pub enum SkeletonHeaderKind {
 /// whatever button row the real header for `kind` would paint, rather than always exactly two
 /// bars regardless of what's loading.
 pub fn skeleton_header(ui: &mut Ui, palette: &Palette, size: f32, kind: SkeletonHeaderKind) {
+    // The same top gap the real header takes, so the page does not jump when it arrives.
+    ui.add_space(theme::HEADER_TOP_PAD);
     ui.horizontal(|ui| {
         let circle = matches!(kind, SkeletonHeaderKind::Artist);
         let (art_rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
@@ -1347,17 +1469,17 @@ pub fn skeleton_header(ui: &mut Ui, palette: &Palette, size: f32, kind: Skeleton
             }
             SkeletonHeaderKind::Detail { description } => {
                 ui.add_space(8.0);
-                skeleton_bar(ui, palette, (ui.available_width() * 0.15).max(50.0), 10.0);
+                skeleton_bar(ui, palette, (ui.available_width() * 0.15).max(50.0), 11.0);
                 ui.add_space(10.0);
-                skeleton_bar(ui, palette, (ui.available_width() * 0.55).max(120.0), 18.0);
+                skeleton_bar(ui, palette, (ui.available_width() * 0.55).max(120.0), 32.0);
                 ui.add_space(10.0);
                 if description {
-                    skeleton_bar(ui, palette, (ui.available_width() * 0.4).max(100.0), 10.0);
+                    skeleton_bar(ui, palette, (ui.available_width() * 0.4).max(100.0), 11.0);
                     ui.add_space(8.0);
                 }
-                skeleton_bar(ui, palette, (ui.available_width() * 0.35).max(90.0), 10.0);
+                skeleton_bar(ui, palette, (ui.available_width() * 0.35).max(90.0), 11.0);
                 ui.add_space(14.0);
-                skeleton_bar(ui, palette, (ui.available_width() * 0.4).max(110.0), 34.0);
+                skeleton_bar(ui, palette, (ui.available_width() * 0.4).max(110.0), 40.0);
             }
         });
     });
@@ -1392,6 +1514,7 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         badge,
         art,
         shape,
+        hide_art,
         id_salt,
         menu,
         like,
@@ -1461,7 +1584,11 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
     };
     let row_art = if narrow { 32.0 } else { theme::ART_SIZE };
     // A video still keeps its 16:9 aspect instead of being squeezed into the square slot.
-    let art_w = if shape == ArtShape::Wide {
+    // Hidden art leaves a zero-width slot rather than its own branch: the number column and
+    // the title's own 12pt gap then place the text exactly as they would beside a cover.
+    let art_w = if hide_art {
+        0.0
+    } else if shape == ArtShape::Wide {
         row_art * 16.0 / 9.0
     } else {
         row_art
@@ -1475,17 +1602,33 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
     // flag, which would blink the highlight out as the pointer crosses them.
     let over = response.contains_pointer();
     let t = fade(ui, response.id.with("row"), over);
+    // A hidden cover leaves its play control behind in the number's slot: the leading column
+    // — where the hover glyph appears — plays on a single click, exactly as the cover did, so
+    // double-click-to-play keeps the same one exception it always had.
+    let number_play = hide_art && !narrow && number.is_some() && menu.is_some();
+    let number_rect = Rect::from_min_size(
+        egui::pos2(rect.left() + theme::ROW_LEFT_INSET, rect.top()),
+        vec2(theme::ROW_NUMBER_W, rect.height()),
+    );
     // Double-click-to-play: the row's own track is the id to select or play. A row without a
     // menu (the queue's current row) is not a selectable list item, so it keeps the plain click.
     // The cover is exempt: it is the hover play button's own control, so a click on it plays on a
     // single click whatever the setting says — and short-circuiting `activate` is what keeps that
-    // click from also marking the row as merely selected.
-    let activate = if on_cover(
-        shape,
-        art_rect,
-        response.interact_pointer_pos(),
-        response.clicked(),
-    ) {
+    // click from also marking the row as merely selected. A hidden slot has no cover to press
+    // (and a zero-width rect would otherwise swallow a click landing exactly on its line).
+    let activate = if (!hide_art
+        && on_cover(
+            shape,
+            art_rect,
+            response.interact_pointer_pos(),
+            response.clicked(),
+        ))
+        || (number_play
+            && response.clicked()
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|pos| number_rect.contains(pos)))
+    {
         true
     } else {
         match menu.as_ref() {
@@ -1509,10 +1652,12 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
                 .rect_filled(rect, radius, palette.surface_hover.gamma_multiply(t));
         }
 
-        paint_art(ui, palette, art_rect, art, shape);
-        // A cover you can press is a control; one you cannot is a picture.
-        if shape == ArtShape::Square {
-            play_overlay(ui, palette, art_rect, t, false, playing);
+        if !hide_art {
+            paint_art(ui, palette, art_rect, art, shape);
+            // A cover you can press is a control; one you cannot is a picture.
+            if shape == ArtShape::Square {
+                play_overlay(ui, palette, art_rect, t, false, playing);
+            }
         }
 
         if !narrow && let Some(rank) = rank {
@@ -1548,16 +1693,42 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
                 );
             }
         } else if !narrow && let Some(n) = number {
-            ui.painter().text(
-                egui::pos2(
-                    rect.left() + theme::ROW_LEFT_INSET + num_w - theme::ROW_NUMBER_GAP,
-                    rect.center().y,
-                ),
-                egui::Align2::RIGHT_CENTER,
-                n.to_string(),
-                theme::regular(12.0),
-                palette.dim,
-            );
+            if number_play && over {
+                // The cover's own hover play button went with the cover, so the affordance
+                // moves into the number's slot — the pointer turns the number into a play
+                // (or pause, on the row that is already going) glyph. Painted in the accent
+                // the cover's button used, so the two read as the same control.
+                let glyph = 14.0;
+                let icon = if playing {
+                    Icon::PauseFilled
+                } else {
+                    Icon::PlayFilled
+                };
+                // The play triangle's visual centre sits left of its bounding box; Pause is
+                // symmetric and needs no nudge.
+                let nudge = if playing { 0.0 } else { glyph * 0.06 };
+                icon.image(palette.accent, glyph).paint_at(
+                    ui,
+                    Rect::from_center_size(
+                        egui::pos2(
+                            rect.left() + theme::ROW_LEFT_INSET + num_w / 2.0 + nudge,
+                            rect.center().y,
+                        ),
+                        vec2(glyph, glyph),
+                    ),
+                );
+            } else {
+                ui.painter().text(
+                    egui::pos2(
+                        rect.left() + theme::ROW_LEFT_INSET + num_w - theme::ROW_NUMBER_GAP,
+                        rect.center().y,
+                    ),
+                    egui::Align2::RIGHT_CENTER,
+                    n.to_string(),
+                    theme::regular(12.0),
+                    palette.dim,
+                );
+            }
         }
 
         let text_x = art_rect.right() + 12.0;
@@ -1587,20 +1758,9 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
 
         let title_color = if active { palette.accent } else { palette.text };
         // A long title scrolls on hover instead of hard-truncating; a title that fits is painted
-        // plainly. Hover-only sense, so the row's own click is never stolen.
-        //
-        // The fade dissolve at the scroll edges is skipped in translucent mode: `surface_hover`
-        // is a real opaque highlight painted over the whole row regardless of opacity settings,
-        // so it stays safe to dissolve into, but `row_fill()` is only ever a guess at what a
-        // live-blurred shell shows through — see `Palette::row_fill`'s own doc for why an
-        // opaque *or* translucent guess there both painted something visibly wrong.
-        let marquee_bg = if over {
-            Some(palette.surface_hover)
-        } else if palette.translucent() {
-            None
-        } else {
-            Some(palette.row_fill())
-        };
+        // plainly. Hover-only sense, so the row's own click is never stolen. Its cut-off fades
+        // the text's own alpha, so no background colour is needed — the row's hover highlight
+        // shows through the dissolve instead of being guessed at.
         // A one-part "subtitle" so the title can carry the same album link the artist credit
         // below it already can, through the exact machinery that lets that link coexist with
         // clicking elsewhere on the row to play it (`ListClick::Link` vs `ListClick::Row`).
@@ -1612,28 +1772,27 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         if let Some(target) = paint_subtitle_marquee(
             ui,
             palette,
-            egui::pos2(title_x, rect.center().y - 9.0),
+            egui::pos2(title_x, rect.center().y - 9.5),
             text_w,
-            marquee_bg,
             &title_parts,
             None,
             ("ytm-row-title", id_salt),
             over,
-            theme::medium(13.0),
+            theme::medium(theme::ROW_TITLE_PT),
             title_color,
         ) {
             link = Some(target);
         }
         // Subtitle pieces, laid out left to right so each linked piece gets its own hit area.
-        // The play-count tail rides the same line and scrolls with it.
+        // The play-count tail rides the same line and scrolls with it. The pair's ±9.5 split
+        // (was ±9 at the old 13pt title) keeps the same gap between the two lines.
         let sub_right = rect.right() - right_pad - duration_w - thumb_w;
         let sub_w = (sub_right - text_x).max(0.0);
         if let Some(target) = paint_subtitle_marquee(
             ui,
             palette,
-            egui::pos2(text_x, rect.center().y + 9.0),
+            egui::pos2(text_x, rect.center().y + 9.5),
             sub_w,
-            marquee_bg,
             &subtitle,
             plays,
             ("ytm-row-link", id_salt),
@@ -2598,6 +2757,57 @@ pub fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
     ui.fonts_mut(|f| text.chars().map(|c| f.glyph_width(font, c)).sum())
 }
 
+/// The largest size in `min..=max` — 2pt steps — at which `text` still fits `max_width`.
+///
+/// A detail header's title shrinks rather than ellipsizing, so a long album name keeps its one
+/// line; `min` when even that overflows, and the caller's own `truncate_to` cuts it there.
+/// `font` builds the `FontId` for a size, so the family stays the theme's business.
+pub fn fit_size(
+    ui: &Ui,
+    text: &str,
+    max_width: f32,
+    max: f32,
+    min: f32,
+    font: impl Fn(f32) -> egui::FontId,
+) -> f32 {
+    let mut size = max;
+    while size > min && text_width(ui, text, &font(size)) > max_width {
+        size = (size - 2.0).max(min);
+    }
+    size
+}
+
+/// How far above its own centre a capital's ink reaches, as a fraction of the font size —
+/// measured from Inter: a 40pt capital rises 14pt.
+pub const TITLE_CAP_RISE: f32 = 0.35;
+
+/// Where a detail header's title centre belongs when a type line ("ALBUM") sits above it.
+///
+/// Measured from that line's own baseline: the air, plus the title's cap rise. What matters is
+/// what it does *not* do — the cap line, which is what the eye reads as the top of the name,
+/// stays the same distance under the label at every title size, so a bigger name grows
+/// downward from it instead of drifting away from the label it belongs to. Centring the line
+/// box instead (`size * 1.08`, as this used to) made that air grow with the size.
+pub fn title_centre_under_label(label_baseline: f32, air: f32, size: f32) -> f32 {
+    label_baseline + air + size * TITLE_CAP_RISE
+}
+
+/// How far below its own centre a line's ink reaches when painted with `font`.
+///
+/// The line box is not the ink: a name with no descenders ends at its baseline, with the
+/// box's whole descent left empty under it, while a tail ("y", "p") reaches most of the way
+/// down. Anything that must sit under a title — a credit line — measures from here, so it
+/// hugs a name that has nothing to clear and keeps its distance from one that does.
+pub fn ink_drop(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
+    ui.fonts_mut(|f| {
+        let galley = f.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER);
+        // `mesh_bounds` is the tight box around the painted glyphs, in the galley's own
+        // coordinates; the galley's top sits half its height above the line's centre.
+        // `Rect::NOTHING` (nothing painted) leaves a -inf, clamped to "no ink" here.
+        (galley.mesh_bounds.max.y - galley.size().y / 2.0).max(0.0)
+    })
+}
+
 /// Shorten text with an ellipsis so it fits `max_width`.
 ///
 /// egui truncates inside its own layout, but these rows are painted directly, so the measuring
@@ -3532,6 +3742,131 @@ mod tests {
         assert_eq!(pingpong(0.0, 1.0, 0.0, 0.0), (0.0, -1.0));
     }
 
+    /// The dissolve strips: the trailing one always, the leading one only after the line has
+    /// scrolled, and the solid paint keeps whatever is between them.
+    #[test]
+    fn a_dissolve_keeps_the_middle_solid() {
+        let clip = egui::Rect::from_min_max(egui::pos2(100.0, 0.0), egui::pos2(300.0, 18.0));
+        // At rest: trailing only, one fade wide.
+        let (main, lead, trail) = dissolve_bands(clip, false, 100.0, 300.0);
+        assert!(lead.is_none());
+        assert_eq!(trail.min.x, 276.0);
+        assert_eq!(main.min.x, 100.0);
+        assert_eq!(main.max.x, 276.0);
+        // Scrolled: both, and the solid strip is exactly what is left between them.
+        let (main, lead, trail) = dissolve_bands(clip, true, 100.0, 300.0);
+        assert_eq!(lead.unwrap().max.x, 124.0);
+        assert_eq!(trail.min.x, 276.0);
+        assert_eq!(
+            main,
+            egui::Rect::from_min_max(egui::pos2(124.0, 0.0), egui::pos2(276.0, 18.0))
+        );
+        // A viewport narrower than one fade: the strips meet and the solid strip inverts,
+        // which the painters read as "nothing solid to draw".
+        let narrow = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(30.0, 18.0));
+        let (main, _, _) = dissolve_bands(narrow, true, 0.0, 30.0);
+        assert!(main.width() <= 0.0);
+    }
+
+    /// The corner walk the header wash and the corner repaint share: full radius at the edge,
+    /// zero once past it, and monotonic in between — the shape that keeps a square shape off
+    /// the gutter at a card's rounded corners.
+    #[test]
+    fn a_corner_walk_starts_at_the_radius_and_ends_flat() {
+        let rad = 20.0;
+        assert_eq!(corner_inset(rad, 0.0), rad);
+        assert_eq!(corner_inset(rad, rad), 0.0);
+        assert_eq!(corner_inset(rad, rad + 5.0), 0.0);
+        let mut last = rad;
+        for i in 0..=20 {
+            let inset = corner_inset(rad, i as f32);
+            assert!(inset <= last + f32::EPSILON, "the walk doubled back at {i}");
+            last = inset;
+        }
+    }
+
+    /// `card_rect` grows a content rect by exactly the frame's margin, side by side.
+    #[test]
+    fn a_content_rect_grows_back_to_its_card() {
+        let inner = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 220.0));
+        let card = card_rect(
+            inner,
+            egui::Margin {
+                left: 8,
+                right: 16,
+                top: 10,
+                bottom: 4,
+            },
+        );
+        assert_eq!(card.min, egui::pos2(2.0, 10.0));
+        assert_eq!(card.max, egui::pos2(126.0, 224.0));
+    }
+
+    /// Run one `Ui` pass and hand back every mesh it painted, in paint order — how the corner
+    /// test below reads what actually landed in the frame rather than trusting the call.
+    fn painted_meshes(
+        ctx: &egui::Context,
+        paint: impl FnOnce(&mut Ui),
+    ) -> Vec<std::sync::Arc<egui::Mesh>> {
+        let mut painted = Vec::new();
+        let mut paint = Some(paint);
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            // `run_ui` takes an `FnMut`, so the one-shot paint is taken rather than moved.
+            if let Some(paint) = paint.take() {
+                paint(ui);
+            }
+            ui.ctx().graphics(|layers| {
+                if let Some(layer) = layers.get(ui.layer_id()) {
+                    for entry in layer.all_entries() {
+                        if let egui::Shape::Mesh(mesh) = &entry.shape {
+                            painted.push(mesh.clone());
+                        }
+                    }
+                }
+            });
+        });
+        frame.textures_delta.clear();
+        painted
+    }
+
+    /// The corner repaint covers only what content can reach: the outer strip of each notch,
+    /// where the content column stops, is left to the gutter, the edge row runs from the
+    /// column's edge out to the card's own corner, and the last row is degenerate where the
+    /// silhouette crosses back inside the column. An inset that already clears the arc paints
+    /// nothing at all.
+    #[test]
+    fn a_corner_repaint_covers_the_notch_the_content_can_reach() {
+        let card = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 300.0));
+        let rows = notch_rows(card, 20.0, 8.0);
+        assert_eq!(rows.len(), 4, "one set of rows per corner");
+        assert_eq!(rows[0][0], (0.0, 8.0, 20.0));
+        assert_eq!(rows[1][0], (0.0, 180.0, 192.0));
+        assert_eq!(rows[2][0], (300.0, 8.0, 20.0));
+        assert_eq!(rows[3][0], (300.0, 180.0, 192.0));
+        assert!(rows[0].iter().all(|&(y, _, _)| (0.0..20.0).contains(&y)));
+        assert!(rows[0].iter().all(|&(_, x0, x1)| x1 >= x0));
+        let last = *rows[0].last().unwrap();
+        assert_eq!(last.0, 4.0, "the silhouette crosses the column at d = 4");
+        assert_eq!(last.1, last.2, "the last row tapers to a point");
+        assert!(notch_rows(card, 20.0, 20.0).iter().all(Vec::is_empty));
+    }
+
+    /// The repaint paints a mesh per corner, in the gutter colour.
+    #[test]
+    fn a_corner_repaint_paints_a_mesh_per_corner() {
+        let ctx = egui::Context::default();
+        let card = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 300.0));
+        let colour = egui::Color32::from_rgb(20, 20, 24);
+        let meshes = painted_meshes(&ctx, |ui| {
+            paint_corner_notches(ui, card, 8.0, colour);
+        });
+        assert_eq!(meshes.len(), 4, "one mesh per corner");
+        let top_left = &meshes[0];
+        assert_eq!(top_left.vertices[0].pos, egui::pos2(8.0, 0.0));
+        assert_eq!(top_left.vertices[1].pos, egui::pos2(20.0, 0.0));
+        assert!(top_left.vertices.iter().all(|v| v.color == colour));
+    }
+
     /// A switch flips on click and only on click: hovering and pressing without releasing
     /// must leave it alone.
     #[test]
@@ -3769,6 +4104,7 @@ mod tests {
                         badge: None,
                         art: None,
                         shape: ArtShape::Square,
+                        hide_art: false,
                         id_salt: 0,
                         menu: Some(RowMenu {
                             track: &track,
@@ -3825,6 +4161,348 @@ mod tests {
         assert!(
             is_selected(&ctx, "cover-test"),
             "a single body click did not select the row"
+        );
+    }
+
+    /// The ink a title's line ends at: its baseline for a name with no descenders, lower for
+    /// one with a tail, and never past the line box it sits in. This is what a credit line
+    /// hangs off, so a name that has nothing to clear pulls its credits up close.
+    #[test]
+    fn a_titles_ink_stops_at_its_baseline_unless_it_has_a_tail() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let measured = std::cell::Cell::new((0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32));
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = crate::theme::bold(40.0);
+            let caps = ink_drop(ui, "OASIS", &font);
+            let tailed = ink_drop(ui, "Bunny", &font);
+            // Half the line box is where a fully-descended glyph would reach; the caps stop
+            // well short of it, and the tail comes most of the way down.
+            let half_box =
+                ui.fonts_mut(|f| {
+                    f.layout_no_wrap("OASIS".to_owned(), font.clone(), Color32::PLACEHOLDER)
+                })
+                .size()
+                .y / 2.0;
+            measured.set((caps, tailed, half_box, ink_drop(ui, "", &font)));
+        })
+        .drop_without_applying_deltas();
+        let (caps, tailed, half_box, empty) = measured.get();
+        assert!(
+            caps > 0.0 && caps < half_box - 4.0,
+            "capitals should stop above the box's descent: {caps} of {half_box}"
+        );
+        assert!(
+            tailed > caps + 3.0,
+            "a tail should reach lower than capitals: {tailed} vs {caps}"
+        );
+        assert!(
+            tailed <= half_box,
+            "nothing should reach past the line box: {tailed} of {half_box}"
+        );
+        assert_eq!(
+            empty, 0.0,
+            "nothing painted is no ink, not a negative reach"
+        );
+    }
+
+    /// The type line above a title: what stays put across title sizes is the *cap line* — the
+    /// top of the name as the eye reads it — so the air between label and name never grows
+    /// with the name. (Centring the line box instead let the air grow with the size, which is
+    /// what the 40pt ceiling made obvious.)
+    #[test]
+    fn a_titles_cap_line_stays_under_its_label_at_any_size() {
+        let baseline = 12.37;
+        let air = 8.0;
+        let cap_line =
+            |size: f32| title_centre_under_label(baseline, air, size) - size * TITLE_CAP_RISE;
+        assert_eq!(cap_line(24.0), baseline + air);
+        assert_eq!(cap_line(40.0), baseline + air);
+        assert_eq!(cap_line(32.0), cap_line(24.0));
+        // And the name grows downward from it: a bigger size puts its centre lower.
+        assert!(
+            title_centre_under_label(baseline, air, 40.0)
+                > title_centre_under_label(baseline, air, 24.0)
+        );
+    }
+
+    /// The detail header's title: the full size while it fits, stepping down while it does not,
+    /// and the floor once even that is too wide — where the caller's own truncation takes over.
+    #[test]
+    fn a_title_fits_by_shrinking_before_it_ellipsizes() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let long = "when we all fall asleep, where do we go?";
+        let measured = std::cell::Cell::new((0.0_f32, 0.0_f32, 0.0_f32, false));
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let short = fit_size(ui, "OASIS", 400.0, 32.0, 24.0, crate::theme::bold);
+            // Two columns measured off the font itself rather than guessed: one that only a
+            // 26pt title fits, and one that nothing does.
+            let at_26 = text_width(ui, long, &crate::theme::bold(26.0));
+            let at_24 = text_width(ui, long, &crate::theme::bold(24.0));
+            let stepped = fit_size(ui, long, at_26 + 5.0, 32.0, 24.0, crate::theme::bold);
+            let floored = fit_size(ui, long, at_24 - 5.0, 32.0, 24.0, crate::theme::bold);
+            // The size it picked is the *largest* that fits: one step up does not.
+            let fits = text_width(ui, long, &crate::theme::bold(stepped)) <= at_26 + 5.0;
+            let one_up = text_width(ui, long, &crate::theme::bold(stepped + 2.0)) > at_26 + 5.0;
+            measured.set((short, stepped, floored, fits && one_up));
+        })
+        .drop_without_applying_deltas();
+        let (short, stepped, floored, largest) = measured.get();
+        assert_eq!(short, 32.0, "a short name takes the full size");
+        assert_eq!(
+            stepped, 26.0,
+            "a name that only fits two steps down should land there, not at the floor"
+        );
+        assert!(largest, "the step chosen was not the largest that fits");
+        assert_eq!(
+            floored, 24.0,
+            "past the floor the caller's own truncation takes over"
+        );
+    }
+
+    /// A hidden cover leaves its play control in the number's slot: a single click on the
+    /// leading column plays even in double-click mode and does not mark the row as merely
+    /// selected, while a click just past it — where the cover's own hit rect used to sit — is
+    /// an ordinary body click that only selects.
+    #[test]
+    fn an_artless_row_plays_from_the_number_slot_the_cover_left_behind() {
+        use std::cell::Cell;
+
+        use egui::{Event, PointerButton, Pos2};
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let palette = crate::theme::Palette::dark();
+        set_double_click_play(&ctx, true);
+
+        let track = crate::model::Track {
+            video_id: "artless-test".into(),
+            title: "A Song".into(),
+            artists: vec![crate::model::ArtistLink::plain("Someone")],
+            album: None,
+            album_id: None,
+            duration: Some(200),
+            plays: None,
+            explicit: false,
+            like: crate::model::LikeStatus::Indifferent,
+            in_library: false,
+            library_add: None,
+            library_remove: None,
+            set_video_id: None,
+            thumbnail: None,
+            rank: None,
+            trend: crate::model::ChartTrend::Unknown,
+            wide: false,
+            local_path: None,
+        };
+        let playlists: [crate::model::PlaylistRef; 0] = [];
+
+        let mut t = 0.0;
+        let activate = Cell::new(false);
+        let number = Cell::new(Pos2::ZERO);
+        let past = Cell::new(Pos2::ZERO);
+        let mut pass = |events: Vec<Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0))),
+                time: Some(t),
+                events,
+                ..Default::default()
+            };
+            let mut fired = false;
+            ctx.run_ui(input, |ui| {
+                let hit = track_row(
+                    ui,
+                    &palette,
+                    TrackRow {
+                        number: Some(1),
+                        rank: None,
+                        trend: crate::model::ChartTrend::Unknown,
+                        title: &track.title,
+                        album_id: None,
+                        subtitle: plain_subtitle("Someone"),
+                        duration: track.duration,
+                        plays: None,
+                        explicit: false,
+                        active: false,
+                        playing: false,
+                        badge: None,
+                        art: None,
+                        shape: ArtShape::Square,
+                        hide_art: true,
+                        id_salt: 0,
+                        menu: Some(RowMenu {
+                            track: &track,
+                            playlist_id: None,
+                            playlists: &playlists,
+                            signed_in: true,
+                            queue_index: None,
+                        }),
+                        like: track.like,
+                        show_rating: false,
+                    },
+                );
+                fired = hit.activate;
+                let rect = hit.response.rect;
+                number.set(egui::pos2(
+                    rect.left() + crate::theme::ROW_NUMBER_W / 2.0,
+                    rect.center().y,
+                ));
+                // Just past the number's column: inside the slot the cover used to occupy,
+                // and outside the control that replaced it.
+                past.set(egui::pos2(
+                    rect.left() + crate::theme::ROW_NUMBER_W + 6.0,
+                    rect.center().y,
+                ));
+            })
+            .drop_without_applying_deltas();
+            activate.set(fired);
+        };
+        let click = |pos: Pos2, pressed: bool| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        pass(vec![]);
+        // The number's own slot: the row's play button, double-click mode or not.
+        pass(vec![Event::PointerMoved(number.get())]);
+        pass(vec![click(number.get(), true)]);
+        pass(vec![click(number.get(), false)]);
+        assert!(
+            activate.get(),
+            "the number slot did not play on a single click"
+        );
+        assert!(
+            !is_selected(&ctx, "artless-test"),
+            "playing from the number slot also marked the row as merely selected"
+        );
+
+        // A click past the control is ordinary row body: select, do not play.
+        pass(vec![Event::PointerMoved(past.get())]);
+        pass(vec![click(past.get(), true)]);
+        pass(vec![click(past.get(), false)]);
+        assert!(
+            !activate.get(),
+            "a click past the number slot played in double-click mode"
+        );
+        assert!(
+            is_selected(&ctx, "artless-test"),
+            "a body click did not select the row"
+        );
+    }
+
+    /// An art-less row's number gives way to the play glyph while the pointer is over it — the
+    /// hover play button the cover would otherwise carry. Read off what was painted: at rest the
+    /// number is the only text in its column, and on hover it is gone.
+    #[test]
+    fn an_artless_row_gives_its_number_to_the_play_glyph_on_hover() {
+        use std::cell::Cell;
+
+        use egui::{Event, Pos2};
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let palette = crate::theme::Palette::dark();
+
+        let track = crate::model::Track {
+            video_id: "hover-glyph-test".into(),
+            title: "A Song".into(),
+            artists: vec![crate::model::ArtistLink::plain("Someone")],
+            album: None,
+            album_id: None,
+            duration: Some(200),
+            plays: None,
+            explicit: false,
+            like: crate::model::LikeStatus::Indifferent,
+            in_library: false,
+            library_add: None,
+            library_remove: None,
+            set_video_id: None,
+            thumbnail: None,
+            rank: None,
+            trend: crate::model::ChartTrend::Unknown,
+            wide: false,
+            local_path: None,
+        };
+        let playlists: [crate::model::PlaylistRef; 0] = [];
+
+        let mut t = 0.0;
+        let numbers = Cell::new(0usize);
+        let centre = Cell::new(Pos2::ZERO);
+        let mut pass = |events: Vec<Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0))),
+                time: Some(t),
+                events,
+                ..Default::default()
+            };
+            let mut found = 0;
+            let mut at = Pos2::ZERO;
+            let mut frame = ctx.run_ui(input, |ui| {
+                let hit = track_row(
+                    ui,
+                    &palette,
+                    TrackRow {
+                        number: Some(7),
+                        rank: None,
+                        trend: crate::model::ChartTrend::Unknown,
+                        title: &track.title,
+                        album_id: None,
+                        subtitle: plain_subtitle("Someone"),
+                        duration: track.duration,
+                        plays: None,
+                        explicit: false,
+                        active: false,
+                        playing: false,
+                        badge: None,
+                        art: None,
+                        shape: ArtShape::Square,
+                        hide_art: true,
+                        id_salt: 0,
+                        menu: Some(RowMenu {
+                            track: &track,
+                            playlist_id: None,
+                            playlists: &playlists,
+                            signed_in: true,
+                            queue_index: None,
+                        }),
+                        like: track.like,
+                        show_rating: false,
+                    },
+                );
+                at = hit.response.rect.center();
+                ui.ctx().graphics(|layers| {
+                    if let Some(layer) = layers.get(ui.layer_id()) {
+                        for entry in layer.all_entries() {
+                            if let egui::Shape::Text(text) = &entry.shape {
+                                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                                if rect.right()
+                                    <= hit.response.rect.left() + crate::theme::ROW_NUMBER_W
+                                {
+                                    found += 1;
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+            frame.textures_delta.clear();
+            numbers.set(found);
+            centre.set(at);
+        };
+
+        pass(vec![]);
+        assert_eq!(numbers.get(), 1, "the number should lead the row at rest");
+        pass(vec![Event::PointerMoved(centre.get())]);
+        pass(vec![Event::PointerMoved(centre.get())]);
+        assert_eq!(
+            numbers.get(),
+            0,
+            "the number stayed under the pointer instead of giving way to the play glyph"
         );
     }
 }

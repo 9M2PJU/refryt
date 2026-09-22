@@ -110,11 +110,6 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         .min((transport_start - thumbs_w - 8.0 - title_x).max(0.0))
         .min((bar_min_x - 10.0 - total_w - 22.0 - thumbs_w - title_x).max(0.0))
         .max(24.0);
-    // The bar sits directly on the gutter, so in opaque mode the fade dissolves cleanly into
-    // the window colour. In acrylic mode that colour is itself dominated by whatever a live,
-    // blurred desktop shows through it — unknowable ahead of painting — so the dissolve is
-    // skipped there rather than guessing; the title is already hard-clipped regardless.
-    let bg = (!p.translucent()).then(|| p.window_fill());
     // The column, then the field the two lines share: title above, credits below.
     let thumbs_x = (title_x + text_w + 10.0)
         .min(transport_start - thumbs_w)
@@ -139,7 +134,6 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         &title,
         title_font,
         p.text,
-        bg,
         "np-title",
         Sense::click(),
         false,
@@ -188,7 +182,6 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
                     &p,
                     baseline,
                     field_w,
-                    bg,
                     &subtitle,
                     None,
                     "np-subtitle",
