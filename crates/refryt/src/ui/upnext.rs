@@ -19,6 +19,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     // The card's own rect, before the list consumes the ui: the corner repaint at the end
     // needs its rounded edges.
     let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
+    widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &app.palette);
 
     let mut area = egui::ScrollArea::vertical()
         .id_salt("upnext")
@@ -125,7 +126,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     });
     // The card's rounded corners, over everything the queue drew: the list runs to the card's
     // top and bottom edges now.
-    widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, app.palette.window);
+    widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, &app.palette);
 }
 
 /// A small caps-ish section label, as the reference uses above each block. `gap` is the space

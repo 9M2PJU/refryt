@@ -163,7 +163,7 @@ fn ranked(app: &mut App, ui: &mut egui::Ui, section: &ChartSection) {
             .filter_map(|r| r.entry.track().cloned())
             .collect();
         if let Some(index) = queue.iter().position(|t| t.video_id == video_id) {
-            app.play_row(queue, index);
+            app.start_from(queue, index);
         }
     }
 }

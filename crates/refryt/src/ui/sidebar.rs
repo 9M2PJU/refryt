@@ -21,6 +21,7 @@ pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
     // The card's own rect, taken before any panel claims space: the corner repaint at the end
     // needs its rounded edges.
     let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
+    widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &app.palette);
     // Claimed first, so the scrolling middle gets whatever is left rather than pushing it off.
     if app.player_error.is_some() {
         egui::Panel::bottom("sidebar-footer")
@@ -45,7 +46,7 @@ pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
     playlists(app, ui);
     // The card's rounded corners, over everything the rail drew: nav rows and playlist rows
     // both run to the card's top and bottom edges now.
-    widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, app.palette.window);
+    widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, &app.palette);
 }
 
 /// Only shown when playback could not start: libmpv never came up, or an attempt stalled until

@@ -245,6 +245,16 @@ impl StallGuard {
     }
 }
 
+/// Where Repeat All wraps: at the end of the tracks the listener chose, so a radio tail appended
+/// before Repeat All went on is looped past rather than played. Playing inside that tail
+/// already, the whole queue is the loop.
+fn loop_end(radio: Option<&Radio>, queue: &[Track], current: usize) -> usize {
+    radio
+        .and_then(|r| r.tail_start(queue))
+        .filter(|&tail| current < tail)
+        .unwrap_or(queue.len())
+}
+
 /// The next index in a queue when not shuffling: the following track, wrapping to the start only
 /// under Repeat All. `None` means the transport stops (or, for Repeat One, replays).
 fn sequential_next(current: usize, len: usize, repeat_all: bool) -> Option<usize> {
@@ -4201,10 +4211,11 @@ impl App {
         self.queue_scroll_reset = true;
     }
 
-    /// A row click: play the clicked track the way a song click means it now. A YouTube track
-    /// gets its own radio — the queue is that song, and the generated next-up is appended as it
-    /// arrives — while a local file keeps the list it was clicked in, since there is no radio to
-    /// seed from a filesystem path.
+    /// A single-song click — a search result or a Home shelf — where the list around the song
+    /// is not something to play through. A YouTube track gets its own radio: the queue is that
+    /// song, and the generated next-up is appended as it arrives. A local file keeps the list it
+    /// was clicked in, since there is no radio to seed from a filesystem path. Album, playlist,
+    /// artist and library rows use [`Self::start_from`] instead: the list plays, then its radio.
     pub(crate) fn play_row(&mut self, tracks: Vec<Track>, index: usize) {
         match tracks.get(index) {
             Some(t) if t.local_path.is_none() => {
@@ -4373,18 +4384,21 @@ impl App {
             // Exhaust the tracks the listener actually chose before spilling into whatever
             // autoplay appended — otherwise shuffle drifts into radio content the moment the
             // river tops the queue up, long before the playlist's own tracks are done.
-            if let Some(radio) = &self.radio {
-                let chosen: Vec<usize> = cand
-                    .iter()
-                    .copied()
-                    .filter(|&i| radio.chosen.iter().any(|id| id == &self.queue[i].video_id))
-                    .collect();
-                if !chosen.is_empty() {
-                    cand = chosen;
-                }
+            let repeat_all = self.repeat == RepeatMode::All;
+            let is_chosen = |i: usize| {
+                self.radio
+                    .as_ref()
+                    .is_none_or(|radio| radio.chosen.iter().any(|id| id == &self.queue[i].video_id))
+            };
+            // Under Repeat All the loop is the chosen tracks alone, so once they have all played
+            // the shuffle starts over rather than drifting into a tail appended earlier.
+            let loops_chosen = repeat_all && (0..self.queue.len()).any(is_chosen);
+            let chosen: Vec<usize> = cand.iter().copied().filter(|&i| is_chosen(i)).collect();
+            if !chosen.is_empty() || loops_chosen {
+                cand = chosen;
             }
             if cand.is_empty() {
-                if self.repeat != RepeatMode::All {
+                if !repeat_all {
                     return None;
                 }
                 // Every track has played: start the shuffle over, keeping the current one out
@@ -4393,7 +4407,9 @@ impl App {
                 if let Some(t) = self.queue.get(current) {
                     self.shuffle_seen.insert(t.video_id.clone());
                 }
-                let all: Vec<usize> = (0..self.queue.len()).filter(|&i| i != current).collect();
+                let all: Vec<usize> = (0..self.queue.len())
+                    .filter(|&i| i != current && (!loops_chosen || is_chosen(i)))
+                    .collect();
                 if all.is_empty() {
                     return Some(current);
                 }
@@ -4403,7 +4419,13 @@ impl App {
             let r = self.next_rng();
             return Some(cand[(r >> 33) as usize % cand.len()]);
         }
-        sequential_next(current, self.queue.len(), self.repeat == RepeatMode::All)
+        let repeat_all = self.repeat == RepeatMode::All;
+        let len = if repeat_all {
+            loop_end(self.radio.as_ref(), &self.queue, current)
+        } else {
+            self.queue.len()
+        };
+        sequential_next(current, len, repeat_all)
     }
 
     /// One LCG step, seeded from the clock at startup — enough for a shuffle pick.
@@ -5879,6 +5901,8 @@ impl eframe::App for App {
                     ui::video::panel(self, ui);
                     return;
                 }
+                let card = widgets::card_rect(top, theme::CARD_INSET);
+                widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &p);
                 match route {
                     Route::Search => ui::search::page(self, ui),
                     Route::Explore => ui::explore::page(self, ui),
@@ -5899,8 +5923,7 @@ impl eframe::App for App {
                 // own top and bottom edges, and the part of it outside the rounded silhouette is
                 // covered with the gutter. The video view returns above — its frame is already
                 // rounded — so this never touches it.
-                let card = widgets::card_rect(top, theme::CARD_INSET);
-                widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, p.window);
+                widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, &p);
             });
         // On the foreground layer, so draw order relative to the panels above doesn't matter —
         // see `widgets::progress_bar`'s own doc comment for why it moved here from the content
@@ -5980,11 +6003,14 @@ impl eframe::App for App {
 
         // Autoplay: one `next` call returns ~50 tracks. A hand-picked queue seeds its tail as
         // soon as it starts, so the tail is there from the beginning; an open river is
-        // extended at the low-water mark. Nothing is fetched while the setting is off.
+        // extended at the low-water mark. Nothing is fetched while the setting is off, nor under
+        // Repeat All, which loops the chosen tracks instead (YouTube Music does the same).
         if !self.radio_loading {
-            let call = self.radio.as_ref().and_then(|radio| {
-                river_call(radio, self.current, &self.queue, self.settings.autoplay)
-            });
+            let wants = self.settings.autoplay && self.repeat != RepeatMode::All;
+            let call = self
+                .radio
+                .as_ref()
+                .and_then(|radio| river_call(radio, self.current, &self.queue, wants));
             if let Some(call) = call {
                 self.radio_loading = true;
                 match call {
@@ -6627,6 +6653,23 @@ mod tests {
             None,
             "an empty queue never advances"
         );
+    }
+
+    /// Repeat All loops the chosen tracks, not the radio tail after them — unless the listener
+    /// is already inside that tail, where the whole queue is the loop.
+    #[test]
+    fn repeat_all_wraps_at_the_radio_tail() {
+        let queue = vec![track("a"), track("b"), track("t1"), track("t2")];
+        let r = radio(River::Open("tok".into()), "b", &["a", "b"]);
+        assert_eq!(loop_end(Some(&r), &queue, 1), 2);
+        assert_eq!(
+            sequential_next(1, loop_end(Some(&r), &queue, 1), true),
+            Some(0)
+        );
+        assert_eq!(loop_end(Some(&r), &queue, 2), 4, "inside the tail");
+        assert_eq!(loop_end(None, &queue, 1), 4, "no radio");
+        let all = radio(River::Pending, "t2", &["a", "b", "t1", "t2"]);
+        assert_eq!(loop_end(Some(&all), &queue, 1), 4, "every track chosen");
     }
 
     /// Previous restarts the track once it is underway, and only steps back within the first

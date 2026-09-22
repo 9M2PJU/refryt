@@ -738,6 +738,30 @@ pub(crate) fn card_rect(inner: egui::Rect, inset: egui::Margin) -> egui::Rect {
     )
 }
 
+/// How far in from a card's top and bottom edge the rounded silhouette meets the content
+/// column `inset_x` in from its sides. Content kept at least this far from both edges never
+/// reaches outside the silhouette.
+fn corner_clearance(rad: f32, inset_x: f32) -> f32 {
+    let arm = rad - inset_x.clamp(0.0, rad);
+    rad - (rad * rad - arm * arm).max(0.0).sqrt()
+}
+
+/// Keep a card's content inside its rounded silhouette when the shell is translucent.
+///
+/// Opaque, content runs to the card's top and bottom edges and [`paint_corner_notches`] covers
+/// what pokes past the corners in the gutter colour. Translucent, no colour matches a gutter
+/// the desktop shows through — an opaque one read as dark slivers at every corner — so the
+/// clip stops [`corner_clearance`] short of both edges instead. Call before the card's content
+/// is laid out; scroll areas inherit the clip.
+pub(crate) fn clip_card_content(ui: &mut Ui, card: egui::Rect, inset_x: f32, palette: &Palette) {
+    if !palette.translucent() {
+        return;
+    }
+    let close = corner_clearance(crate::theme::PANEL_RADIUS as f32, inset_x);
+    let clip = ui.clip_rect().intersect(card.shrink2(vec2(0.0, close)));
+    ui.set_clip_rect(clip);
+}
+
 /// The rows of the four corner notches a card's content can reach: `(y, x0, x1)` per row, from
 /// the corner's edge inward, spanning from the content column's edge out to the card's rounded
 /// silhouette. The content is clipped to its column, so the outer strip of each notch is left
@@ -746,9 +770,7 @@ pub(crate) fn card_rect(inner: egui::Rect, inset: egui::Margin) -> egui::Rect {
 fn notch_rows(card: egui::Rect, rad: f32, inset_x: f32) -> [Vec<(f32, f32, f32)>; 4] {
     let inset_x = inset_x.clamp(0.0, rad);
     let mut rows: [Vec<(f32, f32, f32)>; 4] = std::array::from_fn(|_| Vec::new());
-    // Where the silhouette meets the content column: past it there is nothing left to cover.
-    let arm = rad - inset_x;
-    let close = rad - (rad * rad - arm * arm).max(0.0).sqrt();
+    let close = corner_clearance(rad, inset_x);
     if close <= 0.0 {
         return rows;
     }
@@ -766,19 +788,19 @@ fn notch_rows(card: egui::Rect, rad: f32, inset_x: f32) -> [Vec<(f32, f32, f32)>
 }
 
 /// Paint the four corner notches of a card — the region inside its square rect but outside its
-/// rounded silhouette — with `colour`.
+/// rounded silhouette — in the gutter colour.
 ///
 /// Cards have no top or bottom inner margin any more, so their scroll viewports run the card's
 /// full height and content is clipped at the card's own top and bottom edges. The clip is a
 /// rectangle and the card is not, so what the content leaves outside the silhouette is painted
-/// over with the gutter: `palette.window`, exactly the colour the gutter is in opaque mode,
-/// which makes this the rounded clip egui cannot do. In acrylic mode the gutter is translucent
-/// and this sliver is not — the deliberate trade for content that fills the card; it is a few
-/// points wide, and only where the content column actually reaches a corner.
-pub(crate) fn paint_corner_notches(ui: &Ui, card: egui::Rect, inset_x: f32, colour: Color32) {
-    if card.width() <= 0.0 || card.height() <= 0.0 {
+/// over with `palette.window`, exactly the colour the gutter is in opaque mode, which makes
+/// this the rounded clip egui cannot do. A translucent gutter has no such colour: there this
+/// paints nothing, and [`clip_card_content`] keeps the content out of the corners instead.
+pub(crate) fn paint_corner_notches(ui: &Ui, card: egui::Rect, inset_x: f32, palette: &Palette) {
+    if palette.translucent() || card.width() <= 0.0 || card.height() <= 0.0 {
         return;
     }
+    let colour = palette.window;
     let painter = egui::Painter::new(ui.ctx().clone(), ui.layer_id(), card);
     for corner in notch_rows(card, crate::theme::PANEL_RADIUS as f32, inset_x) {
         if corner.len() < 2 {
@@ -3851,20 +3873,39 @@ mod tests {
         assert!(notch_rows(card, 20.0, 20.0).iter().all(Vec::is_empty));
     }
 
-    /// The repaint paints a mesh per corner, in the gutter colour.
+    /// The repaint paints a mesh per corner, in the gutter colour — and nothing over a
+    /// translucent gutter, where that colour would read as a dark sliver.
     #[test]
     fn a_corner_repaint_paints_a_mesh_per_corner() {
         let ctx = egui::Context::default();
         let card = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 300.0));
-        let colour = egui::Color32::from_rgb(20, 20, 24);
+        let palette = Palette::dark();
         let meshes = painted_meshes(&ctx, |ui| {
-            paint_corner_notches(ui, card, 8.0, colour);
+            paint_corner_notches(ui, card, 8.0, &palette);
         });
         assert_eq!(meshes.len(), 4, "one mesh per corner");
         let top_left = &meshes[0];
         assert_eq!(top_left.vertices[0].pos, egui::pos2(8.0, 0.0));
         assert_eq!(top_left.vertices[1].pos, egui::pos2(20.0, 0.0));
-        assert!(top_left.vertices.iter().all(|v| v.color == colour));
+        assert!(top_left.vertices.iter().all(|v| v.color == palette.window));
+
+        let acrylic = Palette::dark().with_opacity(crate::settings::Opacity::new(1.0));
+        assert!(acrylic.translucent());
+        let meshes = painted_meshes(&ctx, |ui| {
+            paint_corner_notches(ui, card, 8.0, &acrylic);
+        });
+        assert!(meshes.is_empty(), "no notches over a translucent gutter");
+    }
+
+    /// The translucent clip stops exactly where the notch rows do, so no content the opaque
+    /// repaint would have covered is left showing.
+    #[test]
+    fn the_translucent_clip_clears_the_corners() {
+        assert_eq!(corner_clearance(20.0, 8.0), 4.0);
+        assert_eq!(corner_clearance(20.0, 20.0), 0.0);
+        let card = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 300.0));
+        let rows = notch_rows(card, 20.0, 8.0);
+        assert_eq!(rows[0].last().unwrap().0, corner_clearance(20.0, 8.0));
     }
 
     /// A switch flips on click and only on click: hovering and pressing without releasing
