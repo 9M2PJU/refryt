@@ -163,7 +163,8 @@ pub fn save(store: &Store) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec_pretty(store).context("could not encode the playback state")?;
+    // Compact: nobody reads it by hand, and it is rewritten on every skip.
+    let bytes = serde_json::to_vec(store).context("could not encode the playback state")?;
     crate::persist::write_json_atomic(&path, &bytes)
         .with_context(|| format!("could not write {}", path.display()))
 }

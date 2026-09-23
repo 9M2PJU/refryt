@@ -245,6 +245,38 @@ struct MediaScalars {
     can_next: bool,
 }
 
+/// How long a playing track's position may go unsaved. A crash loses at most this much of where
+/// you were; pausing, seeking, skipping and quitting all save at once.
+const POSITION_SAVE_EVERY: Duration = Duration::from_secs(30);
+
+/// What `playback.json` was last written with, for [`playback_save_due`].
+struct SavedPlayback {
+    fingerprint: u64,
+    position: f64,
+    paused: bool,
+    at: Instant,
+}
+
+/// Whether the saved playback state is out of date: never written, the queue or transport
+/// changed, playback paused or resumed, the position jumped (a seek), or a playing track has
+/// moved on for [`POSITION_SAVE_EVERY`]. A paused, unchanged session is never written again.
+fn playback_save_due(
+    saved: Option<&SavedPlayback>,
+    fingerprint: u64,
+    position: f64,
+    paused: bool,
+) -> bool {
+    let Some(saved) = saved else {
+        return true;
+    };
+    if saved.fingerprint != fingerprint || saved.paused != paused {
+        return true;
+    }
+    let elapsed = saved.at.elapsed();
+    let expected = saved.position + if paused { 0.0 } else { elapsed.as_secs_f64() };
+    (position - expected).abs() > 3.0 || (!paused && elapsed >= POSITION_SAVE_EVERY)
+}
+
 /// Where Repeat All wraps: at the end of the tracks the listener chose, so a radio tail appended
 /// before Repeat All went on is looped past rather than played. Playing inside that tail
 /// already, the whole queue is the loop.
@@ -290,7 +322,7 @@ fn order_by_saved(items: &mut [crate::model::PlaylistRef], order: &[String]) {
     items.sort_by_key(|p| rank.get(p.id.as_str()).copied().unwrap_or(usize::MAX));
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub(crate) enum RepeatMode {
     /// Play the queue once and stop.
     #[default]
@@ -1299,8 +1331,12 @@ pub struct App {
     /// A restored position to seek to once the track loads: `(queue index, seconds)`. Consumed
     /// the first time that track is actually playing, and dropped if the queue moves elsewhere.
     pub(crate) resume: Option<(usize, f64)>,
-    /// When the playback state was last written, so the periodic save is throttled.
-    last_playback_save: Instant,
+    /// What `playback.json` was last written with, reduced to what decides whether it is stale.
+    /// `None` until the first write.
+    playback_saved: Option<SavedPlayback>,
+    /// When `playback_saved` was last compared against the live state; the check runs once a
+    /// second, not every frame.
+    last_playback_check: Instant,
     /// Muted by the button versus turned down to zero. `last_volume` remembers what to come back
     /// to.
     pub(crate) muted: bool,
@@ -1687,7 +1723,8 @@ impl App {
             history_loaded_epoch: 0,
             last_volume: 70.0,
             resume: None,
-            last_playback_save: Instant::now(),
+            playback_saved: None,
+            last_playback_check: Instant::now(),
             muted: false,
             toast: None,
             autoplay,
@@ -2292,14 +2329,7 @@ impl App {
         if self.queue.is_empty() {
             return None;
         }
-        let position = if self.playback_started {
-            self.player
-                .as_ref()
-                .map(|p| p.state().position)
-                .unwrap_or(0.0)
-        } else {
-            self.resume.map(|(_, p)| p).unwrap_or(0.0)
-        };
+        let position = self.saved_position();
         Some(crate::playback::Store {
             version: 1,
             queue: self
@@ -2320,10 +2350,59 @@ impl App {
     /// (a failure is only a debug line — losing the queue is not worth a toast). Not what runs on
     /// exit: `eframe::App::save` needs the write to actually finish before the process does, so it
     /// calls `crate::playback::save` directly instead of handing this off to the backend.
-    fn save_playback(&self) {
+    fn save_playback(&mut self) {
         if let Some(store) = self.playback_store() {
+            self.playback_saved = Some(self.saved_playback(store.position));
             self.backend.save_playback(store);
         }
+    }
+
+    /// The position `playback.json` records: the player's once the track is playing, the
+    /// restored one until then.
+    fn saved_position(&self) -> f64 {
+        if self.playback_started {
+            self.player_state.position
+        } else {
+            self.resume.map(|(_, p)| p).unwrap_or(0.0)
+        }
+    }
+
+    fn saved_playback(&self, position: f64) -> SavedPlayback {
+        SavedPlayback {
+            fingerprint: self.playback_fingerprint(),
+            position,
+            paused: self.now.paused || !self.playback_started,
+            at: Instant::now(),
+        }
+    }
+
+    /// Everything in `playback.json` except the position, hashed: the queue (by id), where in it
+    /// we are, and the transport settings. Cheap enough to take once a second.
+    fn playback_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for track in &self.queue {
+            track.video_id.hash(&mut h);
+        }
+        self.current.hash(&mut h);
+        self.repeat.hash(&mut h);
+        self.shuffle.hash(&mut h);
+        self.last_volume.to_bits().hash(&mut h);
+        self.video_open.hash(&mut h);
+        h.finish()
+    }
+
+    /// Whether `playback.json` no longer says what is true: see [`playback_save_due`].
+    fn playback_stale(&self) -> bool {
+        if self.queue.is_empty() {
+            return false;
+        }
+        playback_save_due(
+            self.playback_saved.as_ref(),
+            self.playback_fingerprint(),
+            self.saved_position(),
+            self.now.paused || !self.playback_started,
+        )
     }
 
     /// Act on a restored position once its track is actually playing, and save the transport
@@ -2340,9 +2419,11 @@ impl App {
                 self.resume = None;
             }
         }
-        if self.last_playback_save.elapsed() >= Duration::from_secs(5) {
-            self.last_playback_save = Instant::now();
-            self.save_playback();
+        if self.last_playback_check.elapsed() >= Duration::from_secs(1) {
+            self.last_playback_check = Instant::now();
+            if self.playback_stale() {
+                self.save_playback();
+            }
         }
         if self.liked_dirty && self.last_liked_save.elapsed() >= Duration::from_secs(5) {
             self.save_liked_if_dirty();
@@ -5724,11 +5805,21 @@ impl eframe::App for App {
     /// periodic path uses to keep this same write off the render thread): this call must have
     /// actually reached disk before eframe finishes tearing the process down, and a background
     /// task handed to the backend's runtime has no such guarantee.
+    /// On exit, and on eframe's own 30-second autosave: written here, synchronously, so the exit
+    /// write finishes before the process does — but only when the file is stale, so the autosave
+    /// of an unchanged session writes nothing.
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
-        if let Some(store) = self.playback_store()
-            && let Err(e) = crate::playback::save(&store)
-        {
-            tracing::debug!(error = %format!("{e:#}"), "could not save the playback state");
+        if !self.playback_stale() {
+            return;
+        }
+        let Some(store) = self.playback_store() else {
+            return;
+        };
+        match crate::playback::save(&store) {
+            Ok(()) => self.playback_saved = Some(self.saved_playback(store.position)),
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "could not save the playback state");
+            }
         }
     }
 
@@ -6248,6 +6339,54 @@ mod tests {
 
     fn artist(id: &str) -> Route {
         Route::Artist(id.to_owned())
+    }
+
+    fn saved(position: f64, paused: bool, ago: Duration) -> SavedPlayback {
+        SavedPlayback {
+            fingerprint: 7,
+            position,
+            paused,
+            at: Instant::now() - ago,
+        }
+    }
+
+    /// Nothing changed: a paused session is never rewritten, and a playing one only every
+    /// `POSITION_SAVE_EVERY` — not every few seconds as before.
+    #[test]
+    fn an_unchanged_session_is_not_rewritten() {
+        let paused = saved(42.0, true, Duration::from_secs(3600));
+        assert!(!playback_save_due(Some(&paused), 7, 42.0, true));
+
+        let playing = saved(42.0, false, Duration::from_secs(10));
+        assert!(!playback_save_due(Some(&playing), 7, 52.0, false));
+        let later = saved(42.0, false, POSITION_SAVE_EVERY);
+        assert!(playback_save_due(
+            Some(&later),
+            7,
+            42.0 + POSITION_SAVE_EVERY.as_secs_f64(),
+            false
+        ));
+    }
+
+    /// What the file records changing is saved straight away: the first write, the queue or
+    /// transport, pausing or resuming, and a seek.
+    #[test]
+    fn a_real_change_is_saved_at_once() {
+        let playing = saved(42.0, false, Duration::from_secs(2));
+        assert!(playback_save_due(None, 7, 0.0, true), "never written");
+        assert!(
+            playback_save_due(Some(&playing), 8, 44.0, false),
+            "queue or transport"
+        );
+        assert!(playback_save_due(Some(&playing), 7, 44.0, true), "paused");
+        assert!(
+            playback_save_due(Some(&playing), 7, 120.0, false),
+            "seeked forward"
+        );
+        assert!(
+            playback_save_due(Some(&playing), 7, 5.0, false),
+            "seeked back"
+        );
     }
 
     /// A track that got past its start is one that played, so its end is an end.
