@@ -73,7 +73,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         } else {
             a.kind.clone()
         };
-        let kind_label = kind.to_uppercase();
+        let kind_label = kind;
         let meta = meta_line(a);
         let like_id = a.like_id.clone();
         let in_library = a.in_library;

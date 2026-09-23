@@ -248,7 +248,14 @@ pub fn nav_item(
 
     if ui.is_rect_visible(rect) {
         let t = lit(ui, &response);
-        if let Some(fill) = state_fill(ui, palette, &response) {
+        // The page you are on wears the same pill a selected playlist in the rail below does,
+        // so where you are reads at a glance rather than by comparing font weights.
+        let fill = if selected {
+            Some(palette.surface_active)
+        } else {
+            state_fill(ui, palette, &response)
+        };
+        if let Some(fill) = fill {
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(theme::RADIUS), fill);
         }
@@ -351,12 +358,35 @@ pub fn paint_art(
             // letterboxes instead of squashing. A square cover in a square slot is unchanged.
             let tex_size = tex.size_vec2();
             let scale = (rect.width() / tex_size.x).min(rect.height() / tex_size.y);
+            let fitted = Rect::from_center_size(rect.center(), tex_size * scale);
+            // A circle crops its art to the circle either way; anything else rounds the image
+            // only where it actually reaches the slot's rounded corners.
+            let image_radius = match shape {
+                ArtShape::Circle => radius,
+                _ => inner_radius(radius, rect, fitted),
+            };
             egui::Image::new(tex)
-                .corner_radius(radius)
-                .paint_at(ui, Rect::from_center_size(rect.center(), tex_size * scale));
+                .corner_radius(image_radius)
+                .paint_at(ui, fitted);
         }
         None => art_placeholder(ui, palette, rect, shape),
     }
+}
+
+/// The corner radius an image fitted inside a rounded slot needs: the slot's own where the
+/// image fills it, less as the image sits further in from the slot's edges, and none once it is
+/// a whole radius in.
+///
+/// A wide still letterboxed in a square card sits well clear of the card's rounded corners, so
+/// its own corners are square — rounding it too drew a second, smaller set of curves inside the
+/// first. An image that fills its slot keeps the full curve, and one inset a little keeps just
+/// enough that its corners never poke past the slot's.
+pub(crate) fn inner_radius(slot_radius: CornerRadius, slot: Rect, fitted: Rect) -> CornerRadius {
+    let inset = ((slot.width() - fitted.width()) / 2.0)
+        .max((slot.height() - fitted.height()) / 2.0)
+        .max(0.0);
+    let r = (f32::from(slot_radius.nw) - inset).max(0.0);
+    CornerRadius::same(r.round() as u8)
 }
 
 /// The play affordance that rises over artwork under the pointer.
@@ -564,6 +594,9 @@ pub struct TrackRow<'a> {
     /// what happens next, and a column of controls repeated down it is noise. Rating a queued
     /// song is still one right-click away.
     pub show_rating: bool,
+    /// Keep a like out of sight until the row is hovered. Liked Music sets it: every row there
+    /// is liked by definition, so a filled thumb down the whole list says nothing.
+    pub quiet_like: bool,
 }
 
 /// Paint a subtitle left to right, each linked piece getting its own hit area, and report the
@@ -1541,6 +1574,7 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         menu,
         like,
         show_rating,
+        quiet_like,
     } = row;
     let mut link = None;
     // `click_and_drag`, not `click`: a row inside the open playlist's own editable track list
@@ -1875,7 +1909,17 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         } else {
             rect.right() - right_pad - duration_w
         };
-        if let Some(rate) = rate_thumbs(ui, palette, rect, thumb_right, like, &id, id_salt, over) {
+        if let Some(rate) = rate_thumbs(
+            ui,
+            palette,
+            rect,
+            thumb_right,
+            like,
+            &id,
+            id_salt,
+            over,
+            quiet_like,
+        ) {
             action = Some(rate);
         }
     }
@@ -2387,6 +2431,7 @@ fn rate_thumbs(
     video_id: &str,
     id_salt: usize,
     over: bool,
+    quiet: bool,
 ) -> Option<super::ui::RowAction> {
     use super::ui::RowAction;
     use crate::model::LikeStatus;
@@ -2412,7 +2457,7 @@ fn rate_thumbs(
             ui.id().with(("ytm-row-thumb", id_salt, label)),
             up,
             set,
-            over || set,
+            over || (set && !quiet),
         );
         if hit.clicked() {
             choice = Some(RowAction::Rate {
@@ -3873,6 +3918,28 @@ mod tests {
         assert!(notch_rows(card, 20.0, 20.0).iter().all(Vec::is_empty));
     }
 
+    /// An image that fills its slot keeps the slot's curve; one letterboxed well inside it is
+    /// square; one inset a little keeps only what stops its corners poking past the slot's.
+    #[test]
+    fn a_fitted_image_rounds_only_where_it_meets_the_slot_corners() {
+        let slot = Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(116.0, 116.0));
+        let r = CornerRadius::same(14);
+        assert_eq!(inner_radius(r, slot, slot), r, "fills the slot");
+        // A 16:9 still in a square card: 32pt of letterbox above and below.
+        let wide = Rect::from_center_size(slot.center(), vec2(116.0, 116.0 * 9.0 / 16.0));
+        assert_eq!(
+            inner_radius(r, slot, wide),
+            CornerRadius::ZERO,
+            "letterboxed"
+        );
+        let nearly = Rect::from_center_size(slot.center(), vec2(116.0, 106.0));
+        assert_eq!(
+            inner_radius(r, slot, nearly),
+            CornerRadius::same(9),
+            "5pt in"
+        );
+    }
+
     /// The repaint paints a mesh per corner, in the gutter colour — and nothing over a
     /// translucent gutter, where that colour would read as a dark sliver.
     #[test]
@@ -4156,6 +4223,7 @@ mod tests {
                         }),
                         like: track.like,
                         show_rating: false,
+                        quiet_like: false,
                     },
                 );
                 fired = hit.activate;
@@ -4382,6 +4450,7 @@ mod tests {
                         }),
                         like: track.like,
                         show_rating: false,
+                        quiet_like: false,
                     },
                 );
                 fired = hit.activate;
@@ -4513,6 +4582,7 @@ mod tests {
                         }),
                         like: track.like,
                         show_rating: false,
+                        quiet_like: false,
                     },
                 );
                 at = hit.response.rect.center();

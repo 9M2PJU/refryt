@@ -38,8 +38,9 @@ your own machine, and credentials never pass through anything but your browser a
   (MPRIS on Linux, SMTC on Windows), Discord Rich Presence, and the keyboard shortcuts you'd
   expect from Spotify's desktop app (space to play or pause, arrows to skip, and so on).
 - **A translucent, blurred shell**, with real compositor blur where the desktop offers it (KDE
-  Wayland today; Windows hides transparency and blur for now), nine colour schemes, and a light
-  and dark variant for each.
+  Wayland today; Windows hides transparency and blur for now), and 22 colour themes that are
+  [plain CSS files](docs/THEMES.md) in your config folder: edit one and the app repaints as
+  you save, delete one and it's gone, add your own.
 - **Sign-in from the app or from a browser.** The in-app sign-in window works on Linux and
   Windows, and importing the session from Chrome, Firefox, Brave, Vivaldi or Edge works
   everywhere. No pasting cookies, no device codes.

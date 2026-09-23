@@ -7,19 +7,11 @@ use crate::api::LibrarySection;
 use crate::app::{App, LibrarySort, RailFilter, Route};
 use crate::auth::AuthState;
 use crate::theme;
-use crate::ui::{
-    CARD_ART_PT, CARD_W, ListClick, art_texture, card_is_visible, centered, failed, track_rows,
-};
+use crate::ui::{ListClick, art_texture, card_is_visible, centered, failed, track_rows};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new("Your library")
-            .font(theme::semibold(18.0))
-            .color(app.palette.text),
-    );
-    ui.add_space(10.0);
+    crate::ui::page_title(ui, &app.palette, "Your library");
 
     crate::ui::page_scroll(app, "library").show(ui, |ui| {
         // One section at a time, as the site does. Stacking all five down one page is what left
@@ -301,9 +293,10 @@ fn artist_grid(app: &mut App, ui: &mut egui::Ui) {
     let mut clicked = None;
     let mut last_visible = false;
     ui.horizontal_wrapped(|ui| {
+        let card_w = crate::ui::grid_card_w(ui);
         let count = app.library.artists.len();
         for (i, a) in app.library.artists.items.iter().enumerate() {
-            let visible = card_is_visible(ui, CARD_W, widgets::ArtShape::Circle);
+            let visible = card_is_visible(ui, card_w, widgets::ArtShape::Circle);
             // The last card being on screen is what "scrolled to the end" means for a grid.
             if visible && i + 1 == count {
                 last_visible = true;
@@ -315,14 +308,14 @@ fn artist_grid(app: &mut App, ui: &mut egui::Ui) {
                         &app.backend,
                         ui.ctx(),
                         a.thumbnail.as_ref(),
-                        CARD_ART_PT,
+                        card_w - 16.0,
                     )
                 })
                 .flatten();
             if widgets::art_card(
                 ui,
                 &app.palette,
-                CARD_W,
+                card_w,
                 art,
                 &a.name,
                 a.subscribers.as_deref().unwrap_or(""),
@@ -355,9 +348,10 @@ fn album_grid(app: &mut App, ui: &mut egui::Ui) {
     let mut played = None;
     let mut last_visible = false;
     ui.horizontal_wrapped(|ui| {
+        let card_w = crate::ui::grid_card_w(ui);
         let count = app.library.albums.len();
         for (i, al) in app.library.albums.items.iter().enumerate() {
-            let visible = card_is_visible(ui, CARD_W, widgets::ArtShape::Square);
+            let visible = card_is_visible(ui, card_w, widgets::ArtShape::Square);
             // The last card being on screen is what "scrolled to the end" means for a grid.
             if visible && i + 1 == count {
                 last_visible = true;
@@ -369,7 +363,7 @@ fn album_grid(app: &mut App, ui: &mut egui::Ui) {
                         &app.backend,
                         ui.ctx(),
                         al.thumbnail.as_ref(),
-                        CARD_ART_PT,
+                        card_w - 16.0,
                     )
                 })
                 .flatten();
@@ -387,7 +381,7 @@ fn album_grid(app: &mut App, ui: &mut egui::Ui) {
             let card = widgets::art_card(
                 ui,
                 &app.palette,
-                CARD_W,
+                card_w,
                 art,
                 &al.title,
                 &sub,
@@ -426,9 +420,10 @@ fn playlist_grid(app: &mut App, ui: &mut egui::Ui) {
     let mut played = None;
     let mut last_visible = false;
     ui.horizontal_wrapped(|ui| {
+        let card_w = crate::ui::grid_card_w(ui);
         let count = app.library.playlists.len();
         for (i, pl) in app.library.playlists.items.iter().enumerate() {
-            let visible = card_is_visible(ui, CARD_W, widgets::ArtShape::Square);
+            let visible = card_is_visible(ui, card_w, widgets::ArtShape::Square);
             // The last card being on screen is what "scrolled to the end" means for a grid.
             if visible && i + 1 == count {
                 last_visible = true;
@@ -440,7 +435,7 @@ fn playlist_grid(app: &mut App, ui: &mut egui::Ui) {
                         &app.backend,
                         ui.ctx(),
                         pl.thumbnail.as_ref(),
-                        CARD_ART_PT,
+                        card_w - 16.0,
                     )
                 })
                 .flatten();
@@ -450,7 +445,7 @@ fn playlist_grid(app: &mut App, ui: &mut egui::Ui) {
             let card = widgets::art_card(
                 ui,
                 &app.palette,
-                CARD_W,
+                card_w,
                 art,
                 &pl.title,
                 "",
@@ -630,6 +625,7 @@ fn local_folder_grid(
     let mut open = None;
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
+        let card_w = crate::ui::grid_card_w(ui);
         for name in names {
             // This subfolder's own tracks, at or below it — not the parent's — so the menu
             // acts on exactly what the card names, whether or not it's ever opened.
@@ -653,7 +649,7 @@ fn local_folder_grid(
                 radio_id: None,
                 save_as_new: Some(name.as_str()),
             };
-            let click = widgets::folder_card(ui, &app.palette, CARD_W, name, tracks.len(), menu);
+            let click = widgets::folder_card(ui, &app.palette, card_w, name, tracks.len(), menu);
             if click.response.clicked() {
                 open = Some(name.clone());
             }

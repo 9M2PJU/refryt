@@ -662,10 +662,10 @@ pub struct Options {
     pub queue: bool,
     /// Open the lyrics panel at startup, the same kind of test aid as `queue`.
     pub lyrics: bool,
-    /// Override the saved scheme — and optionally its flavour — for this run, without touching
-    /// `settings.json`. A test aid, for screenshotting the whole matrix without clicking
-    /// through Settings.
-    pub scheme: Option<(crate::theme::Scheme, Option<String>)>,
+    /// Override the saved theme for this run, by name as typed (`catppuccin-frappe`), without
+    /// touching `settings.json`. Also forces that theme's own mode. A test aid, for
+    /// screenshotting the whole matrix without clicking through Settings.
+    pub scheme: Option<String>,
     /// Override the saved opacity for this run, same rule as `scheme`.
     pub opacity: Option<crate::settings::Opacity>,
     /// Never bind the KDE blur protocol this run. Not a test aid but a safety hatch: a Wayland
@@ -1000,6 +1000,10 @@ fn hide_command_for(wayland: bool, hide: bool) -> egui::ViewportCommand {
 
 pub struct App {
     pub(crate) palette: Palette,
+    /// The themes folder as last read. Settings lists these; `settings.custom_theme` picks one.
+    pub(crate) custom_themes: theme::custom::Themes,
+    /// Raised by the folder watcher when a theme file is added, removed or saved.
+    themes_changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     history: History,
     pub(crate) decorated: bool,
     startup_timing: bool,
@@ -1468,14 +1472,31 @@ impl App {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         crate::instance::attach(&cc.egui_ctx);
         let mut settings = crate::settings::load();
+        // The themes folder is written on the very first run, then read — before anything that
+        // names a theme, so an old settings file and `--scheme` both resolve against it.
+        theme::custom::seed();
+        let custom_themes = theme::custom::load();
+        for (file, error) in &custom_themes.errors {
+            tracing::warn!(%file, %error, "custom theme did not load");
+        }
+        settings.migrate_legacy(&custom_themes);
         // Session-only, and applied before the first palette build so the very first frame
         // already shows what was asked for. Never saved: `update_settings` only ever writes
         // `self.settings`, and this happens before that struct is stored on `App`, so a later
         // settings edit persists the override right back — which is fine for a scripted run
         // and would be wrong for anything else, which is why these stay CLI-only.
-        if let Some((scheme, flavour)) = scheme {
-            settings.scheme = scheme;
-            settings.scheme_variant = flavour;
+        if let Some(query) = scheme {
+            match custom_themes.find_loose(&query) {
+                Some(t) if t.dark => {
+                    settings.dark_theme = t.name.clone();
+                    settings.theme = crate::settings::Theme::Dark;
+                }
+                Some(t) => {
+                    settings.light_theme = t.name.clone();
+                    settings.theme = crate::settings::Theme::Light;
+                }
+                None => tracing::warn!(%query, "--scheme: no theme by that name"),
+            }
         }
         if let Some(opacity) = opacity {
             settings.opacity = opacity;
@@ -1497,7 +1518,8 @@ impl App {
             settings.opacity = crate::settings::Opacity::OFF;
             settings.blur = false;
         }
-        let palette = settings.palette(&cc.egui_ctx);
+        let themes_changed = theme::custom::watch(cc.egui_ctx.clone());
+        let palette = settings.palette(&cc.egui_ctx, &custom_themes);
         theme::apply(&cc.egui_ctx, &palette);
         let blur = crate::blur::Blur::new(cc);
 
@@ -1522,6 +1544,8 @@ impl App {
         // that would have shown anyway.
         let mut app = Self {
             palette,
+            custom_themes,
+            themes_changed,
             // Open on Home, as YouTube Music does — it is a real feed now rather than a page we
             // assembled. `--search` starts on Search, and `--page` overrides both.
             history: History::new(match (page, search.is_some()) {
@@ -1832,6 +1856,36 @@ impl App {
     /// Applied immediately rather than on restart: the palette is rebuilt, the resolver retuned,
     /// and only then is the file written — a failed write should not leave the UI disagreeing
     /// with what the app is doing.
+    /// Rebuild the palette from the settings and the loaded themes, and hand it to egui.
+    fn repaint_palette(&mut self, ctx: &egui::Context) {
+        self.palette = self.settings.palette(ctx, &self.custom_themes);
+        theme::apply(ctx, &self.palette);
+    }
+
+    /// Re-read the themes folder when the watcher saw it change, repainting if the theme on
+    /// screen is among what changed. Cheap to call every frame: one atomic load at rest.
+    fn reload_custom_themes(&mut self, ctx: &egui::Context) {
+        if !self
+            .themes_changed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let themes = theme::custom::load();
+        if themes == self.custom_themes {
+            return;
+        }
+        for (file, error) in &themes.errors {
+            tracing::warn!(%file, %error, "custom theme did not load");
+        }
+        self.custom_themes = themes;
+        let palette = self.settings.palette(ctx, &self.custom_themes);
+        if palette != self.palette {
+            self.palette = palette;
+            theme::apply(ctx, &self.palette);
+        }
+    }
+
     pub(crate) fn update_settings(
         &mut self,
         ctx: &egui::Context,
@@ -1842,15 +1896,14 @@ impl App {
         if self.settings == before {
             return;
         }
-        // Any of the four that make a palette: the family, the flavour chosen within it, the
-        // polarity, or how much of the desktop shows through it.
+        // Any of what makes a palette: the mode, the theme chosen for either mode, or how much
+        // of the desktop shows through it.
         if self.settings.theme != before.theme
-            || self.settings.scheme != before.scheme
-            || self.settings.scheme_variant != before.scheme_variant
+            || self.settings.dark_theme != before.dark_theme
+            || self.settings.light_theme != before.light_theme
             || self.settings.opacity != before.opacity
         {
-            self.palette = self.settings.palette(ctx);
-            theme::apply(ctx, &self.palette);
+            self.repaint_palette(ctx);
         }
         if self.settings.quality != before.quality {
             self.backend
@@ -4523,6 +4576,22 @@ impl App {
         }
     }
 
+    /// Keep an open lyrics panel on the loaded track. Song changes and the panel's own toggle
+    /// already ask; this covers the ways a track arrives without either — a session restored at
+    /// launch, or `--lyrics` opening the panel before it — which left the panel saying "Play a
+    /// song" over a song sitting right there in the bar. Once per track: `lyrics_for` is set
+    /// by the request, so a failed fetch is not retried every frame.
+    fn sync_lyrics(&mut self) {
+        if self.lyrics_open
+            && !self.lyrics_loading
+            && let Some(track) = self.now.track.as_ref()
+            && self.lyrics_for.as_deref() != Some(track.video_id.as_str())
+        {
+            let track = track.clone();
+            self.fetch_lyrics(track);
+        }
+    }
+
     /// Start a lyrics request for `track`, replacing whatever is shown. The `lyrics_for` guard
     /// drops the reply if the track changes before it lands.
     fn fetch_lyrics(&mut self, track: Track) {
@@ -5667,6 +5736,7 @@ impl eframe::App for App {
         self.handle_events(&ctx);
         self.poll_tray(&ctx);
         self.poll_media(&ctx);
+        self.reload_custom_themes(&ctx);
         // A second plain launch asked the running instance to show itself (see `instance`).
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         if crate::instance::poll() {
@@ -5876,7 +5946,7 @@ impl eframe::App for App {
                 .fill(Color32::BLACK)
                 .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
         } else {
-            card(p.card_fill(), theme::CARD_INSET)
+            card(p.card_fill(), theme::PAGE_INSET)
         };
         egui::CentralPanel::default()
             .frame(content.outer_margin(egui::Margin {
@@ -5901,8 +5971,8 @@ impl eframe::App for App {
                     ui::video::panel(self, ui);
                     return;
                 }
-                let card = widgets::card_rect(top, theme::CARD_INSET);
-                widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &p);
+                let card = widgets::card_rect(top, theme::PAGE_INSET);
+                widgets::clip_card_content(ui, card, theme::PAGE_INSET_X, &p);
                 match route {
                     Route::Search => ui::search::page(self, ui),
                     Route::Explore => ui::explore::page(self, ui),
@@ -5923,7 +5993,7 @@ impl eframe::App for App {
                 // own top and bottom edges, and the part of it outside the rounded silhouette is
                 // covered with the gutter. The video view returns above — its frame is already
                 // rounded — so this never touches it.
-                widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, &p);
+                widgets::paint_corner_notches(ui, card, theme::PAGE_INSET_X, &p);
             });
         // On the foreground layer, so draw order relative to the panels above doesn't matter —
         // see `widgets::progress_bar`'s own doc comment for why it moved here from the content
@@ -5954,6 +6024,7 @@ impl eframe::App for App {
         // Restore the saved position once its track is loaded, and keep `playback.json` fresh.
         self.poll_playback(&state);
         self.apply_crossfade(&state);
+        self.sync_lyrics();
         if self.playback_started {
             self.stall.observe(state.position);
         }

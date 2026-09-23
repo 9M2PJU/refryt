@@ -1,8 +1,7 @@
 //! One mood's playlists, reached from the home page's Moods & genres grid.
 
 use crate::app::{App, Route};
-use crate::theme;
-use crate::ui::{CARD_ART_PT, CARD_W, art_texture, card_is_visible, failed, section};
+use crate::ui::{art_texture, card_is_visible, failed, section};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
@@ -19,19 +18,14 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
 
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new(&mood.title)
-            .font(theme::semibold(18.0))
-            .color(app.palette.text),
-    );
-    ui.add_space(10.0);
+    crate::ui::page_title(ui, &app.palette, &mood.title);
 
     crate::ui::page_scroll(app, "mood").show(ui, |ui| {
         section(ui, &app.palette, "Playlists");
         let mut clicked = None;
         let mut played = None;
         ui.horizontal_wrapped(|ui| {
+            let card_w = crate::ui::grid_card_w(ui);
             for (i, pl) in app
                 .mood_playlists
                 .as_ref()
@@ -40,21 +34,21 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
                 .iter()
                 .enumerate()
             {
-                let art = card_is_visible(ui, CARD_W, widgets::ArtShape::Square)
+                let art = card_is_visible(ui, card_w, widgets::ArtShape::Square)
                     .then(|| {
                         art_texture(
                             &mut app.images,
                             &app.backend,
                             ui.ctx(),
                             pl.thumbnail.as_ref(),
-                            CARD_ART_PT,
+                            card_w - 16.0,
                         )
                     })
                     .flatten();
                 let card = widgets::art_card(
                     ui,
                     &app.palette,
-                    CARD_W,
+                    card_w,
                     art,
                     &pl.title,
                     &pl.author,

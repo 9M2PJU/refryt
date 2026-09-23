@@ -14,13 +14,7 @@ use crate::ui::{failed, section, shelf_carousel};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new("Charts")
-            .font(theme::semibold(18.0))
-            .color(app.palette.text),
-    );
-    ui.add_space(10.0);
+    crate::ui::page_title(ui, &app.palette, "Charts");
 
     if app.charts_loading && app.charts.is_none() {
         // A ranked section is a 3-column grid, not a single column of rows.

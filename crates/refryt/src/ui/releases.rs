@@ -5,18 +5,11 @@
 //! everywhere else uses.
 
 use crate::app::App;
-use crate::theme;
 use crate::ui::{failed, shelf_carousel};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new("New releases")
-            .font(theme::semibold(18.0))
-            .color(app.palette.text),
-    );
-    ui.add_space(10.0);
+    crate::ui::page_title(ui, &app.palette, "New releases");
 
     if app.releases_loading && app.releases.is_none() {
         // Always albums & singles — card shelves, never a track-list one, unlike Home/Explore.

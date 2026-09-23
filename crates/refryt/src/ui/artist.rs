@@ -87,7 +87,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
 fn hero_header(app: &mut App, ui: &mut egui::Ui) {
     let content_top = ui.cursor().min.y;
     let content_left = ui.cursor().min.x;
-    let inset_x = crate::theme::CARD_INSET_X;
+    let inset_x = crate::theme::PAGE_INSET_X;
     // The content column is inset from the card's sides; the hero spans the card itself. There
     // is no top margin to add: the card's top edge is the content's.
     let width = ui.available_width() + inset_x * 2.0;
@@ -624,11 +624,11 @@ fn you_liked(app: &mut App, ui: &mut egui::Ui) {
     let title_font = crate::theme::semibold(15.0);
     let by_font = crate::theme::regular(12.0);
 
-    // The same 12pt the shelf headings above use, so "You Liked" sits on Popular's baseline.
-    ui.add_space(12.0);
+    // The same 20pt the shelf headings above use, so "You Liked" sits on Popular's baseline.
+    ui.add_space(20.0);
     ui.label(
         egui::RichText::new("You Liked")
-            .font(crate::theme::semibold(14.0))
+            .font(crate::theme::bold(crate::theme::SECTION_PT))
             .color(p.text),
     );
     ui.add_space(8.0);

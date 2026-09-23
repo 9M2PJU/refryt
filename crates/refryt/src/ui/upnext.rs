@@ -96,6 +96,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                         // rate things: a column of thumbs repeated down it is noise.
                         // Rating a queued song is one click away on the player bar.
                         show_rating: false,
+                        quiet_like: false,
                     }
                 },
             )
@@ -201,6 +202,7 @@ fn now_playing(app: &mut App, ui: &mut egui::Ui) {
                 menu: None,
                 like: track.like,
                 show_rating: false,
+                quiet_like: false,
             })
         })
         .inner;

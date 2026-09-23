@@ -12,13 +12,7 @@ use crate::ui::{centered, entry_rows, failed, section};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new("History")
-            .font(theme::semibold(18.0))
-            .color(app.palette.text),
-    );
-    ui.add_space(10.0);
+    crate::ui::page_title(ui, &app.palette, "History");
 
     match &app.auth {
         AuthState::SignedIn { .. } => content(app, ui),

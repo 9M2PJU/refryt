@@ -24,13 +24,7 @@ fn link_target(link: &crate::model::ExploreLink) -> Option<(Icon, Route)> {
 }
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new("Explore")
-            .font(theme::semibold(18.0))
-            .color(app.palette.text),
-    );
-    ui.add_space(10.0);
+    crate::ui::page_title(ui, &app.palette, "Explore");
 
     if app.explore_loading && app.explore.is_none() {
         // Same reasoning as `home.rs`: several titled carousels, mixing grids and row-lists,

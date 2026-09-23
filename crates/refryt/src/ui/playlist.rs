@@ -6,7 +6,7 @@
 
 use crate::app::{App, PlaylistSort};
 use crate::model::Playlist;
-use crate::ui::{ListClick, PAGE_ART_SIZE, failed, track_rows};
+use crate::ui::{ListClick, PAGE_ART_SIZE, failed, track_rows_quiet};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
@@ -120,7 +120,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
             return;
         };
         // The type line is the kind only; the year joins the meta line below, like the album.
-        let kind_label = "PLAYLIST".to_owned();
+        let kind_label = "Playlist".to_owned();
         let meta = meta_line(pl);
         // The owner, folded into the meta line below rather than a separate row: linked where
         // the page gave a channel id, so their profile can be opened from the name. Liked Music
@@ -334,7 +334,11 @@ fn track_list(app: &mut App, ui: &mut egui::Ui) {
             .as_ref()
             .filter(|p| p.editable)
             .map(|p| p.id.as_str());
-        track_rows(
+        // Liked Music is liked all the way down; its thumbs show only under the pointer.
+        let liked_music = playlist
+            .as_ref()
+            .is_some_and(|p| crate::model::is_liked_auto(&p.id));
+        track_rows_quiet(
             ui,
             palette,
             images,
@@ -349,6 +353,7 @@ fn track_list(app: &mut App, ui: &mut egui::Ui) {
             false,
             // Each track is from its own album, so the per-row cover stays.
             false,
+            liked_music,
         )
     };
     // A long playlist arrives 100 tracks at a time; ask for the next when the viewport gets there.

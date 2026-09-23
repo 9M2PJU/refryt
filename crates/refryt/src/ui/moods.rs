@@ -5,18 +5,11 @@
 //! rather than an invented one.
 
 use crate::app::{App, Route};
-use crate::theme;
 use crate::ui::{failed, mood_chips, section};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new("Moods & genres")
-            .font(theme::semibold(18.0))
-            .color(app.palette.text),
-    );
-    ui.add_space(10.0);
+    crate::ui::page_title(ui, &app.palette, "Moods & genres");
 
     if app.moods_loading && app.moods.is_none() {
         // No cover art anywhere on this page — colour-stripe chips, not photo cards.

@@ -12,9 +12,8 @@
 
 use egui::{Color32, CornerRadius, Stroke};
 
-pub mod schemes;
-
-pub use schemes::{Scheme, Variant};
+pub mod custom;
+mod ramp;
 
 // ---------------------------------------------------------------------------------------------
 // Metrics
@@ -29,13 +28,19 @@ pub const ART_RADIUS_MAX: u8 = 16;
 /// Inputs and chips.
 pub const RADIUS_SMALL: u8 = 4;
 /// The frameless window itself.
-pub const WINDOW_RADIUS: u8 = 10;
+pub const WINDOW_RADIUS: u8 = 20;
 
 pub const ROW_HEIGHT: f32 = 56.0;
 pub const ART_SIZE: f32 = 40.0;
 /// A track row's title. A step above the subtitle's 12 so the song reads first and the credits
 /// under it second, without losing the list's density.
 pub const ROW_TITLE_PT: f32 = 14.0;
+/// A page's own title — "Your library", "Settings", "Results for …". Well clear of the section
+/// headings under it, so the page reads title, then sections, then rows.
+pub const PAGE_TITLE_PT: f32 = 26.0;
+/// A section heading inside a page — "Listen again", "Top songs", "Albums". A clear step above
+/// a row title; at the row title's own size the sections dissolved into their contents.
+pub const SECTION_PT: f32 = 20.0;
 /// Where a track row's number/art block starts, from the row's own left edge. Zero so the list
 /// lines up with the page header's cover, which starts at the content origin.
 pub const ROW_LEFT_INSET: f32 = 0.0;
@@ -78,9 +83,23 @@ pub const CARD_INSET: egui::Margin = egui::Margin {
     bottom: 0,
 };
 
-/// [`CARD_INSET`]'s side padding as a scalar, for the geometry that grows a content rect back
-/// out to the card's own edges — the header wash, the artist hero, the corner repaint.
+/// [`CARD_INSET`]'s side padding as a scalar, for the corner repaint on the rail and queue cards.
 pub const CARD_INSET_X: f32 = 8.0;
+
+/// The page card's inner margins. Wider at the sides than the rail and queue cards: the page
+/// holds titles, grids and long lists, and at 8 they sat cramped against the card's rounded
+/// edge. At the card radius the content column clears the corners outright, so no content
+/// ever reaches outside the silhouette.
+pub const PAGE_INSET: egui::Margin = egui::Margin {
+    left: PANEL_RADIUS as i8,
+    right: PANEL_RADIUS as i8,
+    top: 0,
+    bottom: 0,
+};
+
+/// [`PAGE_INSET`]'s side padding as a scalar, for the geometry that grows the page's content
+/// rect back out to the card's own edges — the header wash, the artist hero, the corner repaint.
+pub const PAGE_INSET_X: f32 = PANEL_RADIUS as f32;
 
 /// The page header's own top gap inside the content card.
 ///
@@ -88,7 +107,7 @@ pub const CARD_INSET_X: f32 = 8.0;
 /// header's art — the same distance the art has from the card's side, so the cover sits square
 /// in the corner rather than closer to one edge than the other. Shared by the real header and
 /// the loading skeleton, which would otherwise jump when the page arrives.
-pub const HEADER_TOP_PAD: f32 = CARD_INSET_X;
+pub const HEADER_TOP_PAD: f32 = PAGE_INSET_X;
 
 /// A rail row: cover, title, author.
 pub const RAIL_ROW_HEIGHT: f32 = 60.0;
@@ -146,14 +165,14 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// The default scheme's dark palette. Kept as a name because half the app's tests and the
+    /// The default theme's dark palette. Kept as a name because half the app's tests and the
     /// `--decorated` fallback path reach for it directly.
     pub fn dark() -> Self {
-        Scheme::Classic.palette(true)
+        custom::fallback(true).palette()
     }
 
     pub fn light() -> Self {
-        Scheme::Classic.palette(false)
+        custom::fallback(false).palette()
     }
 
     /// A copy that paints its backgrounds at `opacity`.
@@ -530,25 +549,22 @@ mod tests {
                 Color32::from_rgb(v, v, v)
             );
         }
-        let p = Scheme::Classic
-            .palette(true)
-            .with_opacity(crate::settings::Opacity::OFF);
+        let p = Palette::dark().with_opacity(crate::settings::Opacity::OFF);
         assert_eq!(p.window_fill(), p.window);
         assert_eq!(p.card_fill(), p.panel);
         assert!(!p.translucent());
     }
 
-    /// Every scheme, opaque, is exactly what it was before opacity applied to it — the property
-    /// the transparency slider exists not to disturb for anyone who leaves it at the default.
+    /// Every shipped theme, opaque, is exactly what it was before opacity applied to it — the
+    /// property the transparency slider exists not to disturb for anyone who leaves it at the
+    /// default.
     #[test]
-    fn opacity_off_is_identity_for_every_scheme() {
-        for scheme in Scheme::ALL {
-            for dark in [true, false] {
-                let base = scheme.palette(dark);
-                let opaque = base.with_opacity(crate::settings::Opacity::OFF);
-                assert_eq!(opaque.window_fill(), base.window);
-                assert_eq!(opaque.card_fill(), base.panel);
-            }
+    fn opacity_off_is_identity_for_every_theme() {
+        for (name, css) in custom::BUILTIN {
+            let base = custom::parse(name, css).unwrap().palette();
+            let opaque = base.with_opacity(crate::settings::Opacity::OFF);
+            assert_eq!(opaque.window_fill(), base.window);
+            assert_eq!(opaque.card_fill(), base.panel);
         }
     }
 

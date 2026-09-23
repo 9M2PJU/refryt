@@ -14,13 +14,10 @@
 
 use crate::app::{App, Route};
 use crate::model::{Entry, SearchScope};
-use crate::theme;
 use crate::ui::{ListClick, centered, spec_rows};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-
     let heading = if app.searching {
         format!("Searching “{}”…", app.searched)
     } else if app.searched.is_empty() {
@@ -28,12 +25,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
     } else {
         format!("Results for “{}”", app.searched)
     };
-    ui.label(
-        egui::RichText::new(heading)
-            .font(theme::semibold(18.0))
-            .color(app.palette.text),
-    );
-    ui.add_space(10.0);
+    crate::ui::page_title(ui, &app.palette, &heading);
 
     if let Some(status) = &app.status {
         centered(app, ui, status);

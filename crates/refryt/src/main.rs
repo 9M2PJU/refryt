@@ -64,14 +64,15 @@ fn main() -> eframe::Result {
         .and_then(|s| s.parse::<f64>().ok())
         .map(std::time::Duration::from_secs_f64);
 
-    // Override the saved scheme and opacity for this run only — never written to
-    // `settings.json` — so the whole scheme/flavour × opacity matrix can be screenshotted
-    // without clicking through Settings for each one.
+    // Override the saved theme and opacity for this run only — never written to
+    // `settings.json` — so the whole theme × opacity matrix can be screenshotted without
+    // clicking through Settings for each one. `--scheme` takes a theme's name however it is
+    // typed (`catppuccin-frappe`); it is matched once the themes folder has been read.
     let scheme = args
         .iter()
         .position(|a| a == "--scheme")
         .and_then(|i| args.get(i + 1))
-        .and_then(|s| refryt::theme::Scheme::parse_with_flavour(s));
+        .cloned();
     let opacity = args
         .iter()
         .position(|a| a == "--opacity")

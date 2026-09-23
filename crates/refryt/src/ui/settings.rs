@@ -14,29 +14,24 @@ use crate::browser_cookies;
 #[cfg(not(target_os = "windows"))]
 use crate::settings::Opacity;
 use crate::settings::{Quality, Theme};
-use crate::theme::{self, Scheme, Variant};
+use crate::theme;
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.label(
-        RichText::new("Settings")
-            .font(theme::semibold(18.0))
-            .color(app.palette.text),
-    );
-    ui.add_space(10.0);
+    crate::ui::page_title(ui, &app.palette, "Settings");
 
     crate::ui::page_scroll(app, "settings").show(ui, |ui| {
+        ui.set_max_width(COLUMN_MAX_W.min(ui.available_width()));
         appearance(app, ui);
-        ui.add_space(22.0);
+        ui.add_space(28.0);
         playback(app, ui);
-        ui.add_space(22.0);
+        ui.add_space(28.0);
         system(app, ui);
-        ui.add_space(22.0);
+        ui.add_space(28.0);
         integrations(app, ui);
-        ui.add_space(22.0);
+        ui.add_space(28.0);
         local_music(app, ui);
-        ui.add_space(22.0);
+        ui.add_space(28.0);
         heading(app, ui, "Account");
         match &app.auth {
             AuthState::SignedIn { .. } => signed_in(app, ui),
@@ -49,9 +44,9 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             }
             _ => sign_in(app, ui),
         }
-        ui.add_space(22.0);
+        ui.add_space(28.0);
         heading(app, ui, "Help");
-        if widgets::pill_button(ui, &app.palette, "Keyboard shortcuts").clicked() {
+        if widgets::pill_button(ui, &app.palette, "Keyboard Shortcuts").clicked() {
             app.help_open = true;
         }
         ui.add_space(28.0);
@@ -103,10 +98,54 @@ fn sign_in_error(app: &App, ui: &mut egui::Ui) {
 fn heading(app: &App, ui: &mut egui::Ui, text: &str) {
     ui.label(
         RichText::new(text)
-            .font(theme::semibold(14.0))
+            .font(theme::bold(17.0))
             .color(app.palette.text),
     );
-    ui.add_space(8.0);
+    ui.add_space(10.0);
+}
+
+/// What needs saying under the Scheme row: the painting theme's warnings, a chosen theme that
+/// is gone, the built-in stand-in when the folder has nothing of this mode, and files that
+/// failed to read.
+fn theme_notes(app: &App, ui: &mut egui::Ui, dark: bool) {
+    let themes = &app.custom_themes;
+    let mode = if dark { "dark" } else { "light" };
+    let chosen = if dark {
+        &app.settings.dark_theme
+    } else {
+        &app.settings.light_theme
+    };
+    match app.settings.painting_theme(dark, themes) {
+        Some(t) => {
+            if t.name != *chosen {
+                problem(
+                    app,
+                    ui,
+                    &format!("“{chosen}” is missing, using “{}”.", t.name),
+                );
+            }
+            for warning in &t.warnings {
+                note(app, ui, warning);
+            }
+        }
+        None => problem(
+            app,
+            ui,
+            &format!("No {mode} themes in the folder, using Classic."),
+        ),
+    }
+    for (file, error) in &themes.errors {
+        problem(app, ui, &format!("{file}: {error}"));
+    }
+}
+
+/// A [`note`] that reports something wrong.
+fn problem(app: &App, ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .font(theme::regular(11.0))
+            .color(app.palette.danger),
+    );
 }
 
 fn note(app: &App, ui: &mut egui::Ui, text: &str) {
@@ -120,6 +159,13 @@ fn note(app: &App, ui: &mut egui::Ui, text: &str) {
 /// A label followed by controls on one line, centred together. `ui.horizontal` sizes its row
 /// from `interact_size.y` (18pt) and centres the label on that band, so a 32pt chip hangs below
 /// it; giving the row the chip's own height first keeps the two level.
+/// The label column of a [`labeled_row`].
+const LABEL_W: f32 = 104.0;
+
+/// How wide the settings column gets. Past this the switches, right-aligned, drifted a window's
+/// width away from the words that name them.
+const COLUMN_MAX_W: f32 = 720.0;
+
 fn labeled_row(
     palette: &theme::Palette,
     ui: &mut egui::Ui,
@@ -129,12 +175,20 @@ fn labeled_row(
     ui.scope(|ui| {
         ui.spacing_mut().interact_size.y = 32.0;
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(label)
-                    .font(theme::regular(12.0))
-                    .color(palette.secondary),
+            // A fixed label column, so the chips and dropdowns of consecutive rows start on one
+            // line instead of wherever their own label happened to end.
+            ui.allocate_ui_with_layout(
+                egui::vec2(LABEL_W, 32.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_width(LABEL_W);
+                    ui.label(
+                        RichText::new(label)
+                            .font(theme::regular(12.0))
+                            .color(palette.secondary),
+                    );
+                },
             );
-            ui.add_space(8.0);
             contents(ui);
         });
     });
@@ -159,7 +213,7 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
     heading(app, ui, "Appearance");
 
     let mut theme_choice = app.settings.theme;
-    labeled_row(&app.palette, ui, "Theme", |ui| {
+    labeled_row(&app.palette, ui, "Mode", |ui| {
         for option in Theme::ALL {
             if widgets::chip(ui, &app.palette, option.label(), theme_choice == option).clicked() {
                 theme_choice = option;
@@ -168,70 +222,57 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.add_space(8.0);
 
-    // The polarity on screen right now decides which flavours each family offers, and what a
-    // row's swatch promises — a flavour is what it is; the Theme only chooses between them.
+    // The mode on screen decides which themes are offered: a theme file says whether it is
+    // dark or light, and picking one sets the theme for that mode only, so switching modes
+    // (or following the desktop) swaps between two remembered choices.
     let dark = app.palette.dark;
-    let mut scheme_choice = app.settings.scheme;
-    let mut flavour_choice = app.settings.scheme_variant.clone();
-    ui.label(
-        RichText::new("Scheme")
-            .font(theme::regular(12.0))
-            .color(app.palette.secondary),
-    );
-    ui.add_space(6.0);
-    let scheme_options: Vec<(egui::Color32, &'static str)> = Scheme::ALL
+    let mut dark_choice = app.settings.dark_theme.clone();
+    let mut light_choice = app.settings.light_theme.clone();
+    let offered: Vec<&crate::theme::custom::CustomTheme> = app
+        .custom_themes
+        .themes
         .iter()
-        .map(|s| (s.default_variant(dark).swatch(), s.label()))
+        .filter(|t| t.dark == dark)
         .collect();
-    let resolved = app.settings.variant(dark);
-    if let Some(i) = widgets::dropdown(
-        ui,
-        &app.palette,
-        ui.id().with("scheme-dropdown"),
-        resolved.swatch(),
-        scheme_choice.label(),
-        &scheme_options,
-    ) {
-        scheme_choice = Scheme::ALL[i];
-    }
-    ui.add_space(8.0);
-
-    // A second dropdown, and only when the family actually offers a choice in this polarity —
-    // nine families would be eight rows of noise otherwise. The rows are the family's own
-    // flavours with their own accents, so picking Macchiato is one click, not family-then-flavour.
-    let flavours: Vec<&Variant> = scheme_choice
-        .variants()
+    let options: Vec<(egui::Color32, &str)> = offered
         .iter()
-        .filter(|v| v.dark == dark)
+        .map(|t| (t.palette().accent, t.name.as_str()))
         .collect();
-    if flavours.len() > 1 {
-        ui.label(
-            RichText::new("Flavour")
-                .font(theme::regular(12.0))
-                .color(app.palette.secondary),
-        );
-        ui.add_space(6.0);
-        let flavour_options: Vec<(egui::Color32, &'static str)> =
-            flavours.iter().map(|v| (v.swatch(), v.label)).collect();
-        let current = scheme_choice.resolve(dark, flavour_choice.as_deref());
+    let painting = app.settings.painting_theme(dark, &app.custom_themes);
+    let (current_swatch, current_label) = match painting {
+        Some(t) => (t.palette().accent, t.name.as_str()),
+        None => (app.palette.accent, "Classic (built-in)"),
+    };
+    labeled_row(&app.palette, ui, "Theme", |ui| {
         if let Some(i) = widgets::dropdown(
             ui,
             &app.palette,
-            ui.id().with("flavour-dropdown"),
-            current.swatch(),
-            current.label,
-            &flavour_options,
+            ui.id().with("scheme-dropdown"),
+            current_swatch,
+            current_label,
+            &options,
         ) {
-            flavour_choice = Some(flavours[i].label.to_owned());
+            let name = offered[i].name.clone();
+            if dark {
+                dark_choice = name;
+            } else {
+                light_choice = name;
+            }
         }
-        ui.add_space(4.0);
-    }
-    ui.add_space(4.0);
-    // Nord ships no light theme; the note says so rather than letting Snow Storm quietly
-    // disappear into a set of derived greys that look like a different, unnamed choice.
-    if scheme_choice == Scheme::Nord && !dark {
-        note(app, ui, "Snow Storm is derived; Nord ships no light theme");
-    }
+        ui.add_space(8.0);
+        if widgets::outline_button(ui, &app.palette, "Open Themes Folder").clicked() {
+            match crate::theme::custom::dir() {
+                Some(dir) => {
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        tracing::warn!(%e, "could not create the themes folder");
+                    }
+                    crate::open_url(&dir.to_string_lossy());
+                }
+                None => tracing::warn!("no config directory for the themes folder"),
+            }
+        }
+    });
+    theme_notes(app, ui, dark);
     ui.add_space(8.0);
 
     // Windows gets no transparency and no blur row at all. Its per-pixel-alpha route composites
@@ -265,13 +306,9 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
         });
         ui.add_space(4.0);
         if app.decorated {
-            note(
-                app,
-                ui,
-                "The acrylic mode needs the frameless window; `--decorated` hands it back to the OS.",
-            );
+            note(app, ui, "Not available with `--decorated`.");
         } else {
-            note(app, ui, "How much of the desktop shows through the shell.");
+            note(app, ui, "How much of the desktop shows through.");
         }
         ui.add_space(8.0);
 
@@ -281,13 +318,13 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
         widgets::setting_row(
             ui,
             &app.palette,
-            "Blur what shows through",
+            "Background Blur",
             if !blur_available {
-                "Your compositor does not offer window blur; the window is simply translucent."
+                "Your compositor doesn't support it."
             } else if !blur_useful {
-                "Nothing shows through at the current transparency."
+                "Turn up transparency to use it."
             } else {
-                "Real blur behind the window, on compositors that offer it."
+                "Blurs the desktop behind the window."
             },
             |ui| {
                 // Dimmed and inert rather than clickable-but-pointless when there is nothing to
@@ -314,16 +351,16 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
         app,
         ui,
         "setting-adaptive-art-color",
-        "Match header colour to the cover art",
-        "Tints the album/playlist header with a colour pulled from its cover, instead of the theme's fixed accent.",
+        "Adaptive Header Colour",
+        "Tints album and playlist headers to match the cover.",
         &mut adaptive_art_color,
     );
 
     let ctx = ui.ctx().clone();
     app.update_settings(&ctx, |s| {
         s.theme = theme_choice;
-        s.scheme = scheme_choice;
-        s.scheme_variant = flavour_choice;
+        s.dark_theme = dark_choice;
+        s.light_theme = light_choice;
         s.adaptive_art_color = adaptive_art_color;
     });
 }
@@ -332,7 +369,7 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
     heading(app, ui, "Playback");
 
     let mut quality = app.settings.quality;
-    labeled_row(&app.palette, ui, "Audio quality", |ui| {
+    labeled_row(&app.palette, ui, "Audio Quality", |ui| {
         for option in Quality::ALL {
             if widgets::chip(ui, &app.palette, option.label(), quality == option).clicked() {
                 quality = option;
@@ -348,7 +385,7 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
         ui,
         "setting-autoplay",
         "Autoplay",
-        "Keeps playing related songs once the queue ends: YouTube's own radio.",
+        "Plays similar songs when your queue ends.",
         &mut autoplay,
     );
 
@@ -357,8 +394,8 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
         app,
         ui,
         "setting-normalise",
-        "Even out the volume between tracks",
-        "Uses YouTube's own loudness measurement, so tracks do not jump in level.",
+        "Audio Normaliser",
+        "Keeps the volume consistent between tracks.",
         &mut normalise,
     );
 
@@ -367,8 +404,8 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
         app,
         ui,
         "setting-scrobble",
-        "Count plays on your YouTube account",
-        "Reports what you play to your watch history. Only while signed in; anonymous listening stays anonymous.",
+        "Save Listening History",
+        "Adds what you play to your YouTube history.",
         &mut scrobble,
     );
 
@@ -377,8 +414,8 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
         app,
         ui,
         "setting-double-click",
-        "Double-click to play",
-        "A single click selects a song, a double click plays it — the way Spotify works.",
+        "Double-Click to Play",
+        "One click selects, two clicks play.",
         &mut double_click,
     );
 
@@ -387,8 +424,8 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
         app,
         ui,
         "setting-crossfade",
-        "Crossfade between tracks",
-        "Dips the volume down at the end of a track and back up as the next begins.",
+        "Crossfade",
+        "Fades each track into the next.",
         &mut crossfade,
     );
 
@@ -416,8 +453,8 @@ fn system(app: &mut App, ui: &mut egui::Ui) {
         app,
         ui,
         "setting-start-on-boot",
-        "Start on boot",
-        "Launches Refryt automatically when you log in.",
+        "Launch on Startup",
+        "Opens refryt when you log in.",
         &mut start_on_boot,
     );
 
@@ -427,17 +464,15 @@ fn system(app: &mut App, ui: &mut egui::Ui) {
     // — so the promise made here has to be the one Wayland can actually keep, or the toggle
     // reads as broken the first time someone clicks the tray's Show and nothing happens.
     let hide_tray_detail = if crate::app::is_wayland() {
-        "Closing the window minimizes it instead of quitting: Wayland has no way to hide and \
-         reopen a window from an app, so use your taskbar to bring it back. The tray menu quits \
-         for real."
+        "Closing minimises instead of quitting. Quit from the tray."
     } else {
-        "Closing the window hides it to a tray icon instead of quitting. The tray menu brings it back, or quits for real."
+        "Closing hides to the tray instead of quitting."
     };
     toggle_row(
         app,
         ui,
         "setting-hide-tray",
-        "Hide tray on close",
+        "Close to Tray",
         hide_tray_detail,
         &mut hide_tray,
     );
@@ -462,7 +497,7 @@ fn integrations(app: &mut App, ui: &mut egui::Ui) {
         ui,
         &app.palette,
         "Discord Rich Presence",
-        "Shows what you are playing on your Discord profile. Needs Discord running.",
+        "Shows what you're playing on Discord.",
         |ui| {
             widgets::toggle(
                 ui,
@@ -471,12 +506,6 @@ fn integrations(app: &mut App, ui: &mut egui::Ui) {
                 &mut enabled,
             );
         },
-    );
-    ui.add_space(4.0);
-    note(
-        app,
-        ui,
-        "The presence appears while this is on and something is playing.",
     );
 
     let ctx = ui.ctx().clone();
@@ -489,11 +518,11 @@ fn integrations(app: &mut App, ui: &mut egui::Ui) {
 /// Local tab. Adding or removing a folder here is what triggers the rescan — see
 /// `App::update_settings`'s own diff branch for `local_folders`.
 fn local_music(app: &mut App, ui: &mut egui::Ui) {
-    heading(app, ui, "Local Music");
+    heading(app, ui, "Local Files");
     note(
         app,
         ui,
-        "Folders scanned for audio files, shown in the Library's Local tab.",
+        "Folders to scan for music. They show up in Library → Local.",
     );
     ui.add_space(8.0);
 
@@ -552,7 +581,7 @@ fn sign_in(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.add_space(4.0);
     ui.label(
-        RichText::new("Search and playback work without an account; signing in adds your own content and your personalised home feed.")
+        RichText::new("Search and playback work without one.")
             .font(theme::regular(12.0))
             .color(app.palette.dim),
     );
@@ -573,23 +602,19 @@ fn sign_in(app: &mut App, ui: &mut egui::Ui) {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn window_sign_in(app: &mut App, ui: &mut egui::Ui) {
     ui.label(
-        RichText::new("Sign in with a browser window")
+        RichText::new("Sign-In Window")
             .font(theme::semibold(13.0))
             .color(app.palette.text),
     );
     ui.add_space(4.0);
     ui.label(
-        RichText::new(
-            "Opens a small window with Google's sign-in page. It is the app's own browser, so \
-             the session is read from there directly — nothing is taken from the browsers you \
-             use, and none of them needs to be closed first.",
-        )
-        .font(theme::regular(12.0))
-        .color(app.palette.dim),
+        RichText::new("Signs in through Google in a small window of its own.")
+            .font(theme::regular(12.0))
+            .color(app.palette.dim),
     );
     ui.add_space(8.0);
 
-    if widgets::pill_button(ui, &app.palette, "Open the sign-in window").clicked() {
+    if widgets::pill_button(ui, &app.palette, "Sign In").clicked() {
         // Deliberately not `auth = Checking`: that state means "verifying a stored session at
         // startup", and `AuthChanged` reads it to tell an optimistically personalised feed from
         // an anonymous one a fresh sign-in has just invalidated. The state changes when the
@@ -602,9 +627,9 @@ fn window_sign_in(app: &mut App, ui: &mut egui::Ui) {
 fn browser_import(app: &mut App, ui: &mut egui::Ui) {
     ui.label(
         RichText::new(if cfg!(any(target_os = "linux", target_os = "windows")) {
-            "Or import from a browser"
+            "Or Import from a Browser"
         } else {
-            "Import from a browser"
+            "Import from a Browser"
         })
         .font(theme::semibold(13.0))
         .color(app.palette.text),
@@ -617,10 +642,10 @@ fn browser_import(app: &mut App, ui: &mut egui::Ui) {
     if browsers.is_empty() {
         ui.label(
             RichText::new(if cfg!(target_os = "windows") {
-                "No Firefox profile found. Sign in to music.youtube.com in Firefox, or use the \
-                 sign-in window above."
+                "No Firefox profile found. Sign in to music.youtube.com there, or use the \
+                 window above."
             } else {
-                "No browser profile found. Sign in to music.youtube.com in Firefox, Chrome, \
+                "No signed-in browser found. Sign in to music.youtube.com in Firefox, Chrome, \
                  Chromium, Brave, Vivaldi or Edge."
             })
             .font(theme::regular(12.0))
@@ -630,12 +655,9 @@ fn browser_import(app: &mut App, ui: &mut egui::Ui) {
     }
 
     ui.label(
-        RichText::new(
-            "Reads the cookies from a browser you are already signed into. Nothing is launched \
-             and no page is loaded; only the browser's cookie store is read.",
-        )
-        .font(theme::regular(12.0))
-        .color(app.palette.dim),
+        RichText::new("Uses the session from a browser you're already signed into.")
+            .font(theme::regular(12.0))
+            .color(app.palette.dim),
     );
     // No "close the browser first" hint any more: on Windows only Firefox is ever offered here,
     // and Firefox neither locks its store nor seals it, so there is nothing to close for. The
@@ -683,7 +705,7 @@ fn signed_in(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.add_space(6.0);
     ui.label(
-        RichText::new("Your library is available from the sidebar, and Home is personalised.")
+        RichText::new("Your library and Home feed are synced.")
             .font(theme::regular(12.0))
             .color(app.palette.secondary),
     );
@@ -720,11 +742,7 @@ fn channels(app: &mut App, ui: &mut egui::Ui) {
             chosen = Some(account.page_id.clone());
         }
     }
-    note(
-        app,
-        ui,
-        "Each channel has its own library and playlists. Switching reloads them.",
-    );
+    note(app, ui, "Each channel has its own library.");
 
     if let Some(page_id) = chosen {
         let ctx = ui.ctx().clone();

@@ -16,7 +16,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
     // No "Home" heading: the sidebar already says where you are.
     if app.home_loading && app.home.is_none() {
         // The first row's distance from the card's top, matching the sides.
-        ui.add_space(8.0);
+        ui.add_space(theme::PAGE_INSET_X);
         // The real feed is several titled shelves, mixing grids and row-lists — never one
         // untitled block. Which shelves are coming can't be known before they load, so this is
         // a reasonable approximation of the shape, not a prediction of the exact content.
@@ -44,7 +44,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         // Inside the scroll content, not before the scroll area: this is the first row's own
         // distance from the card's top — the same as from its sides — and it scrolls away with
         // the feed. Outside the area it was a fixed band the feed was clipped under.
-        ui.add_space(8.0);
+        ui.add_space(theme::PAGE_INSET_X);
         sign_in_note(app, ui);
         filter_chips(app, ui);
 
@@ -85,6 +85,9 @@ fn filter_row(
     // every chip's strings up front was 22 allocations a frame in the render path.
     let mut picked = None;
     let mut clear = None;
+    // Wrapped: the moods that do not fit the card's width drop to the next line — the ✕ that
+    // appears once one is picked included — rather than scrolling off an edge where the last one
+    // was cut mid-word and the rest could not be seen at all.
     ui.horizontal_wrapped(|ui| {
         let mut selected = false;
         for (i, chip) in chips.iter().enumerate() {

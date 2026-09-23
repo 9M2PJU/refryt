@@ -1,7 +1,7 @@
 //! User preferences, persisted to `~/.config/refryt/settings.json`.
 //!
 //! Everything here changes something real. There is no setting that only writes itself to disk:
-//! the theme and the scheme repaint, the opacity changes what the window lets through,
+//! the theme and the colour themes repaint, the opacity changes what the window lets through,
 //! normalisation changes the gain applied to the stream, the quality choice changes the format
 //! `yt-dlp` is asked for,
 //! and scrobbling reports plays to the account's watch history.
@@ -9,7 +9,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{Palette, Scheme, Variant};
+use crate::theme::Palette;
+use crate::theme::custom::{CustomTheme, Themes};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,7 +34,7 @@ impl Theme {
     }
 
     /// Which polarity to paint, resolving `System` against what the desktop reports. The
-    /// colours themselves come from the [`Scheme`]; this only picks dark or light.
+    /// colours come from the theme chosen for that polarity; this only picks dark or light.
     pub fn is_dark(self, ctx: &egui::Context) -> bool {
         match self {
             Theme::Dark => true,
@@ -216,9 +217,9 @@ impl Quality {
 
     pub fn detail(self) -> &'static str {
         match self {
-            Quality::High => "Opus ~160 kbps, the best available without the official player",
-            Quality::Medium => "up to 128 kbps",
-            Quality::Low => "the smallest usable stream, for metered connections",
+            Quality::High => "Opus, ~160 kbps",
+            Quality::Medium => "Up to 128 kbps",
+            Quality::Low => "Smallest stream, for metered data",
         }
     }
 
@@ -236,13 +237,20 @@ impl Quality {
 #[serde(default)]
 pub struct Settings {
     pub theme: Theme,
-    /// Which colour family to paint. The polarity still comes from `theme`.
-    pub scheme: Scheme,
-    /// The family's flavour as last chosen in Settings — its label, e.g. "Macchiato". `None`
-    /// paints the family's own default for the polarity on screen. A stored flavour that does
-    /// not match the current family or polarity simply does not resolve, and the default
-    /// paints — which is what makes the choice survive Light → Dark → Light.
-    pub scheme_variant: Option<String>,
+    /// The colour theme painted in dark mode: a file name from the themes folder (see
+    /// [`crate::theme::custom`]) whose `color-scheme` is dark.
+    pub dark_theme: String,
+    /// The colour theme painted in light mode.
+    pub light_theme: String,
+    /// Before themes were files: a family (`catppuccin`), its flavour (`Macchiato`) and a custom
+    /// theme picked over them. Read from an older file, folded into the two names above by
+    /// [`Settings::migrate_legacy`], and never written back.
+    #[serde(default, skip_serializing)]
+    scheme: Option<String>,
+    #[serde(default, skip_serializing)]
+    scheme_variant: Option<String>,
+    #[serde(default, skip_serializing)]
+    custom_theme: Option<String>,
     /// How much shows through the shell.
     pub opacity: Opacity,
     /// Ask the compositor to blur what shows through, where it offers it.
@@ -292,8 +300,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: Theme::default(),
-            scheme: Scheme::default(),
+            dark_theme: "Classic Dark".to_owned(),
+            light_theme: "Classic Light".to_owned(),
+            scheme: None,
             scheme_variant: None,
+            custom_theme: None,
             opacity: Opacity::default(),
             blur: true,
             adaptive_art_color: true,
@@ -314,19 +325,101 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// The flavour to paint in, given the polarity: the stored choice when it resolves, the
-    /// family's own default otherwise.
-    pub fn variant(&self, dark: bool) -> &'static Variant {
-        self.scheme.resolve(dark, self.scheme_variant.as_deref())
+    /// The theme chosen for this polarity, if it loaded and is of that polarity.
+    pub fn chosen_theme<'a>(&self, dark: bool, themes: &'a Themes) -> Option<&'a CustomTheme> {
+        let name = if dark {
+            &self.dark_theme
+        } else {
+            &self.light_theme
+        };
+        themes.get(name).filter(|t| t.dark == dark)
     }
 
-    /// The palette to paint with: the scheme's chosen flavour in the theme's polarity, at the
-    /// chosen opacity. The one place those four meet.
-    pub fn palette(&self, ctx: &egui::Context) -> Palette {
-        self.variant(self.theme.is_dark(ctx))
-            .palette()
-            .with_opacity(self.opacity)
+    /// The theme that paints in this polarity: the chosen one; else the first of that polarity
+    /// in the folder, when the chosen file was deleted or broke; else `None`, and the
+    /// compiled-in fallback paints.
+    pub fn painting_theme<'a>(&self, dark: bool, themes: &'a Themes) -> Option<&'a CustomTheme> {
+        self.chosen_theme(dark, themes)
+            .or_else(|| themes.themes.iter().find(|t| t.dark == dark))
     }
+
+    /// The palette to paint with: the theme for the polarity on screen, at the chosen opacity.
+    /// The one place those meet.
+    pub fn palette(&self, ctx: &egui::Context, themes: &Themes) -> Palette {
+        let dark = self.theme.is_dark(ctx);
+        match self.painting_theme(dark, themes) {
+            Some(t) => t.palette(),
+            None => crate::theme::custom::fallback(dark).palette(),
+        }
+        .with_opacity(self.opacity)
+    }
+
+    /// Fold a pre-files settings file into [`Self::dark_theme`]/[`Self::light_theme`]: a family
+    /// and flavour become the theme files they were turned into, and a custom theme picked over
+    /// them goes to the polarity it declares. Idempotent; the old fields are never saved.
+    pub fn migrate_legacy(&mut self, themes: &Themes) {
+        if let Some(family) = self.scheme.take()
+            && let Some((dark, light)) = legacy_names(&family, self.scheme_variant.as_deref())
+        {
+            self.dark_theme = dark;
+            self.light_theme = light;
+        }
+        self.scheme_variant = None;
+        if let Some(name) = self.custom_theme.take()
+            && let Some(t) = themes.get(&name)
+        {
+            if t.dark {
+                self.dark_theme = name;
+            } else {
+                self.light_theme = name;
+            }
+        }
+    }
+}
+
+/// The theme files an old family and flavour became: `(dark, light)`. The stored flavour names
+/// its own polarity; the other polarity takes the family's first of that kind, which is what
+/// the flavour system painted there.
+fn legacy_names(family: &str, flavour: Option<&str>) -> Option<(String, String)> {
+    let (label, flavours): (&str, &[(&str, bool)]) = match family {
+        "classic" | "ytm" => ("Classic", &[("Dark", true), ("Light", false)]),
+        "catppuccin" => (
+            "Catppuccin",
+            &[
+                ("Latte", false),
+                ("Frappé", true),
+                ("Macchiato", true),
+                ("Mocha", true),
+            ],
+        ),
+        "nord" => ("Nord", &[("Polar Night", true), ("Snow Storm", false)]),
+        "gruvbox" => ("Gruvbox", &[("Dark", true), ("Light", false)]),
+        "tokyo_night" => (
+            "Tokyo Night",
+            &[("Night", true), ("Storm", true), ("Day", false)],
+        ),
+        "dracula" => ("Dracula", &[("Dracula", true), ("Alucard", false)]),
+        "rose_pine" => (
+            "Rosé Pine",
+            &[("Main", true), ("Moon", true), ("Dawn", false)],
+        ),
+        "everforest" => ("Everforest", &[("Dark", true), ("Light", false)]),
+        "solarized" => ("Solarized", &[("Dark", true), ("Light", false)]),
+        _ => return None,
+    };
+    let name = |flavour: &str| match (label, flavour) {
+        ("Tokyo Night", "Night") | ("Rosé Pine", "Main") => label.to_owned(),
+        (_, f) if f == label => label.to_owned(),
+        (_, f) => format!("{label} {f}"),
+    };
+    let pick = |dark: bool| {
+        flavours
+            .iter()
+            .find(|(f, d)| *d == dark && Some(*f) == flavour)
+            .or_else(|| flavours.iter().find(|(_, d)| *d == dark))
+            .map(|(f, _)| name(f))
+    };
+    Some((pick(true)?, pick(false)?))
 }
 
 fn path() -> Result<std::path::PathBuf> {
@@ -373,10 +466,10 @@ mod tests {
         assert_eq!(partial.theme, Theme::Light);
         assert_eq!(partial.quality, Quality::High);
         assert_eq!(
-            partial.scheme,
-            Scheme::Classic,
-            "no scheme named yet defaults to ours"
+            partial.dark_theme, "Classic Dark",
+            "no theme named yet defaults to ours"
         );
+        assert_eq!(partial.light_theme, "Classic Light");
         assert_eq!(
             partial.opacity,
             Opacity::OFF,
@@ -404,17 +497,14 @@ mod tests {
         let migrated: Settings =
             serde_json::from_str(r#"{"theme":"dark","tint_from_art":false}"#).unwrap();
         assert_eq!(migrated.theme, Theme::Dark);
-        assert_eq!(migrated.scheme, Scheme::Classic);
-        assert_eq!(
-            migrated.scheme_variant, None,
-            "an older file has no flavour; the family's default paints"
-        );
+        assert_eq!(migrated.dark_theme, "Classic Dark");
         assert_eq!(migrated.opacity, Opacity::OFF);
 
         // The default family was called "ytm" before it was renamed; an old file must land on
         // Classic, not fall back to the whole default struct.
-        let old_name: Settings = serde_json::from_str(r#"{"scheme":"ytm"}"#).unwrap();
-        assert_eq!(old_name.scheme, Scheme::Classic);
+        let mut old_name: Settings = serde_json::from_str(r#"{"scheme":"ytm"}"#).unwrap();
+        old_name.migrate_legacy(&Themes::default());
+        assert_eq!(old_name.dark_theme, "Classic Dark");
     }
 
     /// The slider is new, but a file written while the setting was four named levels must
@@ -436,8 +526,8 @@ mod tests {
     fn settings_round_trip() {
         let s = Settings {
             theme: Theme::Dark,
-            scheme: Scheme::Catppuccin,
-            scheme_variant: Some("Macchiato".into()),
+            dark_theme: "Catppuccin Macchiato".into(),
+            light_theme: "Nord Snow Storm".into(),
             opacity: Opacity::new(0.5),
             blur: false,
             quality: Quality::Low,
@@ -448,26 +538,85 @@ mod tests {
         assert_eq!(s, back);
     }
 
-    /// A stored flavour resolves within its polarity, falls back when the polarity does not
-    /// offer it, and — the whole point — comes back when the polarity does.
+    /// A family and flavour from before themes were files land on the files they became: the
+    /// flavour in its own polarity, the family's first in the other — what used to paint there.
     #[test]
-    fn a_stored_flavour_survives_a_polarity_round_trip() {
-        let mut s = Settings {
-            scheme: Scheme::Catppuccin,
-            scheme_variant: Some("Macchiato".into()),
+    fn a_family_and_flavour_migrate_to_theme_names() {
+        let mut s: Settings =
+            serde_json::from_str(r#"{"scheme":"catppuccin","scheme_variant":"Macchiato"}"#)
+                .unwrap();
+        s.migrate_legacy(&Themes::default());
+        assert_eq!(s.dark_theme, "Catppuccin Macchiato");
+        assert_eq!(s.light_theme, "Catppuccin Latte");
+
+        let mut s: Settings = serde_json::from_str(r#"{"scheme":"tokyo_night"}"#).unwrap();
+        s.migrate_legacy(&Themes::default());
+        assert_eq!(
+            (s.dark_theme.as_str(), s.light_theme.as_str()),
+            ("Tokyo Night", "Tokyo Night Day")
+        );
+
+        let mut s: Settings =
+            serde_json::from_str(r#"{"scheme":"rose_pine","scheme_variant":"Dawn"}"#).unwrap();
+        s.migrate_legacy(&Themes::default());
+        assert_eq!(
+            (s.dark_theme.as_str(), s.light_theme.as_str()),
+            ("Rosé Pine", "Rosé Pine Dawn")
+        );
+
+        // The old fields are never written back.
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("scheme"), "{json}");
+    }
+
+    /// Every family the old enum knew maps to theme files that actually ship.
+    #[test]
+    fn every_legacy_family_maps_to_shipped_themes() {
+        let shipped: Vec<&str> = crate::theme::custom::BUILTIN
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        for family in [
+            "classic",
+            "ytm",
+            "catppuccin",
+            "nord",
+            "gruvbox",
+            "tokyo_night",
+            "dracula",
+            "rose_pine",
+            "everforest",
+            "solarized",
+        ] {
+            let (dark, light) = legacy_names(family, None).expect(family);
+            assert!(shipped.contains(&dark.as_str()), "{family}: {dark}");
+            assert!(shipped.contains(&light.as_str()), "{family}: {light}");
+        }
+    }
+
+    /// A chosen theme that is gone falls to another of its polarity, and only an empty
+    /// polarity falls to the compiled-in Classic.
+    #[test]
+    fn a_missing_choice_falls_back_within_its_polarity() {
+        let css = |base: &str, scheme: &str| {
+            format!("color-scheme:{scheme};--base:{base};--text:#888888;--accent:#ff0000;")
+        };
+        let themes = Themes {
+            themes: vec![
+                crate::theme::custom::parse("Night", &css("#101010", "dark")).unwrap(),
+                crate::theme::custom::parse("Paper", &css("#fafafa", "light")).unwrap(),
+            ],
+            errors: Vec::new(),
+        };
+        let s = Settings {
+            dark_theme: "Deleted".into(),
+            light_theme: "Night".into(),
             ..Settings::default()
         };
-        assert_eq!(s.variant(true).label, "Macchiato");
-        // Light has one Catppuccin flavour, and Macchiato is not it.
-        assert_eq!(s.variant(false).label, "Latte");
-        assert_eq!(
-            s.scheme_variant,
-            Some("Macchiato".into()),
-            "the fallback must not overwrite the stored choice"
-        );
-        // And a flavour of another family is simply not offered here.
-        s.scheme = Scheme::Nord;
-        assert_eq!(s.variant(true).label, "Polar Night");
+        assert_eq!(s.painting_theme(true, &themes).unwrap().name, "Night");
+        // "Night" is dark, so it is not a light choice; the light polarity takes Paper.
+        assert_eq!(s.painting_theme(false, &themes).unwrap().name, "Paper");
+        assert!(s.painting_theme(true, &Themes::default()).is_none());
     }
 
     /// Every quality must ask for something, and they must differ — a setting that changes no
@@ -524,44 +673,6 @@ mod tests {
             max.gutter() < old_strong.gutter() && max.card() < old_strong.card(),
             "the new maximum must let through more than the old one"
         );
-    }
-
-    /// `--scheme` accepts the label in whatever shape someone types it.
-    #[test]
-    fn scheme_parses_loosely() {
-        assert_eq!(Scheme::parse("tokyo-night"), Some(Scheme::TokyoNight));
-        assert_eq!(Scheme::parse("Tokyo Night"), Some(Scheme::TokyoNight));
-        assert_eq!(Scheme::parse("rose pine"), Some(Scheme::RosePine));
-        assert_eq!(Scheme::parse("CATPPUCCIN"), Some(Scheme::Catppuccin));
-        assert_eq!(Scheme::parse("not a scheme"), None);
-    }
-
-    /// `--scheme catppuccin-macchiato` reaches both the family and the flavour, by the same
-    /// loose rules, in whatever shape someone types it — and a flavour that matches nothing
-    /// fails rather than silently falling back to the family default.
-    #[test]
-    fn scheme_parses_with_a_flavour() {
-        let (family, flavour) = Scheme::parse_with_flavour("catppuccin-macchiato").unwrap();
-        assert_eq!(family, Scheme::Catppuccin);
-        assert_eq!(flavour.as_deref(), Some("Macchiato"));
-        let (family, flavour) = Scheme::parse_with_flavour("catppuccin frappé").unwrap();
-        assert_eq!(family, Scheme::Catppuccin);
-        assert_eq!(flavour.as_deref(), Some("Frappé"));
-        assert_eq!(
-            Scheme::parse_with_flavour("tokyo night storm")
-                .unwrap()
-                .1
-                .as_deref(),
-            Some("Storm")
-        );
-        // A family alone carries no flavour...
-        assert_eq!(
-            Scheme::parse_with_flavour("dracula"),
-            Some((Scheme::Dracula, None))
-        );
-        // ...and nonsense stays nonsense.
-        assert_eq!(Scheme::parse_with_flavour("nord-frobnicate"), None);
-        assert_eq!(Scheme::parse_with_flavour("not a scheme"), None);
     }
 
     #[test]

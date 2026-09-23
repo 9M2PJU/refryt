@@ -23,12 +23,19 @@ const TRANSPORT_W: f32 = 250.0;
 /// label must clear this, or a narrow window paints the video toggle over the number.
 const CONTROL_CLUSTER_W: f32 = 14.0 + 76.0 + 8.0 + 30.0 + 8.0 + 30.0 + 8.0 + 30.0;
 
-/// The seek bar's width: a third of the bar, capped at 420pt, and never so wide that the
-/// duration label hanging right of it reaches the control cluster.
+/// The seek bar's width: grows with the window from the transport's own width up to 420pt,
+/// and never so wide that the duration label hanging right of it reaches the control cluster.
+///
+/// It grows from the transport's width rather than as a flat third of the window: at a
+/// mid-size window a third was wide enough that the elapsed label, which the now-playing text
+/// has to clear, cut "The Weeknd • Kiss Land" down to "Kiss Lan" with room to spare in the
+/// middle.
 fn seek_width(width: f32, cluster_left: f32, total_w: f32, center_x: f32) -> f32 {
     // The label is painted 10pt past the bar's right end; the 6pt is the gap it must leave.
     let room = cluster_left - 6.0 - 10.0 - total_w - center_x;
-    (width * 0.34).min(420.0).min(2.0 * room.max(0.0))
+    (width * 0.5 - 250.0)
+        .clamp(TRANSPORT_W, 420.0)
+        .min(2.0 * room.max(0.0))
 }
 
 pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
@@ -398,13 +405,16 @@ mod tests {
     /// label stops short of the control cluster, where the video toggle used to sit on it.
     #[test]
     fn the_seek_bar_shrinks_before_its_label_reaches_the_controls() {
-        // 1100pt window: a third is ~374, well under the cap and the cluster.
+        // 1100pt window: half less 250 is 300, under the cap and the cluster.
         let wide = seek_width(1100.0, 1100.0 - 14.0 - CONTROL_CLUSTER_W, 30.0, 550.0);
-        assert!((wide - 374.0).abs() < 0.01, "{wide}");
+        assert!((wide - 300.0).abs() < 0.01, "{wide}");
+        // A maximised 1920pt window reaches the cap.
+        let full = seek_width(1920.0, 1920.0 - 14.0 - CONTROL_CLUSTER_W, 30.0, 960.0);
+        assert!((full - 420.0).abs() < 0.01, "{full}");
 
         // 760pt window with a long duration: the cluster is the binding limit.
         let narrow = seek_width(760.0, 760.0 - 14.0 - CONTROL_CLUSTER_W, 45.0, 380.0);
-        assert!(narrow < 760.0 * 0.34, "{narrow}");
+        assert!(narrow < TRANSPORT_W, "{narrow}");
         // The label's right edge — half the bar, the 10pt offset and its own width — clears
         // the cluster with the 6pt gap intact.
         let label_right = 380.0 + narrow / 2.0 + 10.0 + 45.0;
