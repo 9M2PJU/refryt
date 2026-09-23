@@ -74,7 +74,7 @@ Wayland. Transparency and blur are Linux-only for now; Windows hides both.
 
 - **Rust**, one binary, with [`egui`/`eframe`](https://github.com/emilk/egui) for the UI
 - **[`mpv`](https://mpv.io/)** (via `libmpv2`) for playback
-- **[`yt-dlp`](https://github.com/yt-dlp/yt-dlp)** for stream resolution
+- YouTube's own `player` endpoint for stream resolution, with **[`yt-dlp`](https://github.com/yt-dlp/yt-dlp)** as the fallback
 - **[`ytmapi-rs`](https://github.com/nick42d/youtui)** for YouTube Music's InnerTube protocol
 - **`tokio`** and **`reqwest`**/`rustls` for async networking
 - **`glow`** (OpenGL) on Linux, **`wgpu`** (DX12) on Windows, for rendering
@@ -101,3 +101,28 @@ See [`docs/BUILDING.md`](docs/BUILDING.md) for the full setup, the dev-loop comm
 ## License
 
 [GPL-3.0-or-later](LICENSE).
+
+## Inspiration
+
+Ideas this project took from others, and where they show up:
+
+- **[Sonora](https://github.com/sonorahq/sonora)** and its
+  [`ytmusic-rs`](https://github.com/sonorahq/ytmusic-rs): playback asks YouTube's `player`
+  endpoint as the visionOS client, which returns direct stream URLs, and when YouTube refuses the
+  visitor it retries with the one the refusal issues.
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**: the fallback resolver, and the reference for
+  how YouTube gates anonymous clients.
+- **[youtui](https://github.com/nick42d/youtui)**: `ytmapi-rs` for the InnerTube API, and its
+  maintained `rusty_ytdl` fork behind the optional native resolver.
+- **[ytmdesktop](https://github.com/ytmdesktop/ytmdesktop)**: what happens when the queue runs
+  out.
+- **Spotify's desktop app**: the keyboard shortcuts, single-click-to-select with double-click to
+  play, and the shape of the album, playlist and artist pages.
+- **Theme palettes**: [Catppuccin](https://github.com/catppuccin/palette),
+  [Nord](https://www.nordtheme.com/docs/colors-and-palettes),
+  [Gruvbox](https://github.com/morhetz/gruvbox),
+  [Tokyo Night](https://github.com/folke/tokyonight.nvim),
+  [Dracula](https://spec.draculatheme.com), [Rosé Pine](https://github.com/rose-pine/palette),
+  [Everforest](https://github.com/sainnhe/everforest) and
+  [Solarized](https://ethanschoonover.com/solarized). Each theme file in `crates/refryt/themes`
+  names its source.

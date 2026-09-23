@@ -578,6 +578,24 @@ pub(crate) fn yt_dlp_program() -> String {
     }
 }
 
+/// The URL mpv should load for `stream`: through the proxy when the stream has to be read in
+/// ranges, its own URL otherwise (or if the proxy is unavailable).
+fn playable_url(
+    proxy: Option<&refryt_resolve::StreamProxy>,
+    id: &VideoId,
+    stream: &refryt_resolve::AudioStream,
+) -> url::Url {
+    match proxy {
+        Some(proxy) if stream.needs_ranged => proxy
+            .url_for(id, stream)
+            .inspect_err(
+                |e| warn!(error = %format!("{e:#}"), "stream proxy: playing the URL directly"),
+            )
+            .unwrap_or_else(|_| stream.url.clone()),
+        _ => stream.url.clone(),
+    }
+}
+
 /// Run yt-dlp for one track, emitting progress as it goes, and return the file it produced.
 ///
 /// Anonymous first, like playback; a failed download is tried once more as the signed-in
@@ -690,6 +708,9 @@ pub struct Backend {
     http: reqwest::Client,
     api: Arc<Api>,
     resolver: Arc<StreamCache<ChainResolver>>,
+    /// Plays the guest resolver's streams to mpv in ranges (see `refryt_resolve::StreamProxy`).
+    /// `None` only if no loopback port could be opened; those streams then play by URL, slowly.
+    proxy: Option<Arc<refryt_resolve::StreamProxy>>,
     /// The video view's own resolver and cache. `yt-dlp` is the only path that can produce a
     /// video URL, so this is not a chain — and it is a separate cache because the video URL for
     /// an id is a different answer from the audio one, which the queue may be playing.
@@ -727,14 +748,32 @@ impl Backend {
         let (tx, rx) = channel();
 
         let api = Arc::new(Api::new()?);
-        // yt-dlp first: at the M1 gate the native resolver could not produce playable URLs, so
-        // putting it first would make every track pay its latency before falling through. The
-        // native path is behind an off-by-default feature, so by default this is a chain of one.
-        let resolver = StreamCache::new(ChainResolver::default_order(
+        // One pool for the guest `player` requests and the stream ranges after them, kept warm
+        // between tracks: a new connection to the stream host costs ~1.3 s before the first byte,
+        // a pooled one ~0.7 s for a whole MiB (measured 2026-09-23).
+        let stream_http = reqwest::Client::builder()
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .map_err(|e| anyhow::anyhow!("could not build the stream client: {e}"))?;
+        let mut guest = refryt_resolve::GuestResolver::new(stream_http.clone());
+        if let Some(dirs) = directories::ProjectDirs::from("", "", "refryt") {
+            let _ = std::fs::create_dir_all(dirs.config_dir());
+            guest = guest.with_visitor_file(dirs.config_dir().join("visitor"));
+        }
+        let resolver = Arc::new(StreamCache::new(ChainResolver::default_order(
+            guest,
             YtDlpResolver::new()
                 .with_program(yt_dlp_program())
                 .with_session(api.ytdlp_session()),
-        ));
+        )));
+        let refreshing = Arc::clone(&resolver);
+        let refresh: refryt_resolve::Refresh = Arc::new(move |id| {
+            let resolver = Arc::clone(&refreshing);
+            Box::pin(async move { resolver.refresh(&id).await })
+        });
+        let proxy = refryt_resolve::StreamProxy::start(rt.handle(), stream_http, refresh)
+            .inspect_err(|e| warn!(error = %format!("{e:#}"), "stream proxy did not start"))
+            .ok();
         let video_resolver = VideoStreamCache::new(
             YtDlpResolver::new()
                 .with_program(yt_dlp_program())
@@ -749,7 +788,8 @@ impl Backend {
                 .build()
                 .map_err(|e| anyhow::anyhow!("could not build the image client: {e}"))?,
             api,
-            resolver: Arc::new(resolver),
+            resolver,
+            proxy,
             video_resolver: Arc::new(video_resolver),
             tx,
             rx,
@@ -1859,6 +1899,7 @@ impl Backend {
             &self.ctx,
             Event::Resolving(track.clone(), generation),
         );
+        let proxy = self.proxy.clone();
 
         self.rt.spawn(async move {
             // A downloaded track plays from disk without the resolver — offline, and without the
@@ -1947,9 +1988,10 @@ impl Backend {
 
             let event = match resolver.resolve(&id).await {
                 Ok(stream) => {
+                    let url = playable_url(proxy.as_deref(), &id, &stream);
                     match player::load(
                         &mpv,
-                        stream.url.as_str(),
+                        url.as_str(),
                         volume,
                         stream.loudness_db,
                         normalise,
@@ -2081,9 +2123,19 @@ impl Backend {
             return;
         }
         let resolver = Arc::clone(&self.resolver);
+        let proxy = self.proxy.clone();
         self.rt.spawn(async move {
-            if let Ok(id) = VideoId::new(track.video_id) {
-                let _ = resolver.resolve(&id).await;
+            let Ok(id) = VideoId::new(track.video_id) else {
+                return;
+            };
+            // Resolved, and for a ranged stream its first 256 KiB fetched too, so the switch
+            // starts from memory over a connection that is already open.
+            if let Ok(stream) = resolver.resolve(&id).await
+                && stream.needs_ranged
+                && let Some(proxy) = proxy
+                && playable_url(Some(&proxy), &id, &stream) != stream.url
+            {
+                proxy.warm(&id).await;
             }
         });
     }

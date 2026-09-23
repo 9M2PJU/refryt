@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 
 #[cfg(feature = "native-resolver")]
 use crate::NativeResolver;
-use crate::{AudioStream, StreamResolver, VideoId, YtDlpResolver, is_sign_in_gate};
+use crate::{AudioStream, GuestResolver, StreamResolver, VideoId, YtDlpResolver, is_sign_in_gate};
 
 /// Consecutive failures before a resolver is skipped.
 const FAILURES_BEFORE_TRIP: u32 = 3;
@@ -84,6 +84,7 @@ pub struct ChainResolver {
     /// Kept alongside the boxed chain so an audio-quality change can retune it without rebuilding
     /// the chain, which lives behind an `Arc` shared with in-flight resolves.
     ytdlp: std::sync::Arc<YtDlpResolver>,
+    guest: Option<std::sync::Arc<GuestResolver>>,
     resolvers: Vec<Box<dyn StreamResolver>>,
     breakers: Mutex<HashMap<&'static str, Breaker>>,
 }
@@ -93,39 +94,47 @@ impl ChainResolver {
     pub fn new(resolvers: Vec<Box<dyn StreamResolver>>) -> Self {
         Self {
             ytdlp: std::sync::Arc::new(YtDlpResolver::new()),
+            guest: None,
             resolvers,
             breakers: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The order to use today.
+    /// The order to use today: the guest `player` request, then yt-dlp.
     ///
-    /// yt-dlp goes first, which inverts the intended design. As of the M1 gate the native
-    /// resolver cannot produce playable URLs at all (see `native.rs`), so putting it first
-    /// would make every track pay its latency before falling through.
-    ///
-    /// Without the `native-resolver` feature this is a chain of one. That feature is off by
-    /// default because the native path costs the Boa JS engine — the largest dependency in the
-    /// workspace — to sit second in a chain and fail its own validity check.
-    pub fn default_order(ytdlp: YtDlpResolver) -> Self {
+    /// With the `native-resolver` feature the Boa-based resolver sits between them. It is off by
+    /// default: as of the M1 gate it cannot produce playable URLs (see `native.rs`), and it costs
+    /// the Boa JS engine, the largest dependency in the workspace.
+    pub fn default_order(guest: GuestResolver, ytdlp: YtDlpResolver) -> Self {
         let ytdlp = std::sync::Arc::new(ytdlp);
+        let guest = std::sync::Arc::new(guest);
+        // The guest path first: one request, no process. yt-dlp last, so it is never skipped
+        // (see the module docs) and still covers what the guest path cannot reach — a video
+        // YouTube only hands to a signed-in listener, through its own signed-in retry.
         #[allow(unused_mut)]
-        let mut resolvers: Vec<Box<dyn StreamResolver>> =
-            vec![Box::new(std::sync::Arc::clone(&ytdlp))];
+        let mut resolvers: Vec<Box<dyn StreamResolver>> = vec![
+            Box::new(std::sync::Arc::clone(&guest)),
+            Box::new(std::sync::Arc::clone(&ytdlp)),
+        ];
         #[cfg(feature = "native-resolver")]
-        resolvers.push(Box::new(
-            NativeResolver::new(crate::NativeConfig::default()),
-        ));
+        resolvers.insert(
+            1,
+            Box::new(NativeResolver::new(crate::NativeConfig::default())),
+        );
         Self {
             ytdlp,
+            guest: Some(guest),
             resolvers,
             breakers: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Retune what `yt-dlp` is asked for, for the audio-quality preference.
+    /// Retune both resolvers for the audio-quality preference, given as the yt-dlp selector.
     pub fn set_format(&self, format: &str) {
         self.ytdlp.set_format(format);
+        if let Some(guest) = &self.guest {
+            guest.set_quality(crate::GuestQuality::from_ytdlp_format(format));
+        }
     }
 
     /// The intended order, for when the native resolver is healthy again.
@@ -269,6 +278,8 @@ mod tests {
                 expires_at: None,
                 loudness_db: None,
                 resolved_by: "stub",
+                mime: None,
+                needs_ranged: false,
             })
         }
     }

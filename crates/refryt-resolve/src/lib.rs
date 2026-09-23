@@ -13,14 +13,18 @@ use url::Url;
 
 mod cache;
 mod chain;
+mod guest;
 #[cfg(feature = "native-resolver")]
 mod native;
+mod proxy;
 mod ytdlp;
 
 pub use cache::{StreamCache, VideoStreamCache};
 pub use chain::ChainResolver;
+pub use guest::{GUEST_USER_AGENT, GuestQuality, GuestResolver};
 #[cfg(feature = "native-resolver")]
 pub use native::{NativeConfig, NativeResolver};
+pub use proxy::{Refresh, StreamProxy};
 pub use ytdlp::{
     CookieFile, SessionCookie, VIDEO_FORMAT, YtDlpResolver, is_sign_in_gate, ytdlp_permit,
 };
@@ -106,6 +110,11 @@ pub struct AudioStream {
     pub loudness_db: Option<f32>,
     /// Which resolver produced this. Recorded so rot in the fast path is visible in logs.
     pub resolved_by: &'static str,
+    /// The container's MIME type (`audio/webm`), when the resolver knows it. The stream proxy
+    /// answers with it.
+    pub mime: Option<String>,
+    /// Throttled unless fetched in ranges: play it through [`StreamProxy`], not by URL.
+    pub needs_ranged: bool,
 }
 
 impl AudioStream {
@@ -169,9 +178,7 @@ pub(crate) fn parse_expiry(url: &Url) -> Option<SystemTime> {
 ///
 /// Opus is preferred over AAC at any bitrate, so a 128k Opus beats a 128k AAC; within a
 /// codec, higher bitrate wins.
-/// Only the native resolver ranks formats itself; yt-dlp does its own selection. Kept compiled
-/// under `cfg(test)` so the ordering guarantee stays covered either way.
-#[cfg(any(feature = "native-resolver", test))]
+/// The guest and native resolvers rank formats themselves; yt-dlp does its own selection.
 pub(crate) fn score(codec: Codec, bitrate_kbps: u32) -> u64 {
     let codec_weight: u64 = match codec {
         Codec::Opus => 2_000_000,
@@ -299,6 +306,8 @@ mod tests {
             expires_at: None,
             loudness_db: None,
             resolved_by: "test",
+            mime: None,
+            needs_ranged: false,
         };
         assert!(s.is_fresh(Duration::from_secs(600)));
     }
@@ -315,6 +324,8 @@ mod tests {
             expires_at: Some(SystemTime::now() + Duration::from_secs(300)),
             loudness_db: None,
             resolved_by: "test",
+            mime: None,
+            needs_ranged: false,
         };
         // Expires in 5 minutes; with a 10 minute margin it is already stale.
         assert!(!s.is_fresh(Duration::from_secs(600)));

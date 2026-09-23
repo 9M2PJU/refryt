@@ -133,6 +133,8 @@ impl StreamResolver for NativeResolver {
             loudness_db: format.loudness_db.map(|d| d as f32),
             url,
             resolved_by: "native",
+            mime: None,
+            needs_ranged: false,
         })
     }
 }

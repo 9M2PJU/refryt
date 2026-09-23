@@ -89,6 +89,12 @@ impl<R: StreamResolver> StreamCache<R> {
     }
 
     /// Drop expired entries. Cheap; call when convenient.
+    /// Resolve `id` again, past its cached entry — for a URL the host has stopped honouring.
+    pub async fn refresh(&self, id: &VideoId) -> Result<AudioStream> {
+        self.entries.lock().unwrap().remove(id);
+        self.resolve(id).await
+    }
+
     pub fn evict_stale(&self) {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|_, s| s.is_fresh(FRESHNESS_MARGIN));
@@ -222,6 +228,8 @@ mod tests {
                 expires_at: self.expires_in.map(|d| SystemTime::now() + d),
                 loudness_db: None,
                 resolved_by: "counting",
+                mime: None,
+                needs_ranged: false,
             })
         }
     }

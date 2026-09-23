@@ -387,6 +387,8 @@ impl StreamResolver for YtDlpResolver {
             loudness_db: None,
             url,
             resolved_by: "yt-dlp",
+            mime: None,
+            needs_ranged: false,
         })
     }
 }

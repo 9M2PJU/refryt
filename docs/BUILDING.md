@@ -4,8 +4,9 @@
 
 - Rust 1.90+ (see `rust-version` in `Cargo.toml`)
 - [`mpv`](https://mpv.io/) development libraries (`libmpv`) — refryt plays audio through it
-- [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) — resolves a video id to a real audio stream.
-  Not needed to build, only to actually play anything.
+- [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) — the fallback for songs YouTube's `player`
+  endpoint won't hand over, plus the video view and downloads. Not needed to build, and songs
+  play without it.
 - [`just`](https://github.com/casey/just) (optional) — the `Justfile` has a command for
   everything below; without it, the plain `cargo`/`./scripts/...` equivalent is noted alongside.
 

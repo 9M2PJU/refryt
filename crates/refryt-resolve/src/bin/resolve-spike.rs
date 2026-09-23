@@ -13,8 +13,11 @@ use refryt_resolve::{
     ChainResolver, Codec, StreamCache, StreamResolver, VideoId, YtDlpResolver, probe_throughput,
 };
 
-/// Below this the `n` parameter is almost certainly wrong.
-const MIN_THROUGHPUT_BYTES_PER_SEC: f64 = 1_000_000.0;
+/// Below this the `n` parameter is almost certainly wrong: a wrong one throttles the stream to
+/// about real time (~20 KB/s for Opus at 160 kbps). The guest path's ranged reads measure
+/// ~0.66 MiB/s from a cold client per range (2026-09-23) — some thirty times real time, and not
+/// throttled — so the bar sits well below that and well above a trickle.
+const MIN_THROUGHPUT_BYTES_PER_SEC: f64 = 250_000.0;
 const PROBE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[tokio::main]
@@ -44,9 +47,10 @@ async fn main() -> Result<()> {
         eprintln!("note: yt-dlp not found on PATH; the fallback path is unavailable\n");
     }
 
-    // With `--features native-resolver` the chain has two links and this spike is the way to
-    // re-test whether the native path has come back; without it, one.
-    let resolver = StreamCache::new(ChainResolver::default_order(ytdlp));
+    // The app's own order: the guest request, then yt-dlp (and with `--features native-resolver`
+    // the native path between them, which is how to re-test whether it has come back).
+    let guest = refryt_resolve::GuestResolver::new(reqwest::Client::new());
+    let resolver = StreamCache::new(ChainResolver::default_order(guest, ytdlp));
 
     let mut failures = 0usize;
 
