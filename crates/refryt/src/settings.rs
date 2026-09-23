@@ -268,8 +268,6 @@ pub struct Settings {
     /// Spotify-style playback: a single click on a song selects it and only a double click
     /// plays it. On by default; off restores single-click-to-play everywhere.
     pub double_click_to_play: bool,
-    /// Fade the end of one track into the start of the next. Off by default.
-    pub crossfade: bool,
     /// Report plays to the signed-in account's watch history. Anonymous listening never
     /// reports — there is no account to count on — so this only matters while signed in.
     pub scrobble: bool,
@@ -312,7 +310,6 @@ impl Default for Settings {
             autoplay: true,
             normalise_volume: true,
             double_click_to_play: true,
-            crossfade: false,
             scrobble: true,
             account_page_id: None,
             playlist_order: Vec::new(),

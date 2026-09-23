@@ -24,34 +24,6 @@ use crate::widgets;
 /// only by an explicit submit — see `App::submit_search`.
 const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(120);
 
-/// How long the crossfade ramps, at each end.
-const CROSSFADE_SECS: f64 = 5.0;
-
-/// The crossfade volume factor: 1.0 at full volume, dipping to 0 at the very end of a track and
-/// ramping from 0 at the start of the next; the lower of the two wins. Pure, so the curve is
-/// testable without a player.
-fn crossfade_factor(
-    active: bool,
-    position: f64,
-    duration: f64,
-    fade_in_elapsed: Option<f64>,
-) -> f64 {
-    let out = if active && duration > 0.0 {
-        let remaining = duration - position;
-        if remaining < CROSSFADE_SECS {
-            (remaining / CROSSFADE_SECS).clamp(0.0, 1.0)
-        } else {
-            1.0
-        }
-    } else {
-        1.0
-    };
-    let inn = fade_in_elapsed
-        .map(|e| (e / CROSSFADE_SECS).clamp(0.0, 1.0))
-        .unwrap_or(1.0);
-    out.min(inn)
-}
-
 /// While audio is playing the progress bar needs to move. Four times a second is enough to look
 /// continuous and is two orders of magnitude cheaper than repainting every frame.
 const PLAYING_REPAINT: Duration = Duration::from_millis(250);
@@ -1330,13 +1302,8 @@ pub struct App {
     /// When the playback state was last written, so the periodic save is throttled.
     last_playback_save: Instant,
     /// Muted by the button versus turned down to zero. `last_volume` remembers what to come back
-    /// to; this says whether the crossfade may write the volume at all.
+    /// to.
     pub(crate) muted: bool,
-    /// When the current track started, for the crossfade's ramp-in. `None` when not fading in.
-    fade_in: Option<Instant>,
-    /// Whether the crossfade is currently holding the volume down, so it can put it back once
-    /// the setting is switched off mid-track.
-    fade_active: bool,
     /// A confirmation bubble above the player bar, if one is live.
     toast: Option<Toast>,
     /// Play the first result as soon as a search lands (`--autoplay`).
@@ -1722,8 +1689,6 @@ impl App {
             resume: None,
             last_playback_save: Instant::now(),
             muted: false,
-            fade_in: None,
-            fade_active: false,
             toast: None,
             autoplay,
             images: Images::new(),
@@ -2381,41 +2346,6 @@ impl App {
         }
         if self.liked_dirty && self.last_liked_save.elapsed() >= Duration::from_secs(5) {
             self.save_liked_if_dirty();
-        }
-    }
-
-    /// The single-instance crossfade: dip to silence over the last few seconds and back up as the
-    /// next track begins. mpv has no crossfade of its own and nothing is appended to its
-    /// playlist, so a real overlap would need two players; this is the cheap approximation the
-    /// setting offers. Only touches the volume while a ramp is actually in progress.
-    fn apply_crossfade(&mut self, state: &crate::player::PlayerState) {
-        let base = if self.muted { 0.0 } else { self.last_volume };
-        if !self.settings.crossfade {
-            // Switched off mid-fade: put the true volume back once.
-            if self.fade_active {
-                if let Some(player) = self.player.as_mut() {
-                    player.set_volume(base);
-                }
-                self.fade_active = false;
-            }
-            return;
-        }
-        let active = self.playback_started && !state.paused && state.duration > 0.0;
-        let elapsed = self.fade_in.map(|started| started.elapsed().as_secs_f64());
-        if elapsed.is_some_and(|e| e >= CROSSFADE_SECS) {
-            self.fade_in = None;
-        }
-        let factor = crossfade_factor(active, state.position, state.duration, elapsed);
-        if factor < 1.0 {
-            self.fade_active = true;
-            if let Some(player) = self.player.as_mut() {
-                player.set_volume(base * factor);
-            }
-        } else if self.fade_active {
-            self.fade_active = false;
-            if let Some(player) = self.player.as_mut() {
-                player.set_volume(base);
-            }
         }
     }
 
@@ -3946,8 +3876,6 @@ impl App {
                     if self.video_open && !wide {
                         self.video_open = false;
                     }
-                    // A fresh track begins the crossfade's ramp-in (a no-op when it is off).
-                    self.fade_in = Some(Instant::now());
                     self.prefetch_next();
                     // Lyrics follow the track while the panel is open; a song change starts a
                     // fresh request, and the guard drops it if the track changes again.
@@ -4386,8 +4314,8 @@ impl App {
             return;
         };
         let handle = player.handle();
-        // The user's volume, not `player.volume()`: a crossfade may have faded the live value
-        // down, and the next track must not inherit that.
+        // The user's volume, not `player.volume()`: the Audio Normaliser folds each track's gain
+        // into the live value, and the next track must not inherit this one's.
         let volume = if self.muted { 0.0 } else { self.last_volume };
         let init_error = player.init_error().map(str::to_owned);
         let Some(handle) = handle else {
@@ -6105,7 +6033,6 @@ impl eframe::App for App {
         self.now.paused = state.paused;
         // Restore the saved position once its track is loaded, and keep `playback.json` fresh.
         self.poll_playback(&state);
-        self.apply_crossfade(&state);
         self.sync_lyrics();
         if self.playback_started {
             self.stall.observe(state.position);
@@ -6321,23 +6248,6 @@ mod tests {
 
     fn artist(id: &str) -> Route {
         Route::Artist(id.to_owned())
-    }
-
-    /// The fade curve: nothing mid-track, a ramp over the last `CROSSFADE_SECS`, and the same at
-    /// the start; a paused player never fades out.
-    #[test]
-    fn the_crossfade_curve_dips_and_ramps() {
-        let d = 240.0;
-        assert_eq!(crossfade_factor(true, 60.0, d, None), 1.0);
-        assert_eq!(crossfade_factor(true, d - CROSSFADE_SECS, d, None), 1.0);
-        assert!((crossfade_factor(true, d - CROSSFADE_SECS / 2.0, d, None) - 0.5).abs() < 1e-9);
-        assert_eq!(crossfade_factor(true, d, d, None), 0.0);
-        assert_eq!(crossfade_factor(false, d - 1.0, d, None), 1.0);
-        assert_eq!(crossfade_factor(true, 1.0, d, Some(0.0)), 0.0);
-        assert!((crossfade_factor(true, 1.0, d, Some(CROSSFADE_SECS / 2.0)) - 0.5).abs() < 1e-9);
-        assert_eq!(crossfade_factor(true, 1.0, d, Some(CROSSFADE_SECS)), 1.0);
-        // Both ramps at once: the lower one wins (a very short track).
-        assert_eq!(crossfade_factor(true, 0.0, 2.0, Some(0.5)), 0.1);
     }
 
     /// A track that got past its start is one that played, so its end is an end.

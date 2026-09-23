@@ -349,7 +349,8 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     // `vui` packs right-to-left, so whatever is added first ends up closest to the window's
     // edge: the volume slider goes first to sit rightmost, with Queue and Lyrics to its left.
     vui.add_space(14.0);
-    // The user's volume, not `player.volume()`: a crossfade may be holding the live value down.
+    // The user's volume, not `player.volume()`: the Audio Normaliser folds the track's gain into
+    // the live value.
     let volume = if app.muted { 0.0 } else { app.last_volume };
     if let Some(v) = widgets::volume_slider(&mut vui, &p, volume, app.last_volume)
         && let Some(pl) = &mut app.player

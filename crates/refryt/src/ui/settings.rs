@@ -419,16 +419,6 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
         &mut double_click,
     );
 
-    let mut crossfade = app.settings.crossfade;
-    toggle_row(
-        app,
-        ui,
-        "setting-crossfade",
-        "Crossfade",
-        "Fades each track into the next.",
-        &mut crossfade,
-    );
-
     let ctx = ui.ctx().clone();
     app.update_settings(&ctx, |s| {
         s.quality = quality;
@@ -436,7 +426,6 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
         s.normalise_volume = normalise;
         s.scrobble = scrobble;
         s.double_click_to_play = double_click;
-        s.crossfade = crossfade;
     });
 }
 
