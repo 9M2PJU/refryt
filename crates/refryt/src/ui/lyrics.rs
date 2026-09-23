@@ -40,11 +40,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     };
 
     // Which line is playing. Only synced lyrics know; plain text has no highlight.
-    let position_ms = app
-        .player
-        .as_ref()
-        .map(|pl| (pl.state().position * 1000.0) as u64)
-        .unwrap_or(0);
+    let position_ms = (app.player_state.position * 1000.0) as u64;
     let active = lyrics
         .synced
         .then(|| lyrics.lines.iter().rposition(|l| l.at_ms <= position_ms))

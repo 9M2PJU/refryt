@@ -126,7 +126,7 @@ impl Images {
         px: u32,
         mut want: impl FnMut(Arc<str>, String, u32, bool),
     ) -> Option<&TextureHandle> {
-        self.texture_inner(url, px, false, sized_url(url, px), &mut want)
+        self.texture_inner(url, px, false, sized_url, &mut want)
     }
 
     /// The 16:9 variant: `px` is the *width*, and YouTube's image server returns the crop —
@@ -137,7 +137,7 @@ impl Images {
         px: u32,
         mut want: impl FnMut(Arc<str>, String, u32, bool),
     ) -> Option<&TextureHandle> {
-        self.texture_inner(url, px, true, sized_url_wide(url, px), &mut want)
+        self.texture_inner(url, px, true, sized_url_wide, &mut want)
     }
 
     /// The artist hero variant: `px` is the *width* and the server crops to [`HERO_ASPECT`], so
@@ -150,7 +150,7 @@ impl Images {
         px: u32,
         mut want: impl FnMut(Arc<str>, String, u32, bool),
     ) -> Option<&TextureHandle> {
-        self.texture_inner(url, px, true, sized_url_hero(url, px), &mut want)
+        self.texture_inner(url, px, true, sized_url_hero, &mut want)
     }
 
     fn texture_inner(
@@ -158,7 +158,9 @@ impl Images {
         url: &Arc<str>,
         px: u32,
         wide: bool,
-        sized: String,
+        // Called only on a miss: rewriting the URL allocates, and a hit is every visible cover
+        // on every frame.
+        sized: fn(&str, u32) -> String,
         want: &mut impl FnMut(Arc<str>, String, u32, bool),
     ) -> Option<&TextureHandle> {
         self.tick += 1;
@@ -182,7 +184,7 @@ impl Images {
                         used: self.tick,
                     },
                 );
-                want(Arc::clone(url), sized, px, wide);
+                want(Arc::clone(url), sized(url, px), px, wide);
             }
         }
 

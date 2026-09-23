@@ -15,7 +15,7 @@ use libmpv2::Mpv;
 use crate::model::Track;
 
 /// A snapshot of what mpv is doing, read once per frame.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerState {
     pub position: f64,
     pub duration: f64,

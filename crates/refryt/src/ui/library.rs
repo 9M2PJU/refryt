@@ -162,7 +162,7 @@ fn downloads_list(app: &mut App, ui: &mut egui::Ui) {
         );
         return;
     }
-    let tracks = app.downloads.tracks();
+    let tracks = std::sync::Arc::clone(&app.downloaded_tracks);
     let signed_in = app.signed_in();
     let out = {
         let App {
@@ -194,7 +194,7 @@ fn downloads_list(app: &mut App, ui: &mut egui::Ui) {
         app.row_action(action);
     }
     match out.click {
-        Some(crate::ui::ListClick::Row(i)) => app.start_from(tracks, i),
+        Some(crate::ui::ListClick::Row(i)) => app.start_from(tracks.to_vec(), i),
         Some(crate::ui::ListClick::Link(route)) => app.navigate(route),
         None => {}
     }
@@ -512,69 +512,107 @@ fn local_folder_browser(app: &mut App, ui: &mut egui::Ui) {
         centered(app, ui, "No audio files found in the configured folders.");
         return;
     }
-    let Some(entries) = local_entries(app) else {
+    let Some(view) = local_view(app) else {
         centered(app, ui, "Could not resolve the configured folders.");
         return;
     };
 
     local_breadcrumb(app, ui);
 
-    // `indices` is every track at or below the folder currently open — what plays, and what
-    // "Save as playlist" saves, since opening a subfolder's own card already shows its tracks
-    // and saving one archives it whole, the same as archiving a real nested folder would.
-    // `direct` is only what sits right in this folder, with no subfolder in between — the flat
-    // list below the cards shows only this, so a track never appears twice: once here and again
-    // one click into whichever subfolder actually holds it.
-    let depth = app.local_browse_path.len();
-    let mut subfolders: Vec<String> = Vec::new();
-    let mut indices: Vec<usize> = Vec::new();
-    let mut direct: Vec<usize> = Vec::new();
-    for (segs, i) in &entries {
-        if segs.len() < depth || segs[..depth] != app.local_browse_path[..] {
-            continue;
-        }
-        indices.push(*i);
-        match segs.get(depth) {
-            None => direct.push(*i),
-            Some(name) if !subfolders.contains(name) => subfolders.push(name.clone()),
-            Some(_) => {}
-        }
-    }
-    subfolders.sort();
+    save_as_playlist_row(app, ui, &view.all);
 
-    save_as_playlist_row(app, ui, &indices);
-
-    if !subfolders.is_empty() {
-        local_folder_grid(app, ui, &entries, depth, &subfolders);
+    if !view.subfolders.is_empty() {
+        local_folder_grid(app, ui, &view.subfolders);
     }
 
-    if direct.is_empty() {
-        if subfolders.is_empty() {
+    if view.direct.is_empty() {
+        if view.subfolders.is_empty() {
             centered(app, ui, "Nothing directly in this folder.");
         }
         return;
     }
-    local_track_list(app, ui, direct);
+    local_track_list(app, ui, &view.direct);
+}
+
+/// What the Local tab shows for the folder open in it, derived once per folder rather than
+/// every frame: walking every track into path segments and cloning the tracks under each card
+/// is real work once the local library holds any real number of files.
+#[derive(Debug, PartialEq)]
+pub(crate) struct LocalView {
+    /// Every track at or below the open folder, as indices into `app.local_tracks` — what
+    /// "Save as playlist" saves, since saving a folder archives it whole, nested folders too.
+    all: Vec<usize>,
+    /// The subfolders one level down, sorted, each with every track at or below it — what its
+    /// card's menu acts on, whether or not it is ever opened.
+    subfolders: Vec<(String, Vec<crate::model::Track>)>,
+    /// Only what sits right in this folder, with no subfolder in between. The flat list shows
+    /// only this, so a track never appears twice: once here and again one click into whichever
+    /// subfolder actually holds it.
+    direct: Vec<crate::model::Track>,
+}
+
+/// The cached [`LocalView`] for the open folder, rebuilt when the scan, the configured folders
+/// or the open folder change. `None` when no configured folder resolves.
+fn local_view(app: &mut App) -> Option<std::sync::Arc<LocalView>> {
+    if let Some(cache) = &app.local_view_cache
+        && cache.generation == app.local_tracks_generation
+        && cache.folders == app.settings.local_folders
+        && cache.path == app.local_browse_path
+    {
+        return Some(std::sync::Arc::clone(&cache.view));
+    }
+
+    let view = std::sync::Arc::new(build_local_view(
+        &app.local_tracks,
+        &local_entries(app)?,
+        &app.local_browse_path,
+    ));
+    app.local_view_cache = Some(crate::app::LocalViewCache {
+        generation: app.local_tracks_generation,
+        folders: app.settings.local_folders.clone(),
+        path: app.local_browse_path.clone(),
+        view: std::sync::Arc::clone(&view),
+    });
+    Some(view)
+}
+
+fn build_local_view(
+    tracks: &[crate::model::Track],
+    entries: &[(Vec<String>, usize)],
+    path: &[String],
+) -> LocalView {
+    let depth = path.len();
+    let mut all = Vec::new();
+    let mut direct = Vec::new();
+    let mut subfolders: Vec<(String, Vec<crate::model::Track>)> = Vec::new();
+    for (segs, i) in entries {
+        if segs.len() < depth || segs[..depth] != path[..] {
+            continue;
+        }
+        all.push(*i);
+        let Some(track) = tracks.get(*i) else {
+            continue;
+        };
+        match segs.get(depth) {
+            None => direct.push(track.clone()),
+            Some(name) => match subfolders.iter_mut().find(|(n, _)| n == name) {
+                Some((_, under)) => under.push(track.clone()),
+                None => subfolders.push((name.clone(), vec![track.clone()])),
+            },
+        }
+    }
+    subfolders.sort_by(|a, b| a.0.cmp(&b.0));
+    LocalView {
+        all,
+        subfolders,
+        direct,
+    }
 }
 
 /// Every local track's folder-path segments (relative to whichever configured root it sits
-/// under) paired with its position in `app.local_tracks`.
-///
-/// Cached against `(local_tracks_generation, local_folders)`: neither changes on most frames the
-/// Local tab is open, and re-walking every track's path into freshly allocated `String` segments
-/// every frame is a real cost once the local library holds any real number of files.
-fn local_entries(app: &mut App) -> Option<crate::app::LocalEntries> {
-    if app.settings.local_folders.is_empty() {
-        return None;
-    }
-    let generation = app.local_tracks_generation;
-    if let Some((cached_gen, cached_folders, entries)) = &app.local_entries_cache
-        && *cached_gen == generation
-        && cached_folders == &app.settings.local_folders
-    {
-        return Some(entries.clone());
-    }
-
+/// under) paired with its position in `app.local_tracks`. Only [`local_view`] asks for it, and
+/// only when its own cache misses.
+fn local_entries(app: &App) -> Option<crate::app::LocalEntries> {
     let roots: Vec<std::path::PathBuf> = app
         .settings
         .local_folders
@@ -584,29 +622,24 @@ fn local_entries(app: &mut App) -> Option<crate::app::LocalEntries> {
     if roots.is_empty() {
         return None;
     }
-    let entries: crate::app::LocalEntries = app
-        .local_tracks
-        .iter()
-        .enumerate()
-        .filter_map(|(i, t)| {
-            let path = t.local_path.as_ref()?;
-            let root = roots.iter().find(|r| path.starts_with(r))?;
-            let rel = path.strip_prefix(root).ok()?;
-            let mut segs: Vec<String> = rel
-                .iter()
-                .map(|c| c.to_string_lossy().into_owned())
-                .collect();
-            // The filename itself is not a folder segment.
-            segs.pop();
-            Some((segs, i))
-        })
-        .collect();
-    app.local_entries_cache = Some((
-        generation,
-        app.settings.local_folders.clone(),
-        entries.clone(),
-    ));
-    Some(entries)
+    Some(
+        app.local_tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                let path = t.local_path.as_ref()?;
+                let root = roots.iter().find(|r| path.starts_with(r))?;
+                let rel = path.strip_prefix(root).ok()?;
+                let mut segs: Vec<String> = rel
+                    .iter()
+                    .map(|c| c.to_string_lossy().into_owned())
+                    .collect();
+                // The filename itself is not a folder segment.
+                segs.pop();
+                Some((segs, i))
+            })
+            .collect(),
+    )
 }
 
 /// The current level's subfolders, as cards — a file-explorer view rather than a row of plain
@@ -617,26 +650,17 @@ fn local_entries(app: &mut App) -> Option<crate::app::LocalEntries> {
 fn local_folder_grid(
     app: &mut App,
     ui: &mut egui::Ui,
-    entries: &[(Vec<String>, usize)],
-    depth: usize,
-    names: &[String],
+    subfolders: &[(String, Vec<crate::model::Track>)],
 ) {
     let signed_in = app.signed_in();
     let mut open = None;
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
         let card_w = crate::ui::grid_card_w(ui);
-        for name in names {
-            // This subfolder's own tracks, at or below it — not the parent's — so the menu
-            // acts on exactly what the card names, whether or not it's ever opened.
-            let tracks: Vec<crate::model::Track> = entries
-                .iter()
-                .filter(|(segs, _)| segs.len() > depth && segs[depth] == *name)
-                .filter_map(|(_, i)| app.local_tracks.get(*i).cloned())
-                .collect();
+        for (name, tracks) in subfolders {
             let menu = widgets::PageMenu {
                 page_id: name.as_str(),
-                tracks: &tracks,
+                tracks,
                 artist_id: None,
                 playlists: &app.library.playlists.items,
                 signed_in,
@@ -734,12 +758,8 @@ fn save_as_playlist_row(app: &mut App, ui: &mut egui::Ui, indices: &[usize]) {
 /// their own listing one card-click away — through the same row renderer every other track
 /// list in the app uses, so art, hover, truncation, the active-track highlight and the "Save
 /// to playlist" menu all work exactly as they do everywhere else.
-fn local_track_list(app: &mut App, ui: &mut egui::Ui, indices: Vec<usize>) {
+fn local_track_list(app: &mut App, ui: &mut egui::Ui, tracks: &[crate::model::Track]) {
     let signed_in = app.signed_in();
-    let tracks: Vec<crate::model::Track> = indices
-        .iter()
-        .filter_map(|&i| app.local_tracks.get(i).cloned())
-        .collect();
     let clicked = {
         let App {
             palette,
@@ -757,7 +777,7 @@ fn local_track_list(app: &mut App, ui: &mut egui::Ui, indices: Vec<usize>) {
             backend,
             stats,
             now,
-            &tracks,
+            tracks,
             false,
             None,
             &library.playlists.items,
@@ -768,12 +788,67 @@ fn local_track_list(app: &mut App, ui: &mut egui::Ui, indices: Vec<usize>) {
     };
     match clicked.click {
         Some(ListClick::Row(i)) => {
-            app.start_from(tracks, i);
+            app.start_from(tracks.to_vec(), i);
         }
         Some(ListClick::Link(route)) => app.navigate(route),
         None => {}
     }
     if let Some(action) = clicked.action {
         app.row_action(action);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Track;
+
+    fn track(id: &str) -> Track {
+        Track {
+            video_id: id.to_owned(),
+            title: id.to_owned(),
+            artists: Vec::new(),
+            album: None,
+            album_id: None,
+            duration: None,
+            plays: None,
+            explicit: false,
+            like: crate::model::LikeStatus::Indifferent,
+            in_library: false,
+            library_add: None,
+            library_remove: None,
+            set_video_id: None,
+            thumbnail: None,
+            rank: None,
+            trend: crate::model::ChartTrend::Unknown,
+            wide: false,
+            local_path: None,
+        }
+    }
+
+    fn segs(path: &[&str]) -> Vec<String> {
+        path.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// One folder's view: its own files listed directly, each subfolder a sorted card holding
+    /// everything at or below it, and "all" covering both.
+    #[test]
+    fn a_local_view_splits_direct_files_from_subfolders() {
+        let tracks: Vec<Track> = ["a", "b", "c", "d", "e"].map(track).to_vec();
+        let entries = vec![
+            (segs(&["Music"]), 0),
+            (segs(&["Music", "Zeta"]), 1),
+            (segs(&["Music", "Alpha"]), 2),
+            (segs(&["Music", "Alpha", "Deep"]), 3),
+            (segs(&["Other"]), 4),
+        ];
+        let view = build_local_view(&tracks, &entries, &segs(&["Music"]));
+
+        assert_eq!(view.all, vec![0, 1, 2, 3]);
+        assert_eq!(view.direct, vec![track("a")]);
+        let names: Vec<&str> = view.subfolders.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Alpha", "Zeta"]);
+        assert_eq!(view.subfolders[0].1, vec![track("c"), track("d")]);
+        assert_eq!(view.subfolders[1].1, vec![track("b")]);
     }
 }

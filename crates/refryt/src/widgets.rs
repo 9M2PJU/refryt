@@ -134,14 +134,21 @@ pub(crate) fn is_selected(ctx: &egui::Context, id: &str) -> bool {
 
 /// The set of downloaded video ids, published once a frame by `App::ui` so the row menu can
 /// offer Download or Remove download without every caller threading the index through.
-pub(crate) fn set_downloaded(ctx: &egui::Context, ids: std::collections::HashSet<String>) {
+/// An `Arc`, because egui's `get_temp` hands back an owned clone: a bare set would be copied
+/// whole on every read.
+pub(crate) fn set_downloaded(
+    ctx: &egui::Context,
+    ids: std::sync::Arc<std::collections::HashSet<String>>,
+) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("ytm-downloaded"), ids));
 }
 
 fn is_downloaded(ctx: &egui::Context, id: &str) -> bool {
     ctx.data(|d| {
-        d.get_temp::<std::collections::HashSet<String>>(egui::Id::new("ytm-downloaded"))
-            .is_some_and(|ids| ids.contains(id))
+        d.get_temp::<std::sync::Arc<std::collections::HashSet<String>>>(egui::Id::new(
+            "ytm-downloaded",
+        ))
+        .is_some_and(|ids| ids.contains(id))
     })
 }
 
@@ -904,6 +911,19 @@ fn pingpong(offset: f32, dir: f32, max_off: f32, advance: f32) -> (f32, f32) {
 /// colour and hold up over the acrylic shell as well as the opaque one. Repaint discipline:
 /// frames are asked for only while hovered-and-overflowing. At rest nothing is requested;
 /// unhovering snaps home on the pointer-move frame that caused it.
+/// Ask for the next marquee frame: continuous only while the text moves. Through the dwell
+/// before it starts and the hold at each end nothing changes on screen, so one frame at the end
+/// of the wait is enough.
+fn marquee_repaint(ui: &Ui, now: f64, hover_since: f64, hold_until: f64) {
+    let wake = (hover_since + MARQUEE_DWELL_SECS).max(hold_until);
+    if wake > now {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(wake - now));
+    } else {
+        ui.ctx().request_repaint();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn marquee_line(
     ui: &mut Ui,
@@ -943,13 +963,18 @@ pub fn marquee_line(
         };
     }
     if hovered {
-        ui.ctx().request_repaint();
         if state.hover_since.is_none() {
             state.hover_since = Some(now);
         }
         let since = state.hover_since.unwrap_or(now);
         if now - since >= MARQUEE_DWELL_SECS && now >= state.hold_until {
-            let dt = (now - state.last_t).clamp(0.0, 0.25) as f32;
+            // From the end of any wait, not the last frame: with no frames painted through the
+            // dwell or a hold, the last one may be long before the text started moving again.
+            let moving_since = state
+                .last_t
+                .max(since + MARQUEE_DWELL_SECS)
+                .max(state.hold_until);
+            let dt = (now - moving_since).clamp(0.0, 0.25) as f32;
             let max_off = (full - max_width).max(0.0);
             let (offset, dir) = pingpong(state.offset, state.dir, max_off, MARQUEE_SPEED * dt);
             if (dir - state.dir).abs() > f32::EPSILON {
@@ -958,6 +983,7 @@ pub fn marquee_line(
             state.offset = offset;
             state.dir = dir;
         }
+        marquee_repaint(ui, now, since, state.hold_until);
     } else {
         state.hover_since = None;
         state.offset = 0.0;
@@ -1083,13 +1109,18 @@ pub fn paint_subtitle_marquee<'a>(
     // See the doc comment: the viewport loses hover to the links stacked on it.
     let hovered = over_view || state.link_hovered || row_hovered;
     if hovered {
-        ui.ctx().request_repaint();
         if state.hover_since.is_none() {
             state.hover_since = Some(now);
         }
         let since = state.hover_since.unwrap_or(now);
         if now - since >= MARQUEE_DWELL_SECS && now >= state.hold_until {
-            let dt = (now - state.last_t).clamp(0.0, 0.25) as f32;
+            // From the end of any wait, not the last frame: with no frames painted through the
+            // dwell or a hold, the last one may be long before the text started moving again.
+            let moving_since = state
+                .last_t
+                .max(since + MARQUEE_DWELL_SECS)
+                .max(state.hold_until);
+            let dt = (now - moving_since).clamp(0.0, 0.25) as f32;
             let max_off = (full - max_width).max(0.0);
             let (offset, dir) = pingpong(state.offset, state.dir, max_off, MARQUEE_SPEED * dt);
             if (dir - state.dir).abs() > f32::EPSILON {
@@ -1098,6 +1129,7 @@ pub fn paint_subtitle_marquee<'a>(
             state.offset = offset;
             state.dir = dir;
         }
+        marquee_repaint(ui, now, since, state.hold_until);
     } else {
         state.hover_since = None;
         state.offset = 0.0;

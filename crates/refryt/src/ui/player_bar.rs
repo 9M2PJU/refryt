@@ -44,7 +44,7 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
 
     // No divider: the bar sits on the gutter with the cards above it, so the gap is the edge.
 
-    let state = app.player.as_ref().map(|pl| pl.state()).unwrap_or_default();
+    let state = app.player_state;
 
     let art = Rect::from_min_size(
         rect.left_top() + vec2(14.0, (rect.height() - 56.0) / 2.0),

@@ -69,9 +69,17 @@ const QUEUE_HISTORY: usize = 5;
 /// The convention the streaming apps use, so a press never loses the track being listened to.
 const PREVIOUS_RESTART_AFTER: Duration = Duration::from_secs(2);
 /// Every local track's folder-path segments paired with its position in `App::local_tracks` —
-/// `ui::library::local_entries`'s own return/cache shape, named here so `App::local_entries_cache`
-/// doesn't need to spell out the nested tuple-of-tuples.
+/// `ui::library::local_entries`'s return shape.
 pub(crate) type LocalEntries = Vec<(Vec<String>, usize)>;
+
+/// A [`crate::ui::library::LocalView`] and what it was derived from: the scan generation, the
+/// configured folders and the folder open in the Local tab.
+pub(crate) struct LocalViewCache {
+    pub(crate) generation: u64,
+    pub(crate) folders: Vec<String>,
+    pub(crate) path: Vec<String>,
+    pub(crate) view: std::sync::Arc<crate::ui::library::LocalView>,
+}
 
 /// How many already-played tracks are kept sitting before `current` before the oldest are
 /// dropped. Autoplay's radio river only ever appends (`append_new`), so an unbounded played
@@ -243,6 +251,26 @@ impl StallGuard {
         self.retries = 0;
         self.retry_at = None;
     }
+}
+
+/// What the OS media widget last showed, as `publish_media` compares it: the track by id and
+/// title, borrowed for the comparison and cloned only when it changes.
+struct MediaKey {
+    id: Option<String>,
+    title: Option<String>,
+    scalars: MediaScalars,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct MediaScalars {
+    playing: bool,
+    position: u64,
+    duration: u64,
+    volume: i32,
+    repeat: RepeatMode,
+    shuffle: bool,
+    can_previous: bool,
+    can_next: bool,
 }
 
 /// Where Repeat All wraps: at the end of the tracks the listener chose, so a radio tail appended
@@ -711,8 +739,9 @@ pub(crate) struct Radio {
     pub(crate) seed: String,
     /// The video ids the listener chose: the queue they started plus anything queued by hand.
     /// Tracks not in this list are the algorithm's and carry a "Radio" marker in Up Next.
-    /// Ids, not indices — inserting into the queue shifts indices, and ids do not.
-    pub(crate) chosen: Vec<String>,
+    /// Ids, not indices — inserting into the queue shifts indices, and ids do not. A set, because
+    /// only membership is ever asked, once per queued track on every frame the queue is open.
+    pub(crate) chosen: std::collections::HashSet<String>,
 }
 
 impl Radio {
@@ -730,7 +759,7 @@ impl Radio {
     pub(crate) fn tail_start(&self, queue: &[Track]) -> Option<usize> {
         queue
             .iter()
-            .position(|t| !self.chosen.iter().any(|id| id == &t.video_id))
+            .position(|t| !self.chosen.contains(&t.video_id))
     }
 }
 
@@ -1023,6 +1052,10 @@ pub struct App {
 
     pub(crate) backend: Backend,
     pub(crate) player: Option<Player>,
+    /// mpv's state, read at the top of the frame for the player bar and lyrics, and again after
+    /// the panels (whose clicks can change it) for the queue advance and the OS publishers. Each
+    /// read is four blocking property calls into mpv, so nothing else asks it per frame.
+    pub(crate) player_state: crate::player::PlayerState,
     /// Set when libmpv could not be initialised, so the UI can explain instead of silently
     /// doing nothing when you press play.
     pub(crate) player_error: Option<String>,
@@ -1133,13 +1166,11 @@ pub struct App {
     /// Every track found under `settings.local_folders` by the last full rescan — there is no
     /// incremental update, a changed folder list just rescans everything again.
     pub(crate) local_tracks: Vec<crate::model::Track>,
-    /// Bumped whenever `local_tracks` is replaced, so `ui::library::local_entries` can cache its
-    /// per-track folder-segment index instead of rebuilding it from scratch every frame the
-    /// Local tab is open.
+    /// Bumped whenever `local_tracks` is replaced, so `ui::library::local_view` can cache what
+    /// the Local tab shows instead of rebuilding it every frame the tab is open.
     pub(crate) local_tracks_generation: u64,
-    /// Cache for `ui::library::local_entries`: the `(local_tracks_generation, local_folders)` it
-    /// was computed for, and the index itself.
-    pub(crate) local_entries_cache: Option<(u64, Vec<String>, LocalEntries)>,
+    /// Cache for `ui::library::local_view`: what the Local tab shows for the folder open in it.
+    pub(crate) local_view_cache: Option<LocalViewCache>,
     pub(crate) local_scanning: bool,
     pub(crate) local_scan_error: Option<String>,
     /// Which folder the Library's Local tab is currently browsing, one path segment per level,
@@ -1348,6 +1379,11 @@ pub struct App {
     /// What is downloaded to `~/Music/refryt`, indexed by video id. Pushed into the backend so a
     /// downloaded track plays from disk.
     pub(crate) downloads: crate::downloads::Index,
+    /// The downloaded ids, shared with the row menus through egui's temp data. Rebuilt only when
+    /// `downloads` changes; each frame hands egui another reference to the same set.
+    downloaded_ids: std::sync::Arc<std::collections::HashSet<String>>,
+    /// The Library's Downloads tab, built from `downloads` at the same moments as the ids.
+    pub(crate) downloaded_tracks: std::sync::Arc<Vec<Track>>,
     /// In-flight download progress, by video id (0–100).
     pub(crate) download_progress: std::collections::HashMap<String, f32>,
 
@@ -1369,6 +1405,10 @@ pub struct App {
     /// What was last handed to Discord — the track's id, whether it was playing, and its title —
     /// so the presence is only resent when something material changes rather than every frame.
     presence_key: Option<(Option<String>, bool, String)>,
+    /// What the OS media widget was last handed, reduced to what it shows. `publish_media` runs
+    /// every frame; building and sending the full snapshot (every string cloned, then cloned
+    /// twice more inside playwire) only happens when this changes.
+    media_key: Option<MediaKey>,
     /// Where the track was when the presence was last sent, and when: together they say whether
     /// the progress bar Discord is drawing has been broken by a seek, which needs a resend.
     presence_position: f64,
@@ -1565,6 +1605,7 @@ impl App {
             autostart_attention: autostart,
             backend,
             player,
+            player_state: Default::default(),
             player_error: None,
             query: search.clone().unwrap_or_default(),
             query_changed_at: None,
@@ -1697,6 +1738,8 @@ impl App {
             help_open: false,
             crash_report: crate::crash::last(),
             downloads: crate::downloads::Index::default(),
+            downloaded_ids: Default::default(),
+            downloaded_tracks: Default::default(),
             download_progress: std::collections::HashMap::new(),
             stats: Stats::new(stats),
             stats_after,
@@ -1705,6 +1748,7 @@ impl App {
             media,
             discord: None,
             presence_key: None,
+            media_key: None,
             presence_position: 0.0,
             presence_sent_at: Instant::now(),
             ctx: cc.egui_ctx.clone(),
@@ -1712,7 +1756,7 @@ impl App {
             video: None,
             local_tracks: Vec::new(),
             local_tracks_generation: 0,
-            local_entries_cache: None,
+            local_view_cache: None,
             local_scanning: false,
             local_scan_error: None,
             local_browse_path: Vec::new(),
@@ -2097,8 +2141,12 @@ impl App {
 
     /// Publish the transport to the OS widget. Once a frame is fine — `playwire` diffs, so an
     /// unchanged snapshot costs almost nothing.
+    fn read_player_state(&self) -> crate::player::PlayerState {
+        self.player.as_ref().map(|p| p.state()).unwrap_or_default()
+    }
+
     fn publish_media(&mut self) {
-        let state = self.player.as_ref().map(|p| p.state()).unwrap_or_default();
+        let state = self.player_state;
         // A restored track is not loaded yet, so mpv's position is 0; show the saved one so the
         // OS scrubber matches the bar.
         let position = if self.playback_started {
@@ -2109,9 +2157,37 @@ impl App {
                 .map(|(_, p)| p)
                 .unwrap_or(state.position)
         };
+        let Some(media) = self.media.as_mut() else {
+            return;
+        };
+        let playing = self.playback_started && !state.paused;
+        let track = self.now.track.as_ref();
+        let scalars = MediaScalars {
+            playing,
+            // Whole seconds: the OS extrapolates between updates, so a sub-second tick adds
+            // nothing, but a seek or a stall still lands within the second.
+            position: position as u64,
+            duration: state.duration as u64,
+            volume: if self.muted {
+                0
+            } else {
+                self.last_volume.round() as i32
+            },
+            repeat: self.repeat,
+            shuffle: self.shuffle,
+            can_previous: self.current.is_some_and(|c| c > 0),
+            can_next: !self.queue.is_empty(),
+        };
+        if self.media_key.as_ref().is_some_and(|k| {
+            k.scalars == scalars
+                && k.id.as_deref() == track.map(|t| t.video_id.as_str())
+                && k.title.as_deref() == track.map(|t| t.title.as_str())
+        }) {
+            return;
+        }
         let snapshot = crate::media::playback_state(
             self.now.track.as_ref(),
-            self.playback_started && !state.paused,
+            playing,
             position,
             state.duration,
             if self.muted {
@@ -2119,14 +2195,17 @@ impl App {
             } else {
                 (self.last_volume / 100.0).clamp(0.0, 1.0)
             },
-            self.repeat,
-            self.shuffle,
-            self.current.is_some_and(|c| c > 0),
-            !self.queue.is_empty(),
+            scalars.repeat,
+            scalars.shuffle,
+            scalars.can_previous,
+            scalars.can_next,
         );
-        if let Some(media) = self.media.as_mut() {
-            media.set_state(&snapshot);
-        }
+        media.set_state(&snapshot);
+        self.media_key = Some(MediaKey {
+            id: track.map(|t| t.video_id.clone()),
+            title: track.map(|t| t.title.clone()),
+            scalars,
+        });
     }
 
     /// Hand Discord the current track, when there is one. Called right after `publish_media`, so
@@ -2140,7 +2219,7 @@ impl App {
         let Some(discord) = self.discord.as_ref() else {
             return;
         };
-        let state = self.player.as_ref().map(|p| p.state()).unwrap_or_default();
+        let state = self.player_state;
         let playing = self.playback_started && !state.paused;
         // Mirrors `publish_media`: a restored, not-yet-loaded track shows its saved position.
         let position = if self.playback_started {
@@ -2341,7 +2420,11 @@ impl App {
     }
 
     /// Tell the backend which video ids are on disk, so `play` uses the file.
-    fn push_downloads_to_backend(&self) {
+    /// Every change to `downloads` ends here, so this is also where the menus' copy of the ids
+    /// is refreshed.
+    fn push_downloads_to_backend(&mut self) {
+        self.downloaded_ids = std::sync::Arc::new(self.downloads.entries.keys().cloned().collect());
+        self.downloaded_tracks = std::sync::Arc::new(self.downloads.tracks());
         let map = self
             .downloads
             .entries
@@ -3903,7 +3986,7 @@ impl App {
                         }
                         self.radio = Some(Radio {
                             state: queue.next.map_or(River::Dead, River::Open),
-                            chosen: vec![seed.clone()],
+                            chosen: std::iter::once(seed.clone()).collect(),
                             seed,
                         });
                         self.prefetch_next();
@@ -3913,7 +3996,7 @@ impl App {
                         // opens a flowing one. No token means the mix itself was one page long.
                         self.radio = Some(Radio {
                             state: queue.next.map_or(River::Dead, River::Open),
-                            chosen: vec![seed.clone()],
+                            chosen: std::iter::once(seed.clone()).collect(),
                             seed,
                         });
                     }
@@ -4441,7 +4524,7 @@ impl App {
             let is_chosen = |i: usize| {
                 self.radio
                     .as_ref()
-                    .is_none_or(|radio| radio.chosen.iter().any(|id| id == &self.queue[i].video_id))
+                    .is_none_or(|radio| radio.chosen.contains(&self.queue[i].video_id))
             };
             // Under Repeat All the loop is the chosen tracks alone, so once they have all played
             // the shuffle starts over rather than drifting into a tail appended earlier.
@@ -4611,7 +4694,7 @@ impl App {
             Some(i) => {
                 self.queue.insert(i + 1, track.clone());
                 if let Some(radio) = &mut self.radio {
-                    radio.chosen.push(track.video_id);
+                    radio.chosen.insert(track.video_id);
                 }
                 self.prefetch_next();
             }
@@ -4625,7 +4708,7 @@ impl App {
     /// the songs they chose and before the algorithm's.
     pub(crate) fn add_to_queue(&mut self, track: Track) {
         if let Some(radio) = &mut self.radio {
-            radio.chosen.push(track.video_id.clone());
+            radio.chosen.insert(track.video_id.clone());
         }
         match self.radio.as_ref().and_then(|r| r.tail_start(&self.queue)) {
             Some(i) => self.queue.insert(i, track),
@@ -4805,7 +4888,7 @@ impl App {
                         for t in tracks {
                             i += 1;
                             if let Some(radio) = &mut self.radio {
-                                radio.chosen.push(t.video_id.clone());
+                                radio.chosen.insert(t.video_id.clone());
                             }
                             self.queue.insert(i, t);
                         }
@@ -5737,6 +5820,7 @@ impl eframe::App for App {
         self.poll_tray(&ctx);
         self.poll_media(&ctx);
         self.reload_custom_themes(&ctx);
+        self.player_state = self.read_player_state();
         // A second plain launch asked the running instance to show itself (see `instance`).
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         if crate::instance::poll() {
@@ -5758,7 +5842,7 @@ impl eframe::App for App {
         // Publish the playback click model for the row and card widgets this frame, so no page
         // has to thread the setting through.
         crate::widgets::set_double_click_play(&ctx, self.settings.double_click_to_play);
-        crate::widgets::set_downloaded(&ctx, self.downloads.entries.keys().cloned().collect());
+        crate::widgets::set_downloaded(&ctx, std::sync::Arc::clone(&self.downloaded_ids));
 
         let maximized = Self::is_maximized(&ctx);
         // Square on Windows, where the shell is opaque: the outer corner pixels of a rounded
@@ -6011,12 +6095,10 @@ impl eframe::App for App {
             chrome::resize_handles(ui);
         }
 
-        // Advance the queue when mpv runs out of file.
-        let state = self
-            .player
-            .as_ref()
-            .map(|pl| pl.state())
-            .unwrap_or_default();
+        // Advance the queue when mpv runs out of file. Read fresh: a click in the panels above
+        // may have loaded, paused or seeked since the top of the frame.
+        let state = self.read_player_state();
+        self.player_state = state;
         // Kept in sync here rather than at every `toggle_pause`/`set_paused` call site — mpv is
         // the single source of truth for this, and every row/card's play-vs-pause glyph reads
         // it off `now` rather than reaching for the player directly.
@@ -6910,8 +6992,8 @@ mod tests {
         let queue = vec![track("a"), track("b"), track("t1"), track("t2")];
         let mut r = radio(River::Open("tok".into()), "b", &["a", "b"]);
         assert_eq!(r.tail_start(&queue), Some(2));
-        r.chosen.push("t1".into());
-        r.chosen.push("t2".into());
+        r.chosen.insert("t1".into());
+        r.chosen.insert("t2".into());
         assert_eq!(r.tail_start(&queue), None);
 
         // And the pending constructor records the queue as chosen, so nothing marks it Radio.
