@@ -579,8 +579,33 @@ pub(crate) fn yt_dlp_program() -> String {
 }
 
 /// Run yt-dlp for one track, emitting progress as it goes, and return the file it produced.
+///
+/// Anonymous first, like playback; a failed download is tried once more as the signed-in
+/// account, for the songs YouTube only hands to one (its bot check, its age gate). Unlike
+/// playback the retry keeps the audio-only format, so a video file never lands in the music
+/// folder — see `YtDlpResolver::run_gated` for why signed-in is not the default.
 async fn run_download(
     track: &Track,
+    session: &refryt_resolve::SessionCookie,
+    format: &str,
+    tx: &Sender<Event>,
+    ctx: &egui::Context,
+) -> anyhow::Result<std::path::PathBuf> {
+    let anonymous = run_download_as(track, None, format, tx, ctx).await;
+    if anonymous.is_ok() {
+        return anonymous;
+    }
+    // Held until yt-dlp exits; dropping it deletes the file.
+    let Some(cookies) = refryt_resolve::CookieFile::for_session(session) else {
+        return anonymous;
+    };
+    tracing::info!(video_id = %track.video_id, "download failed anonymously; retrying as the account");
+    run_download_as(track, Some(&cookies), format, tx, ctx).await
+}
+
+async fn run_download_as(
+    track: &Track,
+    cookies: Option<&refryt_resolve::CookieFile>,
     format: &str,
     tx: &Sender<Event>,
     ctx: &egui::Context,
@@ -590,9 +615,14 @@ async fn run_download(
     let dir = crate::downloads::dir()?;
     std::fs::create_dir_all(&dir)?;
     let args = crate::downloads::yt_dlp_args(track, format, &dir);
+    // Shares playback's cap on concurrent yt-dlp runs; held until the process has exited.
+    let _permit = refryt_resolve::ytdlp_permit().await;
     let mut cmd = tokio::process::Command::new(yt_dlp_program());
-    cmd.args(&args)
-        .stdout(std::process::Stdio::piped())
+    cmd.args(&args);
+    if let Some(file) = cookies {
+        cmd.arg("--cookies").arg(file.path());
+    }
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
@@ -701,12 +731,15 @@ impl Backend {
         // putting it first would make every track pay its latency before falling through. The
         // native path is behind an off-by-default feature, so by default this is a chain of one.
         let resolver = StreamCache::new(ChainResolver::default_order(
-            YtDlpResolver::new().with_program(yt_dlp_program()),
+            YtDlpResolver::new()
+                .with_program(yt_dlp_program())
+                .with_session(api.ytdlp_session()),
         ));
         let video_resolver = VideoStreamCache::new(
             YtDlpResolver::new()
                 .with_program(yt_dlp_program())
-                .with_format(refryt_resolve::VIDEO_FORMAT),
+                .with_format(refryt_resolve::VIDEO_FORMAT)
+                .with_session(api.ytdlp_session()),
         );
 
         Ok(Self {
@@ -737,9 +770,10 @@ impl Backend {
     /// Completion carries the `Track` back so the app can add it to the index.
     pub fn download_track(&self, track: Track, format: &'static str) {
         let (tx, ctx, http) = (self.tx.clone(), self.ctx.clone(), self.http.clone());
+        let session = self.api.ytdlp_session();
         self.rt.spawn(async move {
             let video_id = track.video_id.clone();
-            match run_download(&track, format, &tx, &ctx).await {
+            match run_download(&track, &session, format, &tx, &ctx).await {
                 Ok(path) => {
                     let cover = cover_bytes(&http, &track).await;
                     let (tag_path, tag_track) = (path.clone(), track.clone());
@@ -776,10 +810,11 @@ impl Backend {
     /// task, so a fifty-track album does not launch fifty yt-dlp processes at once.
     pub fn download_many(&self, tracks: Vec<Track>, format: &'static str) {
         let (tx, ctx, http) = (self.tx.clone(), self.ctx.clone(), self.http.clone());
+        let session = self.api.ytdlp_session();
         self.rt.spawn(async move {
             for track in tracks {
                 let video_id = track.video_id.clone();
-                match run_download(&track, format, &tx, &ctx).await {
+                match run_download(&track, &session, format, &tx, &ctx).await {
                     Ok(path) => {
                         let cover = cover_bytes(&http, &track).await;
                         let (tag_path, tag_track) = (path.clone(), track.clone());

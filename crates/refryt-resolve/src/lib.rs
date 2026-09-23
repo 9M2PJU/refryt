@@ -21,7 +21,9 @@ pub use cache::{StreamCache, VideoStreamCache};
 pub use chain::ChainResolver;
 #[cfg(feature = "native-resolver")]
 pub use native::{NativeConfig, NativeResolver};
-pub use ytdlp::{VIDEO_FORMAT, YtDlpResolver};
+pub use ytdlp::{
+    CookieFile, SessionCookie, VIDEO_FORMAT, YtDlpResolver, is_sign_in_gate, ytdlp_permit,
+};
 
 /// Audio codec of a resolved stream.
 ///

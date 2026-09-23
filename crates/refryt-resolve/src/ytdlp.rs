@@ -41,6 +41,97 @@ fn no_console(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command
     cmd
 }
 
+/// The signed-in session's `Cookie` header, shared between whoever owns the session and every
+/// yt-dlp run. `None` while signed out: yt-dlp then goes to YouTube anonymously, which is what
+/// its "Sign in to confirm you're not a bot" and age gates refuse.
+pub type SessionCookie = std::sync::Arc<std::sync::RwLock<Option<String>>>;
+
+/// A Netscape cookie file holding one session, for one yt-dlp run, removed on drop.
+///
+/// One file per run rather than one shared file: yt-dlp writes its cookie jar back when it
+/// exits, and two concurrent runs rewriting the same file could leave a third reading it half
+/// written. Created `0600` — it is the account's credential.
+pub struct CookieFile(std::path::PathBuf);
+
+impl CookieFile {
+    /// Write the current session, or `None` when signed out (or the file cannot be written, in
+    /// which case the run goes anonymous rather than failing).
+    pub fn for_session(session: &SessionCookie) -> Option<Self> {
+        let header = session.read().ok()?.clone()?;
+        let text = netscape_cookies(&header)?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("refryt-cookies-{}-{n}.txt", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).ok()?;
+        let file_path = Self(path);
+        std::io::Write::write_all(&mut file, text.as_bytes()).ok()?;
+        Some(file_path)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for CookieFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Whether yt-dlp failed because YouTube wants a signed-in client — its bot check or its age
+/// gate — rather than for a reason a session cannot fix.
+pub fn is_sign_in_gate(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("Sign in to confirm")
+}
+
+/// How long a sign-in refusal is believed: while it holds, resolves go straight to the signed-in
+/// run instead of paying for an anonymous one that would fail. When YouTube gates anonymous
+/// clients it gates all of them from that address, not one video.
+const GATE_MEMORY: Duration = Duration::from_secs(15 * 60);
+
+/// How many yt-dlp processes may run at once, across playback, video and downloads. One run
+/// peaks near 380 MB with its Deno child (measured 2026-09-23), so this is the memory ceiling.
+/// Two, not one, so a play never queues behind a slow prefetch of another track.
+const MAX_CONCURRENT_RUNS: usize = 2;
+
+/// A slot to run yt-dlp in. Hold it for as long as the process lives.
+pub async fn ytdlp_permit() -> tokio::sync::SemaphorePermit<'static> {
+    static RUNS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    RUNS.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_RUNS))
+        .acquire()
+        .await
+        .expect("the yt-dlp semaphore is never closed")
+}
+
+/// A `Cookie` header (`a=1; b=2`) as the Netscape cookie file yt-dlp's `--cookies` reads, every
+/// cookie scoped to `.youtube.com`. `None` when the header holds no cookie at all.
+fn netscape_cookies(header: &str) -> Option<String> {
+    let mut out = String::from("# Netscape HTTP Cookie File\n");
+    let mut any = false;
+    for (name, value) in header
+        .split(';')
+        .filter_map(|pair| pair.trim().split_once('='))
+        .filter(|(name, _)| !name.is_empty())
+    {
+        // domain, include subdomains, path, secure, expiry (far future: the session's own
+        // lifetime is YouTube's business, not this file's), name, value.
+        out.push_str(&format!(
+            ".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{name}\t{value}\n"
+        ));
+        any = true;
+    }
+    any.then_some(out)
+}
+
 pub struct YtDlpResolver {
     program: String,
     /// Extra arguments, e.g. a PO token provider or a cookies file.
@@ -49,6 +140,10 @@ pub struct YtDlpResolver {
     /// to what gets fetched rather than a label; read per resolve, so no rebuild is needed.
     format: std::sync::Mutex<String>,
     timeout: Duration,
+    /// The signed-in session, read per run so signing in or out takes effect on the next track.
+    session: Option<SessionCookie>,
+    /// Until when YouTube is taken to be refusing anonymous clients; see [`GATE_MEMORY`].
+    gated_until: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl YtDlpResolver {
@@ -58,7 +153,15 @@ impl YtDlpResolver {
             extra_args: Vec::new(),
             format: std::sync::Mutex::new(DEFAULT_FORMAT.to_owned()),
             timeout: Duration::from_secs(30),
+            session: None,
+            gated_until: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Run yt-dlp as the signed-in account whenever there is one.
+    pub fn with_session(mut self, session: SessionCookie) -> Self {
+        self.session = Some(session);
+        self
     }
 
     pub fn with_program(mut self, program: impl Into<String>) -> Self {
@@ -139,12 +242,89 @@ struct YtDlpFormat {
 }
 
 impl YtDlpResolver {
+    /// Ask yt-dlp for `format`, anonymously first. Only when YouTube refuses an anonymous client
+    /// ("Sign in to confirm you're not a bot", "… your age") is it asked again as the signed-in
+    /// account, with `/best` appended.
+    ///
+    /// Not signed in every time: signed in, yt-dlp takes YouTube's web clients, which need a PO
+    /// token it cannot mint, so every audio-only stream is withheld and only the combined 360p
+    /// file is offered (measured 2026-09-23). Anonymous keeps Opus for everything YouTube lets
+    /// through; the fallback trades quality for playing at all, and mpv runs with `vid=no`, so
+    /// the combined file plays as its audio alone.
+    ///
+    /// Each yt-dlp run costs seconds, so a refusal is remembered for [`GATE_MEMORY`]: in that
+    /// window the anonymous attempt is skipped, and after it the next resolve tries anonymously
+    /// again, so Opus comes back by itself once YouTube relents.
+    async fn run_gated(&self, id: &VideoId, format: &str) -> Result<YtDlpFormat> {
+        let signed_in = |cookies: CookieFile| async move {
+            self.run_json(id, &format!("{format}/best"), Some(&cookies))
+                .await
+        };
+        if self.gated()
+            && let Some(cookies) = self.session.as_ref().and_then(CookieFile::for_session)
+        {
+            return signed_in(cookies).await;
+        }
+        let anonymous = self.run_json(id, format, None).await;
+        let Err(refusal) = &anonymous else {
+            return anonymous;
+        };
+        if !is_sign_in_gate(refusal) {
+            return anonymous;
+        }
+        let Some(cookies) = self.session.as_ref().and_then(CookieFile::for_session) else {
+            return anonymous;
+        };
+        self.remember_gate();
+        signed_in(cookies)
+            .await
+            .with_context(|| format!("retried signed in after: {refusal:#}"))
+    }
+
+    /// Whether a recent refusal still stands. Clears (and says so) once it has lapsed.
+    fn gated(&self) -> bool {
+        let Ok(mut until) = self.gated_until.lock() else {
+            return false;
+        };
+        match *until {
+            Some(at) if std::time::Instant::now() < at => true,
+            Some(_) => {
+                *until = None;
+                tracing::info!("yt-dlp: trying anonymously again");
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn remember_gate(&self) {
+        if let Ok(mut until) = self.gated_until.lock() {
+            if until.is_none() {
+                tracing::info!(
+                    minutes = GATE_MEMORY.as_secs() / 60,
+                    "yt-dlp: YouTube wants a sign-in; resolving as the account for now"
+                );
+            }
+            *until = Some(std::time::Instant::now() + GATE_MEMORY);
+        }
+    }
+
     /// Ask yt-dlp for one format and parse its `-j` output.
-    async fn run_json(&self, id: &VideoId, format: &str) -> Result<YtDlpFormat> {
+    async fn run_json(
+        &self,
+        id: &VideoId,
+        format: &str,
+        cookies: Option<&CookieFile>,
+    ) -> Result<YtDlpFormat> {
+        // Held until the process is done; see `MAX_CONCURRENT_RUNS`.
+        let _permit = ytdlp_permit().await;
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(["-j", "--no-warnings", "--no-playlist", "-f", format])
-            .args(&self.extra_args)
-            .arg(id.watch_url())
+            .args(&self.extra_args);
+        if let Some(file) = cookies {
+            cmd.arg("--cookies").arg(file.path());
+        }
+        cmd.arg(id.watch_url())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -176,7 +356,7 @@ impl StreamResolver for YtDlpResolver {
             .lock()
             .map(|f| f.clone())
             .unwrap_or_else(|_| DEFAULT_FORMAT.to_owned());
-        let parsed = self.run_json(id, &format).await?;
+        let parsed = self.run_gated(id, &format).await?;
 
         if parsed.url.is_empty() {
             bail!("yt-dlp returned no URL for {id}");
@@ -260,7 +440,7 @@ impl VideoResolver for YtDlpResolver {
     }
 
     async fn resolve_video(&self, id: &VideoId) -> Result<VideoStream> {
-        let parsed = self.run_json(id, VIDEO_FORMAT).await?;
+        let parsed = self.run_gated(id, VIDEO_FORMAT).await?;
         video_stream_from(&parsed, id)
     }
 }
@@ -268,6 +448,63 @@ impl VideoResolver for YtDlpResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bot check and the age gate retry signed in; anything else (a removed video, a
+    /// network failure) does not, since a session changes nothing there.
+    #[test]
+    fn only_youtubes_sign_in_refusals_count_as_a_gate() {
+        let bot = anyhow!(
+            "yt-dlp failed for x: ERROR: [youtube] x: Sign in to confirm you’re not a bot."
+        );
+        let age = anyhow!("yt-dlp failed for x: ERROR: [youtube] x: Sign in to confirm your age.");
+        let gone = anyhow!("yt-dlp failed for x: ERROR: [youtube] x: Video unavailable");
+        assert!(is_sign_in_gate(&bot));
+        assert!(is_sign_in_gate(&age));
+        assert!(!is_sign_in_gate(&gone));
+    }
+
+    /// Each pair becomes one `.youtube.com` line; stray separators and empty names are
+    /// dropped, and `=` inside a value survives.
+    #[test]
+    fn a_cookie_header_becomes_a_netscape_file() {
+        let text = netscape_cookies("SID=abc; ; __Secure-3PSID=x=y;=nope").unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "# Netscape HTTP Cookie File");
+        assert_eq!(
+            lines[1],
+            ".youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\tabc"
+        );
+        assert_eq!(
+            lines[2],
+            ".youtube.com\tTRUE\t/\tTRUE\t2147483647\t__Secure-3PSID\tx=y"
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(netscape_cookies(" ; "), None);
+    }
+
+    /// Signed out writes nothing; signed in writes a private file that is gone once dropped.
+    #[test]
+    fn the_cookie_file_is_private_and_removed_after_the_run() {
+        let session: SessionCookie = std::sync::Arc::new(std::sync::RwLock::new(None));
+        assert!(CookieFile::for_session(&session).is_none());
+
+        *session.write().unwrap() = Some("SID=abc".to_owned());
+        let file = CookieFile::for_session(&session).unwrap();
+        let path = file.path().to_owned();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\tSID\tabc")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(file);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn parses_a_representative_yt_dlp_payload() {
@@ -351,5 +588,60 @@ mod tests {
         }"#;
         let parsed: YtDlpFormat = serde_json::from_str(json).unwrap();
         assert!(video_stream_from(&parsed, &id()).is_err());
+    }
+
+    /// A stub yt-dlp that refuses anonymous runs with YouTube's bot check and answers signed-in
+    /// ones, recording every run in `log`.
+    #[cfg(unix)]
+    fn gated_stub(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("runs");
+        let script = dir.join("yt-dlp");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                 *--cookies*) echo signed >> '{log}'; \
+                 echo '{{\"url\":\"https://example.com/a\",\"acodec\":\"mp4a.40.2\",\"format_id\":\"18\"}}' ;;\n\
+                 *) echo anonymous >> '{log}'; \
+                 echo 'ERROR: [youtube] x: Sign in to confirm you are not a bot.' >&2; exit 1 ;;\n\
+                 esac\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script.to_string_lossy().into_owned(), log)
+    }
+
+    /// Once refused, the next track skips the anonymous attempt: one yt-dlp run, not two.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refusal_is_remembered_so_the_next_track_runs_yt_dlp_once() {
+        let dir = std::env::temp_dir().join(format!("refryt-gate-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (program, log) = gated_stub(&dir);
+        let session: SessionCookie =
+            std::sync::Arc::new(std::sync::RwLock::new(Some("SID=abc".to_owned())));
+        let resolver = YtDlpResolver::new()
+            .with_program(program)
+            .with_session(session);
+
+        let first = resolver
+            .resolve(&VideoId::new("dQw4w9WgXcQ").unwrap())
+            .await;
+        assert_eq!(first.unwrap().itag, 18);
+        let second = resolver
+            .resolve(&VideoId::new("TiebZllW8As").unwrap())
+            .await;
+        assert_eq!(second.unwrap().itag, 18);
+
+        let runs = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            runs.lines().collect::<Vec<_>>(),
+            ["anonymous", "signed", "signed"]
+        );
     }
 }

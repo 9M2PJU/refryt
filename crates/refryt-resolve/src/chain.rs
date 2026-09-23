@@ -5,6 +5,12 @@
 //! a breaker each play would pay the full native timeout before falling back, making a
 //! degraded app feel broken. After a few consecutive failures we stop asking until a cooldown
 //! elapses, so the cost of a dead fast path is bounded.
+//!
+//! Two limits keep it from doing harm. A failure that belongs to one video — YouTube wanting a
+//! sign-in for it, the video being gone or private — says nothing about the resolver and is not
+//! counted. And the last resolver is never skipped: there is nothing after it to route to, so
+//! skipping it (the whole chain, by default) only turned one bad track into ten minutes of
+//! failures for every track after it, which is what the log showed on 2026-09-22 and -23.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -15,12 +21,28 @@ use tracing::{debug, warn};
 
 #[cfg(feature = "native-resolver")]
 use crate::NativeResolver;
-use crate::{AudioStream, StreamResolver, VideoId, YtDlpResolver};
+use crate::{AudioStream, StreamResolver, VideoId, YtDlpResolver, is_sign_in_gate};
 
 /// Consecutive failures before a resolver is skipped.
 const FAILURES_BEFORE_TRIP: u32 = 3;
 /// How long a tripped resolver is skipped before being retried once.
 const COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Whether a failure is about this one video rather than the resolver: the next video has no
+/// reason to fail the same way, so the breaker does not count it.
+fn is_video_specific(error: &anyhow::Error) -> bool {
+    if is_sign_in_gate(error) {
+        return true;
+    }
+    let text = format!("{error:#}");
+    [
+        "Video unavailable",
+        "Private video",
+        "This video has been removed",
+    ]
+    .iter()
+    .any(|reason| text.contains(reason))
+}
 
 #[derive(Debug, Default)]
 struct Breaker {
@@ -154,9 +176,10 @@ impl StreamResolver for ChainResolver {
     async fn resolve(&self, id: &VideoId) -> Result<AudioStream> {
         let mut errors = Vec::new();
 
-        for resolver in &self.resolvers {
+        let last = self.resolvers.len().saturating_sub(1);
+        for (i, resolver) in self.resolvers.iter().enumerate() {
             let name = resolver.name();
-            if self.should_skip(name) {
+            if i < last && self.should_skip(name) {
                 debug!(
                     resolver = name,
                     "skipping resolver, circuit breaker is open"
@@ -178,13 +201,15 @@ impl StreamResolver for ChainResolver {
                 }
                 Err(e) => {
                     warn!(resolver = name, error = format!("{e:#}"), "resolver failed");
-                    self.record_failure(name);
+                    if !is_video_specific(&e) {
+                        self.record_failure(name);
+                    }
                     errors.push(format!("{name}: {e:#}"));
                 }
             }
         }
 
-        // Every resolver was skipped: the breakers are all open.
+        // Only an empty chain gets here with no errors: the last resolver is never skipped.
         if errors.is_empty() {
             bail!("every resolver is in cooldown after repeated failures; cannot resolve {id}");
         }
@@ -202,6 +227,7 @@ mod tests {
     struct Stub {
         name: &'static str,
         fail: bool,
+        error: &'static str,
         calls: AtomicUsize,
     }
 
@@ -210,7 +236,15 @@ mod tests {
             Self {
                 name,
                 fail,
+                error: "stub failure",
                 calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn failing_with(name: &'static str, error: &'static str) -> Self {
+            Self {
+                error,
+                ..Self::new(name, true)
             }
         }
     }
@@ -223,7 +257,7 @@ mod tests {
         async fn resolve(&self, _id: &VideoId) -> Result<AudioStream> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
-                bail!("stub failure");
+                bail!("{}", self.error);
             }
             Ok(AudioStream {
                 url: Url::parse("https://example.com/a").unwrap(),
@@ -294,5 +328,36 @@ mod tests {
         let err = chain.resolve(&id()).await.unwrap_err().to_string();
         assert!(err.contains("a: "), "{err}");
         assert!(err.contains("b: "), "{err}");
+    }
+
+    /// With nothing after it to route to, the last resolver is asked every time however often
+    /// it has failed — skipping it would only fail every track after one bad one.
+    #[tokio::test]
+    async fn the_last_resolver_is_never_skipped() {
+        let only = std::sync::Arc::new(Stub::new("only", true));
+        let chain = ChainResolver::new(vec![Box::new(only.clone())]);
+
+        for _ in 0..10 {
+            let err = chain.resolve(&id()).await.unwrap_err().to_string();
+            assert!(err.contains("only: "), "{err}");
+        }
+        assert_eq!(only.calls.load(Ordering::SeqCst), 10);
+    }
+
+    /// A video YouTube will not hand over anonymously says nothing about the resolver, so a run
+    /// of them does not trip its breaker.
+    #[tokio::test]
+    async fn failures_about_one_video_do_not_trip_the_breaker() {
+        let gated = std::sync::Arc::new(Stub::failing_with(
+            "gated",
+            "ERROR: [youtube] x: Sign in to confirm you’re not a bot.",
+        ));
+        let good = std::sync::Arc::new(Stub::new("good", false));
+        let chain = ChainResolver::new(vec![Box::new(gated.clone()), Box::new(good)]);
+
+        for _ in 0..10 {
+            chain.resolve(&id()).await.unwrap();
+        }
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 10);
     }
 }

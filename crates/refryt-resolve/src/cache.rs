@@ -17,9 +17,47 @@ use crate::{AudioStream, StreamResolver, VideoId, VideoResolver, VideoStream};
 /// refreshed slightly early.
 const FRESHNESS_MARGIN: Duration = Duration::from_secs(10 * 60);
 
+/// One resolve per video at a time. A prefetch and a play of the same track used to race, each
+/// running the full resolve — seconds of yt-dlp and hundreds of MB apiece — for one answer. The
+/// second now waits its turn and finds the first one's result in the cache.
+#[derive(Default)]
+struct InFlight(Mutex<HashMap<VideoId, std::sync::Arc<tokio::sync::Mutex<()>>>>);
+
+/// Held for the length of one resolve; releasing it lets the next caller for that id in.
+struct Turn<'a> {
+    owner: &'a InFlight,
+    id: VideoId,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl InFlight {
+    async fn turn(&self, id: &VideoId) -> Turn<'_> {
+        let lock = std::sync::Arc::clone(self.0.lock().unwrap().entry(id.clone()).or_default());
+        let guard = std::sync::Arc::clone(&lock).lock_owned().await;
+        Turn {
+            owner: self,
+            id: id.clone(),
+            lock,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut map = self.owner.0.lock().unwrap();
+        // The map's own reference, this turn's, and the guard's: nobody else is waiting.
+        if std::sync::Arc::strong_count(&self.lock) <= 3 {
+            map.remove(&self.id);
+        }
+    }
+}
+
 pub struct StreamCache<R> {
     inner: R,
     entries: Mutex<HashMap<VideoId, AudioStream>>,
+    in_flight: InFlight,
 }
 
 impl<R: StreamResolver> StreamCache<R> {
@@ -27,6 +65,7 @@ impl<R: StreamResolver> StreamCache<R> {
         Self {
             inner,
             entries: Mutex::new(HashMap::new()),
+            in_flight: InFlight::default(),
         }
     }
 
@@ -74,6 +113,11 @@ impl<R: StreamResolver> StreamResolver for StreamCache<R> {
         if let Some(hit) = self.get_cached(id) {
             return Ok(hit);
         }
+        let _turn = self.in_flight.turn(id).await;
+        // Whoever held the turn before may have just filled the cache.
+        if let Some(hit) = self.get_cached(id) {
+            return Ok(hit);
+        }
         let stream = self.inner.resolve(id).await?;
         self.entries
             .lock()
@@ -89,6 +133,7 @@ impl<R: StreamResolver> StreamResolver for StreamCache<R> {
 pub struct VideoStreamCache<R> {
     inner: R,
     entries: Mutex<HashMap<VideoId, VideoStream>>,
+    in_flight: InFlight,
 }
 
 impl<R: VideoResolver> VideoStreamCache<R> {
@@ -96,6 +141,7 @@ impl<R: VideoResolver> VideoStreamCache<R> {
         Self {
             inner,
             entries: Mutex::new(HashMap::new()),
+            in_flight: InFlight::default(),
         }
     }
 
@@ -131,6 +177,10 @@ impl<R: VideoResolver> VideoResolver for VideoStreamCache<R> {
         if let Some(hit) = self.get_cached(id) {
             return Ok(hit);
         }
+        let _turn = self.in_flight.turn(id).await;
+        if let Some(hit) = self.get_cached(id) {
+            return Ok(hit);
+        }
         let stream = self.inner.resolve_video(id).await?;
         self.entries
             .lock()
@@ -160,6 +210,8 @@ mod tests {
         }
         async fn resolve(&self, _id: &VideoId) -> Result<AudioStream> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            // Long enough for a second caller to arrive while this one is still resolving.
+            tokio::time::sleep(Duration::from_millis(20)).await;
             Ok(AudioStream {
                 url: Url::parse("https://example.com/a").unwrap(),
                 itag: 251,
@@ -270,5 +322,24 @@ mod tests {
         cache.resolve_video(&id()).await.unwrap();
 
         assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A prefetch and a play of the same track at once: one resolve, both answered.
+    #[tokio::test]
+    async fn concurrent_resolves_of_one_video_share_the_work() {
+        let inner = std::sync::Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+            expires_in: Some(Duration::from_secs(6 * 3600)),
+        });
+        let cache = StreamCache::new(inner.clone());
+
+        let video = id();
+        let (a, b) = tokio::join!(cache.resolve(&video), cache.resolve(&video));
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            cache.in_flight.0.lock().unwrap().is_empty(),
+            "turns are cleaned up"
+        );
     }
 }

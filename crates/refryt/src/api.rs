@@ -116,6 +116,9 @@ pub struct Api {
     noauth: Mutex<Option<YtMusic<NoAuthToken>>>,
     browser: Mutex<Option<YtMusic<BrowserToken>>>,
     session: Mutex<Option<auth::Session>>,
+    /// The session's cookie as yt-dlp sees it: kept in step with `session` wherever that is
+    /// set or cleared, so playback and downloads run as the signed-in account too.
+    ytdlp_session: refryt_resolve::SessionCookie,
     /// Single-flights [`Self::refresh_from_source`]: several requests can independently notice
     /// a rotated cookie at once (`Self::library`'s four sections fetch concurrently), and without
     /// this each would launch its own `yt-dlp` cookie re-import in parallel.
@@ -126,7 +129,11 @@ impl Api {
     pub fn new() -> Result<Self> {
         let session = auth::load_session().ok().flatten();
         let page_id = crate::settings::load().account_page_id;
+        let ytdlp_session = std::sync::Arc::new(std::sync::RwLock::new(
+            session.as_ref().map(|s| s.cookie.clone()),
+        ));
         Ok(Self {
+            ytdlp_session,
             http: Mutex::new(http_client_for(page_id.as_deref())?),
             noauth: Mutex::new(None),
             browser: Mutex::new(None),
@@ -266,6 +273,7 @@ impl Api {
         )?;
 
         auth::save_session(&cookie, source)?;
+        self.share_with_ytdlp(Some(&cookie));
         *self.session.lock().await = Some(auth::Session {
             cookie,
             source: source.map(str::to_owned),
@@ -316,6 +324,7 @@ impl Api {
     /// holding its database) looks exactly the same — and deleting it there destroyed a working
     /// session that a later retry would have refreshed. Only [`Self::sign_out`] deletes.
     pub async fn forget_session(&self) {
+        self.share_with_ytdlp(None);
         *self.session.lock().await = None;
         *self.browser.lock().await = None;
     }
@@ -1517,6 +1526,17 @@ impl Api {
 
     /// The stored browser cookie, for requests that ride outside `ytmapi-rs` — the watchtime
     /// pings are plain GETs, not InnerTube calls, so they carry the cookie themselves.
+    /// The slot yt-dlp reads the session from; see [`refryt_resolve::YtDlpResolver::with_session`].
+    pub fn ytdlp_session(&self) -> refryt_resolve::SessionCookie {
+        std::sync::Arc::clone(&self.ytdlp_session)
+    }
+
+    fn share_with_ytdlp(&self, cookie: Option<&str>) {
+        if let Ok(mut slot) = self.ytdlp_session.write() {
+            *slot = cookie.map(str::to_owned);
+        }
+    }
+
     pub async fn session_cookie(&self) -> Option<String> {
         self.session.lock().await.clone().map(|s| s.cookie)
     }
