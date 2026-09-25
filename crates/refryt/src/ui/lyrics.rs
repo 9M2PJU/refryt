@@ -27,7 +27,10 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
 
     if app.lyrics_loading {
-        crate::ui::centered(app, ui, "Loading lyrics…");
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            ui.vertical(|ui| widgets::skeleton_lines(ui, &p, 8));
+        });
         return;
     }
     let Some(lyrics) = app.lyrics.as_ref() else {

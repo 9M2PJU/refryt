@@ -18,6 +18,16 @@ const FIELD_MAX_W: f32 = 320.0;
 /// The transport's width: shuffle, previous, play, next, repeat. Centred on the window, and
 /// shared with the title cap so the two never overlap.
 const TRANSPORT_W: f32 = 250.0;
+/// The play button's diameter, and the transport row's height.
+const PLAY_DIAMETER: f32 = 40.0;
+/// An icon button's box at the transport's 16 pt glyphs (`widgets::icon_button` pads by 14).
+const TRANSPORT_ICON_BOX: f32 = 16.0 + 14.0;
+/// Where the transport row and the seek bar sit, from the bar's vertical centre. Together they
+/// span from the play button's top to the time labels' bottom, and these offsets centre that
+/// span on the bar — the line the cover and the right-hand controls are centred on — rather
+/// than leaving it 6 pt high, as the old −12/+16 did.
+const TRANSPORT_DY: f32 = -6.0;
+const SEEK_DY: f32 = 22.0;
 /// The right-hand control cluster, pinned to the window's edge: the 14pt inset, the volume
 /// slider, Queue, Lyrics and the video toggle, with their separations. The seek bar's duration
 /// label must clear this, or a narrow window paints the video toggle over the number.
@@ -59,15 +69,12 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     );
     widgets::paint_art(ui, &p, art, bar_art, widgets::ArtShape::Square);
 
-    // A status line replaces the credits while resolving or after a failure; otherwise the
-    // credits are the same linked pieces a row draws, which is what makes *every* artist here
-    // clickable rather than only the first.
+    // A failure replaces the credits; otherwise the credits are the same linked pieces a row
+    // draws, which is what makes *every* artist here clickable rather than only the first.
+    // Loading keeps them: the ring on the play button says it, and the artist is what you look
+    // for while you wait.
     let (title, status) = match (&app.now.track, &app.now.error) {
         (Some(t), Some(e)) => (t.title.clone(), Some((e.clone(), p.danger))),
-        (Some(t), None) if app.now.resolving => (
-            t.title.clone(),
-            Some(("Resolving…".to_owned(), p.secondary)),
-        ),
         (Some(t), None) => (t.title.clone(), None),
         // Nothing playing, nothing said — not even a dash.
         (None, _) => (String::new(), None),
@@ -251,10 +258,14 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     }
 
     // Transport, centred on the window so it does not shift with the track title: shuffle and
-    // repeat flank previous/play/next, the way the reference lays them out.
+    // repeat flank previous/play/next, the way the reference lays them out. The box is exactly
+    // the row's own width — four 30 pt icon buttons, the 40 pt play button and the gaps between —
+    // because the row packs from the left: a wider box left its spare room on the right and
+    // pushed every button ~30 pt left of the seek bar under it.
+    let row_w = 4.0 * TRANSPORT_ICON_BOX + PLAY_DIAMETER + 4.0 * ui.spacing().item_spacing.x;
     let controls = Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.center().y - 12.0),
-        vec2(TRANSPORT_W, 40.0),
+        egui::pos2(rect.center().x, rect.center().y + TRANSPORT_DY),
+        vec2(row_w, PLAY_DIAMETER),
     );
     let mut cui = ui.new_child(
         egui::UiBuilder::new()
@@ -270,7 +281,20 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         skip_delta = -1;
     }
     let playing = app.playback_started && !state.paused;
-    if widgets::play_button(&mut cui, &p, playing, 40.0).clicked() {
+    // While the song is still loading the button already shows pause — you asked it to play —
+    // with the loading ring turning around its rim.
+    let loading = widgets::track_loading(cui.ctx());
+    let play = widgets::play_button(&mut cui, &p, playing || loading, PLAY_DIAMETER);
+    if loading {
+        widgets::paint_spinner(
+            &cui,
+            play.rect.center(),
+            play.rect.width() / 2.0 + 3.0,
+            2.0,
+            p.accent,
+        );
+    }
+    if play.clicked() {
         app.toggle_playback();
     }
     if widgets::icon_button(&mut cui, &p, Icon::SkipForwardFilled, 16.0, false).clicked() {
@@ -299,7 +323,7 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     // Seek bar, click or drag to scrub. `bar_w` is shared with the title cap above, so
     // the elapsed-time label the bar paints can never sit under the title.
     let bar = Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.center().y + 16.0),
+        egui::pos2(rect.center().x, rect.center().y + SEEK_DY),
         vec2(bar_w, 4.0),
     );
     // A restored, not-yet-loaded track still shows its saved position and length: mpv has no

@@ -57,6 +57,28 @@ fn main() -> eframe::Result {
         .and_then(|i| args.get(i + 1))
         .and_then(|p| p.split_once(','))
         .and_then(|(x, y)| Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?)));
+    let screenshot = args
+        .iter()
+        .position(|a| a == "--screenshot")
+        .and_then(|i| args.get(i + 1))
+        .map(|p| {
+            let value = |flag: &str| {
+                args.iter()
+                    .position(|a| a == flag)
+                    .and_then(|i| args.get(i + 1))
+                    .cloned()
+            };
+            let when = match value("--screenshot-on").as_deref() {
+                Some("ring") => app::ShotWhen::Ring,
+                Some("skeleton") => app::ShotWhen::Skeleton,
+                _ => app::ShotWhen::After(std::time::Duration::from_secs_f64(
+                    value("--screenshot-after")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(8.0),
+                )),
+            };
+            (std::path::PathBuf::from(p), when)
+        });
     let stats_after = args
         .iter()
         .position(|a| a == "--stats-after")
@@ -182,6 +204,7 @@ fn main() -> eframe::Result {
                         autoplay,
                         stats,
                         stats_after,
+                        screenshot: screenshot.clone(),
                         page: page.clone(),
                         autoscroll,
                         queue,

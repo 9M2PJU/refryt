@@ -245,6 +245,49 @@ struct MediaScalars {
     can_next: bool,
 }
 
+/// When `--screenshot` takes its picture.
+#[derive(Clone, Copy, Debug)]
+pub enum ShotWhen {
+    /// This long after launch (`--screenshot-after`, default 8 s).
+    After(Duration),
+    /// While a song's loading ring is showing (`--screenshot-on ring`).
+    Ring,
+    /// While a page's skeletons are showing (`--screenshot-on skeleton`).
+    Skeleton,
+}
+
+/// A kind of work in flight, for deciding what shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Load {
+    Search,
+    Artist,
+    Album,
+    Playlist,
+    ArtistExpand,
+    Home,
+    MoodPlaylists,
+    Explore,
+    History,
+    Releases,
+    Charts,
+    Moods,
+    Library,
+    /// The radio topping the queue up. Nobody asked for it this moment.
+    Radio,
+    /// The sidebar's playlists refreshing in the background.
+    SidebarPlaylists,
+    /// The current song being resolved: the loading ring's job, not a page's.
+    Song,
+}
+
+impl Load {
+    /// Whether this is a page the listener is waiting on — what skeletons stand in for.
+    /// Background work shows nothing, and a song shows its ring instead.
+    fn shows_skeleton(self) -> bool {
+        !matches!(self, Load::Radio | Load::SidebarPlaylists | Load::Song)
+    }
+}
+
 /// How long a playing track's position may go unsaved. A crash loses at most this much of where
 /// you were; pausing, seeking, skipping and quitting all save at once.
 const POSITION_SAVE_EVERY: Duration = Duration::from_secs(30);
@@ -683,6 +726,9 @@ pub struct Options {
     pub stats: bool,
     /// Print one line of counters after this long, then exit.
     pub stats_after: Option<Duration>,
+    /// Save a PNG of the window to this path when `ShotWhen` says, then exit. The window
+    /// captures itself, so nothing else on the desktop can end up in it.
+    pub screenshot: Option<(std::path::PathBuf, ShotWhen)>,
     /// Start on a named page, overriding the default of Home.
     pub page: Option<Route>,
     /// Scroll the current page steadily downward. A test aid: paging is driven by the viewport
@@ -1340,6 +1386,10 @@ pub struct App {
     /// Muted by the button versus turned down to zero. `last_volume` remembers what to come back
     /// to.
     pub(crate) muted: bool,
+    /// When the page's current load began, in egui time; see `publish_loading`.
+    page_loading_since: Option<f64>,
+    /// When the current song started resolving; see `publish_loading`.
+    resolving_since: Option<Instant>,
     /// A confirmation bubble above the player bar, if one is live.
     toast: Option<Toast>,
     /// Play the first result as soon as a search lands (`--autoplay`).
@@ -1354,6 +1404,8 @@ pub struct App {
     /// Print one line of counters and exit, once this much time has passed. Used by
     /// `scripts/perf.sh` to measure a *loaded* app rather than an empty one.
     stats_after: Option<Duration>,
+    /// `--screenshot`: where to save the window, when, and whether it has been asked for yet.
+    screenshot: Option<(std::path::PathBuf, ShotWhen, bool)>,
 
     /// Debug autoscroll offset, advanced each frame when `--autoscroll` is set.
     pub(crate) autoscroll: Option<f32>,
@@ -1499,6 +1551,7 @@ impl App {
             autoplay,
             stats,
             stats_after,
+            screenshot,
             page,
             autoscroll,
             queue,
@@ -1518,6 +1571,7 @@ impl App {
         // The themes folder is written on the very first run, then read — before anything that
         // names a theme, so an old settings file and `--scheme` both resolve against it.
         theme::custom::seed();
+        widgets::init_reduced_motion();
         let custom_themes = theme::custom::load();
         for (file, error) in &custom_themes.errors {
             tracing::warn!(%file, %error, "custom theme did not load");
@@ -1724,6 +1778,8 @@ impl App {
             last_volume: 70.0,
             resume: None,
             playback_saved: None,
+            page_loading_since: None,
+            resolving_since: None,
             last_playback_check: Instant::now(),
             muted: false,
             toast: None,
@@ -1745,6 +1801,7 @@ impl App {
             download_progress: std::collections::HashMap::new(),
             stats: Stats::new(stats),
             stats_after,
+            screenshot: screenshot.map(|(path, when)| (path, when, false)),
             content_rect: egui::Rect::NOTHING,
             blur,
             media,
@@ -2685,7 +2742,11 @@ impl App {
     /// it back. The `--startup-timing`/`--stats-after` measurement runs keep the old path: they
     /// exist to time the shell, and `verify_session` has no request timeout to bound them by.
     fn splash_visible(&mut self) -> bool {
-        if !self.startup_splash || self.startup_timing || self.stats_after.is_some() {
+        if !self.startup_splash
+            || self.startup_timing
+            || self.stats_after.is_some()
+            || self.screenshot.is_some()
+        {
             return false;
         }
         let waiting = match self.auth {
@@ -3115,25 +3176,114 @@ impl App {
         self.backend.fetch_library_more(section, token);
     }
 
-    /// Anything with a request in flight — the progress bar's condition and the repaint
-    /// schedule's, which must agree or the sweep stalls mid-travel.
-    fn anything_loading(&self) -> bool {
-        self.searching
-            || self.now.resolving
-            || self.artist_loading
-            || self.album_loading
-            || self.playlist_loading
-            || self.artist_expand_loading
-            || self.home_loading
-            || self.mood_playlists_loading
-            || self.explore_loading
-            || self.history_loading
-            || self.releases_loading
-            || self.charts_loading
-            || self.moods_loading
-            || self.library_loading
-            || self.radio_loading
-            || self.library.playlists.loading
+    /// A load the page on screen is waiting for — what its skeletons stand in for. Not the song
+    /// being resolved (the loading ring says that), and not background work the listener never
+    /// asked for: the sidebar's refresh, the radio topping up the queue.
+    fn visible_loading(&self) -> bool {
+        self.loads().any(Load::shows_skeleton)
+    }
+
+    /// Everything in flight right now.
+    fn loads(&self) -> impl Iterator<Item = Load> {
+        [
+            (self.searching, Load::Search),
+            (self.artist_loading, Load::Artist),
+            (self.album_loading, Load::Album),
+            (self.playlist_loading, Load::Playlist),
+            (self.artist_expand_loading, Load::ArtistExpand),
+            (self.home_loading, Load::Home),
+            (self.mood_playlists_loading, Load::MoodPlaylists),
+            (self.explore_loading, Load::Explore),
+            (self.history_loading, Load::History),
+            (self.releases_loading, Load::Releases),
+            (self.charts_loading, Load::Charts),
+            (self.moods_loading, Load::Moods),
+            (self.library_loading, Load::Library),
+            (self.radio_loading, Load::Radio),
+            (self.library.playlists.loading, Load::SidebarPlaylists),
+            (self.now.resolving, Load::Song),
+        ]
+        .into_iter()
+        .filter_map(|(on, load)| on.then_some(load))
+    }
+
+    /// `--screenshot`: ask egui for the window's pixels once the deadline passes, save the reply
+    /// as a PNG, and quit.
+    fn take_screenshot(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let ready = match self.screenshot.as_ref().map(|(_, when, _)| *when) {
+            None => return,
+            Some(ShotWhen::After(after)) => crate::elapsed_since_start() >= after,
+            // A beat into each, so the ring has turned and the shimmer is mid-pass.
+            Some(ShotWhen::Ring) => {
+                widgets::track_loading(ctx)
+                    && self
+                        .resolving_since
+                        .is_some_and(|s| s.elapsed() >= Duration::from_millis(450))
+            }
+            Some(ShotWhen::Skeleton) => self.page_loading_since.is_some_and(|s| now - s >= 0.75),
+        };
+        let Some((path, _, asked)) = &mut self.screenshot else {
+            return;
+        };
+        ctx.request_repaint_after(Duration::from_millis(16));
+        if !*asked && crate::elapsed_since_start() >= Duration::from_secs(60) {
+            eprintln!("screenshot: the moment never came; nothing saved");
+            self.screenshot = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if !*asked && ready {
+            *asked = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        }
+        let shot = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(std::sync::Arc::clone(image)),
+                _ => None,
+            })
+        });
+        let Some(image) = shot else {
+            return;
+        };
+        let [w, h] = image.size;
+        let saved = image::RgbaImage::from_raw(w as u32, h as u32, image.as_raw().to_vec())
+            .map(|rgba| rgba.save(&*path));
+        match saved {
+            Some(Ok(())) => println!("screenshot={}", path.display()),
+            _ => eprintln!("could not save the screenshot to {}", path.display()),
+        }
+        self.screenshot = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Publish this frame's loading signals: when the page's load began, for the skeletons'
+    /// show delay, and whether the current song has been loading long enough to show its ring.
+    fn publish_loading(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        self.page_loading_since = if self.visible_loading() {
+            Some(self.page_loading_since.unwrap_or(now))
+        } else {
+            None
+        };
+        widgets::set_skeleton_since(ctx, self.page_loading_since);
+
+        self.resolving_since = if self.now.resolving {
+            Some(self.resolving_since.unwrap_or_else(Instant::now))
+        } else {
+            None
+        };
+        let shown = self.resolving_since.is_some_and(|since| {
+            match widgets::track_ring_due(since.elapsed()) {
+                Ok(()) => true,
+                Err(left) => {
+                    // Wake up exactly when the ring is due, not a frame later.
+                    ctx.request_repaint_after(left);
+                    false
+                }
+            }
+        });
+        widgets::set_track_loading(ctx, shown);
     }
 
     /// Fill the sidebar's playlist list as soon as there is a session.
@@ -5861,6 +6011,7 @@ impl eframe::App for App {
         // Publish the playback click model for the row and card widgets this frame, so no page
         // has to thread the setting through.
         crate::widgets::set_double_click_play(&ctx, self.settings.double_click_to_play);
+        self.publish_loading(&ctx);
         crate::widgets::set_downloaded(&ctx, std::sync::Arc::clone(&self.downloaded_ids));
 
         let maximized = Self::is_maximized(&ctx);
@@ -6098,13 +6249,6 @@ impl eframe::App for App {
                 // rounded — so this never touches it.
                 widgets::paint_corner_notches(ui, card, theme::PAGE_INSET_X, &p);
             });
-        // On the foreground layer, so draw order relative to the panels above doesn't matter —
-        // see `widgets::progress_bar`'s own doc comment for why it moved here from the content
-        // card's own top edge.
-        if self.anything_loading() {
-            widgets::progress_bar(ui, &p, if rounded { theme::WINDOW_RADIUS } else { 0 });
-        }
-
         // The playlist management modals, over everything and on every route.
         ui::playlist::modals(self, ui);
         ui::help::modal(self, ui);
@@ -6214,13 +6358,9 @@ impl eframe::App for App {
         if let Some(due) = suggest_due {
             ctx.request_repaint_after(due);
         } else {
-            // The sweep moves visibly, so a load asks for frames faster than playback
-            // progress needs — but only while something is actually in flight.
-            let busy = self.anything_loading();
-            let advancing = self.playback_started && !state.paused;
-            if busy {
-                ctx.request_repaint_after(Duration::from_millis(16));
-            } else if advancing {
+            // Loading asks for no frames of its own here: the skeletons and the loading ring each
+            // ask for theirs while they are on screen, and background work shows nothing.
+            if self.playback_started && !state.paused {
                 ctx.request_repaint_after(PLAYING_REPAINT);
             }
         }
@@ -6320,6 +6460,7 @@ impl eframe::App for App {
             // Keep painting until the deadline, or the app would idle and never get there.
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        self.take_screenshot(&ctx);
 
         if self.startup_timing {
             // egui runs one more pass after the close command, so latch it.
@@ -6339,6 +6480,24 @@ mod tests {
 
     fn artist(id: &str) -> Route {
         Route::Artist(id.to_owned())
+    }
+
+    /// Background work and the song's own load never show page skeletons; every page load does.
+    #[test]
+    fn only_page_loads_show_skeletons() {
+        assert!(!Load::Radio.shows_skeleton());
+        assert!(!Load::SidebarPlaylists.shows_skeleton());
+        assert!(!Load::Song.shows_skeleton());
+        for page in [
+            Load::Search,
+            Load::Home,
+            Load::Library,
+            Load::Album,
+            Load::Playlist,
+            Load::Artist,
+        ] {
+            assert!(page.shows_skeleton(), "{page:?}");
+        }
     }
 
     fn saved(position: f64, paused: bool, ago: Duration) -> SavedPlayback {

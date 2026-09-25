@@ -1206,52 +1206,190 @@ pub fn paint_subtitle_marquee<'a>(
     clicked
 }
 
-/// The loading answer: a bare accent sweep along the very top edge of the window while
-/// anything is in flight — above the topbar and sidebar alike, not just the content card, so
-/// it reads the same regardless of which page is loading.
-///
-/// Time is the only state — no timers, no stored values — so this costs nothing when it is
-/// not drawn, and the caller already asks for repaints while loading. Painted on the
-/// foreground layer rather than into the calling `Ui`, which is what lets it sit above the
-/// topbar and sidebar panels that get laid out after it without caring about draw order. No
-/// track, no container — just the sweep itself, the way YouTube's own loading line reads —
-/// and its ends are held clear of the window's own rounded top corners (`radius` — `0` when
-/// OS-decorated or maximized, [`theme::WINDOW_RADIUS`] otherwise), which a full-bleed bar at
-/// the very top would otherwise ride over.
-pub fn progress_bar(ui: &Ui, palette: &Palette, radius: u8) {
-    let rect = ui.ctx().content_rect();
-    let (left, right) = (rect.left(), rect.right());
-    if right <= left {
+/// How long a load may take before its skeleton shows. Anything faster — a page answered from
+/// cache — goes straight to its content with no grey flash in between.
+const SKELETON_DELAY: f64 = 0.15;
+/// One pass of the shimmer across the window.
+const SHIMMER_PERIOD: f64 = 1.4;
+/// How long a song may take to start before its loading ring shows. A warm resolve (~0.4 s)
+/// shows it briefly; a prefetched track (instant) never does.
+pub const TRACK_LOADING_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+/// One eased turn of the loading ring.
+const SPINNER_PERIOD: f64 = 1.2;
+
+/// How much longer a skeleton waits before showing, given when its load began (`since`, egui
+/// time) — `None` once it should show, and at once when no load is being timed.
+pub(crate) fn skeleton_wait(now: f64, since: Option<f64>) -> Option<f64> {
+    let wait = SKELETON_DELAY - (now - since?);
+    (wait > 0.0).then_some(wait)
+}
+
+/// Whether a song that has been loading for `waited` should show its ring yet; `Err` carries how
+/// long until it should, so the caller can wake up exactly then.
+pub(crate) fn track_ring_due(waited: std::time::Duration) -> Result<(), std::time::Duration> {
+    if waited >= TRACK_LOADING_DELAY {
+        Ok(())
+    } else {
+        Err(TRACK_LOADING_DELAY - waited)
+    }
+}
+
+/// Whether the desktop asks for less motion. Read once, at startup, by [`init_reduced_motion`].
+static REDUCED_MOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn reduced_motion() -> bool {
+    REDUCED_MOTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read the desktop's "reduce animations" preference once: KDE's global animation speed set to
+/// instant (`AnimationDurationFactor=0` in `kdeglobals`), or GNOME's `enable-animations` off.
+/// Other platforms keep the default, motion on.
+pub(crate) fn init_reduced_motion() {
+    #[cfg(target_os = "linux")]
+    {
+        let kde = directories::BaseDirs::new()
+            .and_then(|dirs| std::fs::read_to_string(dirs.config_dir().join("kdeglobals")).ok())
+            .is_some_and(|text| kde_animations_off(&text));
+        let gnome = || {
+            std::process::Command::new("gsettings")
+                .args(["get", "org.gnome.desktop.interface", "enable-animations"])
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "false")
+        };
+        let reduced = kde || gnome();
+        if reduced {
+            tracing::info!("the desktop asks for less motion; skeletons stay still");
+        }
+        REDUCED_MOTION.store(reduced, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether `kdeglobals` sets the global animation speed to instant.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn kde_animations_off(kdeglobals: &str) -> bool {
+    let mut in_kde = false;
+    for line in kdeglobals.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_kde = line == "[KDE]";
+        } else if in_kde && let Some(value) = line.strip_prefix("AnimationDurationFactor=") {
+            return value.trim().parse::<f64>().is_ok_and(|f| f <= 0.0);
+        }
+    }
+    false
+}
+
+/// Publish when the page's current load began (egui time), or `None` when nothing is loading,
+/// for the skeletons' show delay. Set every frame by the app, like the click model.
+pub(crate) fn set_skeleton_since(ctx: &egui::Context, since: Option<f64>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ytm-skeleton-since"), since));
+}
+
+fn skeleton_since(ctx: &egui::Context) -> Option<f64> {
+    ctx.data(|d| {
+        d.get_temp::<Option<f64>>(egui::Id::new("ytm-skeleton-since"))
+            .flatten()
+    })
+}
+
+/// Publish whether the current track has been loading long enough to say so; the active row and
+/// the player bar's play button draw the ring off this.
+pub(crate) fn set_track_loading(ctx: &egui::Context, loading: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ytm-track-loading"), loading));
+}
+
+pub(crate) fn track_loading(ctx: &egui::Context) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<bool>(egui::Id::new("ytm-track-loading"))
+            .unwrap_or(false)
+    })
+}
+
+/// The ring's rotation at time `t`, in radians: one turn per [`SPINNER_PERIOD`], eased in and out
+/// so it surges and settles rather than turning like a clock hand.
+pub(crate) fn spinner_angle(t: f64) -> f32 {
+    let x = (t / SPINNER_PERIOD).fract();
+    let eased = if x < 0.5 {
+        2.0 * x * x
+    } else {
+        1.0 - (-2.0 * x + 2.0).powi(2) / 2.0
+    };
+    (eased * std::f64::consts::TAU) as f32
+}
+
+/// A quarter-circle arc turning around `center`: the one loading glyph, on the play button and on
+/// the row that asked to play. Asks for the next frame itself, so it only costs frames while it
+/// is on screen.
+pub fn paint_spinner(ui: &Ui, center: egui::Pos2, radius: f32, width: f32, color: Color32) {
+    let start = spinner_angle(ui.input(|i| i.time));
+    let sweep = std::f32::consts::FRAC_PI_2;
+    let points: Vec<egui::Pos2> = (0..=16)
+        .map(|i| {
+            let a = start + sweep * i as f32 / 16.0;
+            center + radius * vec2(a.cos(), a.sin())
+        })
+        .collect();
+    ui.painter().add(egui::epaint::PathShape::line(
+        points,
+        egui::Stroke::new(width, color),
+    ));
+    ui.ctx().request_repaint();
+}
+
+/// Fill one skeleton shape: nothing until [`SKELETON_DELAY`] into a load, then the grey shape with
+/// a soft highlight gliding across it. The highlight's position comes from time and the shape's
+/// place on screen alone, so every skeleton on the page shimmers as one band, slanted by height.
+fn skeleton_fill(ui: &Ui, rect: Rect, radius: impl Into<CornerRadius>, palette: &Palette) {
+    let ctx = ui.ctx();
+    let now = ui.input(|i| i.time);
+    if let Some(wait) = skeleton_wait(now, skeleton_since(ctx)) {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         return;
     }
-    let y = rect.top() + 1.0;
-    // Where the window's own outline begins on the bar's top row, given the corner radius:
-    // the sweep emerges from behind the corner rather than crossing the curve. One row below
-    // the top edge the inset is large — most of the radius — so clamping by it keeps the
-    // whole 3 pt bar inside the window at both ends.
-    let rad = f32::from(radius);
-    let dy = rad - (y - rect.top());
-    let inset = (rad - (rad * rad - dy * dy).max(0.0).sqrt()).min(rad);
-    let (start, end) = (left + inset, right - inset);
-    if end <= start {
+    ui.painter()
+        .rect_filled(rect, radius, palette.surface_hover);
+    // Reduced motion: the shapes alone, still, and no frames asked for.
+    if reduced_motion() {
         return;
     }
-    let seg = 120.0;
-    let travel = f64::from(right - left) + f64::from(seg);
-    let t = ui.input(|i| i.time);
-    let x = left - seg + ((t * 800.0) % travel) as f32;
-    let (lo, hi) = (x.max(start), (x + seg).min(end));
-    if hi > lo {
-        ui.ctx()
-            .layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("ytm-loading-bar"),
-            ))
-            .rect_filled(
-                Rect::from_min_size(egui::pos2(lo, y), egui::vec2(hi - lo, 3.0)),
-                CornerRadius::same(2),
-                palette.accent,
-            );
+    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+
+    let screen = ctx.content_rect();
+    let band = 240.0;
+    let phase = ((now % SHIMMER_PERIOD) / SHIMMER_PERIOD) as f32;
+    let centre = screen.left() - band + phase * (screen.width() + 2.0 * band)
+        - (rect.center().y - screen.top()) * 0.35;
+    let (left, right) = (centre - band / 2.0, centre + band / 2.0);
+    if right < rect.left() || left > rect.right() {
+        return;
+    }
+    let glow = palette.text.gamma_multiply(0.07);
+    let mut mesh = egui::Mesh::default();
+    for (x, colour) in [
+        (left, Color32::TRANSPARENT),
+        (centre, glow),
+        (right, Color32::TRANSPARENT),
+    ] {
+        mesh.colored_vertex(egui::pos2(x, rect.top()), colour);
+        mesh.colored_vertex(egui::pos2(x, rect.bottom()), colour);
+    }
+    for quad in 0..2u32 {
+        let i = quad * 2;
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i + 1, i + 3, i + 2);
+    }
+    ui.painter()
+        .with_clip_rect(rect.intersect(ui.clip_rect()))
+        .add(mesh);
+}
+
+/// Grey placeholder lines of text, for a panel whose content is prose (the lyrics).
+pub fn skeleton_lines(ui: &mut Ui, palette: &Palette, n: usize) {
+    for i in 0..n {
+        let width = ui.available_width() * [0.7, 0.55, 0.62, 0.45][i % 4];
+        skeleton_bar(ui, palette, width, 12.0);
+        ui.add_space(10.0);
     }
 }
 
@@ -1261,15 +1399,10 @@ fn skeleton_bar(ui: &mut Ui, palette: &Palette, w: f32, h: f32) {
     if !ui.is_rect_visible(rect) {
         return;
     }
-    ui.painter().rect_filled(
-        rect,
-        CornerRadius::same(theme::RADIUS_SMALL),
-        palette.surface_hover,
-    );
+    skeleton_fill(ui, rect, CornerRadius::same(theme::RADIUS_SMALL), palette);
 }
 
-/// Grey placeholder rows while a track list loads — static shapes, so they answer without
-/// costing a single extra frame.
+/// Grey placeholder rows while a track list loads, in the shape of the rows that replace them.
 pub fn skeleton_rows(ui: &mut Ui, palette: &Palette, n: usize) {
     for _ in 0..n {
         let (rect, _) = ui.allocate_exact_size(
@@ -1283,27 +1416,25 @@ pub fn skeleton_rows(ui: &mut Ui, palette: &Palette, n: usize) {
             egui::pos2(rect.left() + 8.0, rect.center().y - theme::ART_SIZE / 2.0),
             vec2(theme::ART_SIZE, theme::ART_SIZE),
         );
-        ui.painter().rect_filled(
-            art,
-            CornerRadius::same(theme::RADIUS_SMALL),
-            palette.surface_hover,
-        );
+        skeleton_fill(ui, art, CornerRadius::same(theme::RADIUS_SMALL), palette);
         let tx = art.right() + 12.0;
-        ui.painter().rect_filled(
+        skeleton_fill(
+            ui,
             Rect::from_min_size(
                 egui::pos2(tx, rect.center().y - 10.0),
                 vec2((rect.width() * 0.4).max(80.0), 10.0),
             ),
             CornerRadius::same(theme::RADIUS_SMALL),
-            palette.surface_hover,
+            palette,
         );
-        ui.painter().rect_filled(
+        skeleton_fill(
+            ui,
             Rect::from_min_size(
                 egui::pos2(tx, rect.center().y + 4.0),
                 vec2((rect.width() * 0.25).max(60.0), 8.0),
             ),
             CornerRadius::same(theme::RADIUS_SMALL),
-            palette.surface_hover,
+            palette,
         );
     }
 }
@@ -1327,13 +1458,14 @@ pub fn skeleton_track_rows(ui: &mut Ui, palette: &Palette, n: usize, hide_art: b
         }
         let num_x =
             rect.left() + theme::ROW_LEFT_INSET + theme::ROW_NUMBER_W - theme::ROW_NUMBER_GAP;
-        ui.painter().rect_filled(
+        skeleton_fill(
+            ui,
             Rect::from_min_size(
                 egui::pos2(num_x - 12.0, rect.center().y - 5.0),
                 vec2(12.0, 10.0),
             ),
             CornerRadius::same(theme::RADIUS_SMALL),
-            palette.surface_hover,
+            palette,
         );
         let art = Rect::from_min_size(
             egui::pos2(
@@ -1343,11 +1475,7 @@ pub fn skeleton_track_rows(ui: &mut Ui, palette: &Palette, n: usize, hide_art: b
             vec2(theme::ART_SIZE, theme::ART_SIZE),
         );
         if !hide_art {
-            ui.painter().rect_filled(
-                art,
-                CornerRadius::same(theme::RADIUS_SMALL),
-                palette.surface_hover,
-            );
+            skeleton_fill(ui, art, CornerRadius::same(theme::RADIUS_SMALL), palette);
         }
         let tx = if hide_art {
             rect.left() + theme::ROW_LEFT_INSET + theme::ROW_NUMBER_W + 12.0
@@ -1355,29 +1483,32 @@ pub fn skeleton_track_rows(ui: &mut Ui, palette: &Palette, n: usize, hide_art: b
             art.right() + 12.0
         };
         let text_w = (rect.right() - right_pad - duration_w - 8.0 - tx).max(40.0);
-        ui.painter().rect_filled(
+        skeleton_fill(
+            ui,
             Rect::from_min_size(
                 egui::pos2(tx, rect.center().y - 10.0),
                 vec2((text_w * 0.6).max(80.0), 10.0),
             ),
             CornerRadius::same(theme::RADIUS_SMALL),
-            palette.surface_hover,
+            palette,
         );
-        ui.painter().rect_filled(
+        skeleton_fill(
+            ui,
             Rect::from_min_size(
                 egui::pos2(tx, rect.center().y + 4.0),
                 vec2((text_w * 0.35).max(60.0), 8.0),
             ),
             CornerRadius::same(theme::RADIUS_SMALL),
-            palette.surface_hover,
+            palette,
         );
-        ui.painter().rect_filled(
+        skeleton_fill(
+            ui,
             Rect::from_min_size(
                 egui::pos2(rect.right() - right_pad - duration_w, rect.center().y - 5.0),
                 vec2(duration_w, 9.0),
             ),
             CornerRadius::same(theme::RADIUS_SMALL),
-            palette.surface_hover,
+            palette,
         );
     }
 }
@@ -1396,11 +1527,7 @@ pub fn skeleton_chips(ui: &mut Ui, palette: &Palette, n: usize) {
             if !ui.is_rect_visible(rect) {
                 continue;
             }
-            ui.painter().rect_filled(
-                rect,
-                CornerRadius::same(theme::RADIUS),
-                palette.surface_hover,
-            );
+            skeleton_fill(ui, rect, CornerRadius::same(theme::RADIUS), palette);
         }
     });
 }
@@ -1422,28 +1549,26 @@ pub fn skeleton_chart_grid(ui: &mut Ui, palette: &Palette, n: usize) {
                 continue;
             }
             let art = Rect::from_min_size(rect.left_center() + vec2(4.0, -20.0), vec2(40.0, 40.0));
-            ui.painter().rect_filled(
-                art,
-                CornerRadius::same(theme::RADIUS_SMALL),
-                palette.surface_hover,
-            );
+            skeleton_fill(ui, art, CornerRadius::same(theme::RADIUS_SMALL), palette);
             let tx = art.right() + 8.0;
             let text_w = (rect.right() - 4.0 - tx).max(30.0);
-            ui.painter().rect_filled(
+            skeleton_fill(
+                ui,
                 Rect::from_min_size(
                     egui::pos2(tx, rect.center().y - 9.0),
                     vec2(text_w * 0.7, 9.0),
                 ),
                 CornerRadius::same(theme::RADIUS_SMALL),
-                palette.surface_hover,
+                palette,
             );
-            ui.painter().rect_filled(
+            skeleton_fill(
+                ui,
                 Rect::from_min_size(
                     egui::pos2(tx, rect.center().y + 6.0),
                     vec2(text_w * 0.45, 8.0),
                 ),
                 CornerRadius::same(theme::RADIUS_SMALL),
-                palette.surface_hover,
+                palette,
             );
         }
     });
@@ -1500,15 +1625,16 @@ pub fn skeleton_cards(ui: &mut Ui, palette: &Palette, n: usize, shape: ArtShape)
                 }
                 ArtShape::Square | ArtShape::Wide => CornerRadius::same(theme::RADIUS),
             };
-            ui.painter().rect_filled(art, radius, palette.surface_hover);
+            skeleton_fill(ui, art, radius, palette);
             for (dy, w) in [(14.0, 0.7), (28.0, 0.45)] {
-                ui.painter().rect_filled(
+                skeleton_fill(
+                    ui,
                     Rect::from_min_size(
                         art.left_bottom() + vec2(0.0, dy),
                         vec2((super::ui::CARD_W - 16.0) * w, 9.0),
                     ),
                     CornerRadius::same(theme::RADIUS_SMALL),
-                    palette.surface_hover,
+                    palette,
                 );
             }
         }
@@ -1543,8 +1669,7 @@ pub fn skeleton_header(ui: &mut Ui, palette: &Palette, size: f32, kind: Skeleton
         } else {
             CornerRadius::same(theme::RADIUS)
         };
-        ui.painter()
-            .rect_filled(art_rect, radius, palette.surface_hover);
+        skeleton_fill(ui, art_rect, radius, palette);
         ui.vertical(|ui| match kind {
             SkeletonHeaderKind::Artist => {
                 ui.add_space(size / 2.0 - 22.0);
@@ -1740,10 +1865,28 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
                 .rect_filled(rect, radius, palette.surface_hover.gamma_multiply(t));
         }
 
+        // The row that asked to play shows it loading: over its cover, or — on a page whose
+        // rows have none (the album) — in place of its number.
+        let loading = active && track_loading(ui.ctx());
         if !hide_art {
             paint_art(ui, palette, art_rect, art, shape);
-            // A cover you can press is a control; one you cannot is a picture.
-            if shape == ArtShape::Square {
+            if loading {
+                let radius = if shape == ArtShape::Circle {
+                    CornerRadius::same(u8::MAX)
+                } else {
+                    CornerRadius::same(theme::RADIUS_SMALL)
+                };
+                ui.painter()
+                    .rect_filled(art_rect, radius, Color32::from_black_alpha(120));
+                paint_spinner(
+                    ui,
+                    art_rect.center(),
+                    art_rect.width() * 0.28,
+                    2.0,
+                    Color32::WHITE,
+                );
+            } else if shape == ArtShape::Square {
+                // A cover you can press is a control; one you cannot is a picture.
                 play_overlay(ui, palette, art_rect, t, false, playing);
             }
         }
@@ -1781,7 +1924,9 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
                 );
             }
         } else if !narrow && let Some(n) = number {
-            if number_play && over {
+            if loading && hide_art {
+                paint_spinner(ui, number_rect.center(), 7.0, 2.0, palette.accent);
+            } else if number_play && over {
                 // The cover's own hover play button went with the cover, so the affordance
                 // moves into the number's slot — the pointer turns the number into a play
                 // (or pause, on the row that is already going) glyph. Painted in the accent
@@ -2570,7 +2715,21 @@ pub fn art_card(
         paint_art(ui, palette, art, texture, shape);
         // Circles are people — an artist has no single thing to play, so no play button.
         if shape != ArtShape::Circle {
-            play_overlay(ui, palette, art, t, true, playing);
+            // Loading, the corner button stays up whether hovered or not, ringed like the
+            // player bar's — the card you pressed says it heard you.
+            let loading = playing && track_loading(ui.ctx());
+            play_overlay(
+                ui,
+                palette,
+                art,
+                if loading { 1.0 } else { t },
+                true,
+                playing,
+            );
+            if loading {
+                let centre = art.right_bottom() - vec2(17.0 + 8.0, 17.0 + 8.0);
+                paint_spinner(ui, centre, 17.0 + 3.0, 2.0, palette.accent);
+            }
             // A separate hit region over just the button, sized at its full (settled) diameter
             // regardless of the fade's current progress — a click only ever lands once it is
             // basically visible anyway, and a fixed target beats one that moves under the
@@ -3768,6 +3927,65 @@ pub fn volume_slider(ui: &mut Ui, palette: &Palette, volume: f64, unmute_to: f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A skeleton waits 150 ms into its load and then shows; one with no timed load shows at once.
+    #[test]
+    fn skeletons_wait_out_fast_loads() {
+        assert_eq!(skeleton_wait(10.0, None), None);
+        assert!((skeleton_wait(10.05, Some(10.0)).unwrap() - 0.10).abs() < 1e-9);
+        assert_eq!(skeleton_wait(10.0 + SKELETON_DELAY, Some(10.0)), None);
+        assert_eq!(skeleton_wait(12.0, Some(10.0)), None);
+    }
+
+    /// The ring shows 250 ms into a load, and until then says how long is left.
+    #[test]
+    fn the_loading_ring_waits_a_quarter_second() {
+        use std::time::Duration;
+        assert_eq!(track_ring_due(Duration::ZERO), Err(TRACK_LOADING_DELAY));
+        assert_eq!(
+            track_ring_due(Duration::from_millis(100)),
+            Err(Duration::from_millis(150))
+        );
+        assert_eq!(track_ring_due(TRACK_LOADING_DELAY), Ok(()));
+        assert_eq!(track_ring_due(Duration::from_secs(2)), Ok(()));
+    }
+
+    #[test]
+    fn kde_instant_animations_read_as_reduced_motion() {
+        assert!(kde_animations_off(
+            "[General]\nfoo=1\n[KDE]\nAnimationDurationFactor=0\n"
+        ));
+        assert!(!kde_animations_off("[KDE]\nAnimationDurationFactor=0.5\n"));
+        assert!(!kde_animations_off("[Other]\nAnimationDurationFactor=0\n"));
+        assert!(!kde_animations_off(""));
+    }
+
+    /// The ring turns once per period, eased: slow out of each start, fastest halfway, slow into
+    /// the end — and back at its start when the next turn begins.
+    #[test]
+    fn the_loading_ring_eases_through_one_turn_per_period() {
+        let turn = std::f32::consts::TAU;
+        assert!(spinner_angle(0.0).abs() < 1e-6);
+        assert!((spinner_angle(SPINNER_PERIOD / 2.0) - turn / 2.0).abs() < 1e-4);
+        assert!(
+            spinner_angle(SPINNER_PERIOD).abs() < 1e-4,
+            "a new turn starts at 0"
+        );
+        let step = SPINNER_PERIOD / 20.0;
+        let early = spinner_angle(step) - spinner_angle(0.0);
+        let middle = spinner_angle(SPINNER_PERIOD / 2.0 + step / 2.0)
+            - spinner_angle(SPINNER_PERIOD / 2.0 - step / 2.0);
+        assert!(
+            middle > 3.0 * early,
+            "eased: {early} at the start, {middle} midway"
+        );
+        let mut last = -1.0;
+        for i in 0..100 {
+            let a = spinner_angle(SPINNER_PERIOD * f64::from(i) / 100.0);
+            assert!(a >= last, "never turns backwards");
+            last = a;
+        }
+    }
 
     /// The trap that closed the song menu whenever the mouse moved: `egui::Memory` keeps
     /// **one** popup slot per viewport, so opening a second popup by id silently evicts the
