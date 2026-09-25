@@ -48,12 +48,15 @@ fn text(v: &Value) -> String {
         return runs
             .iter()
             .filter_map(|r| r.get("text").and_then(Value::as_str))
+            .map(crate::model::fold_styled_letters)
             .collect();
     }
-    v.get("simpleText")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
+    crate::model::fold_styled_letters(
+        v.get("simpleText")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
+    .into_owned()
 }
 
 fn non_empty(s: String) -> Option<String> {
@@ -275,7 +278,10 @@ fn segments_from_runs(runs: &[Value], column: usize) -> Vec<Segment> {
     };
 
     for run in runs {
-        let text = run.get("text").and_then(Value::as_str).unwrap_or_default();
+        let text = crate::model::fold_styled_letters(
+            run.get("text").and_then(Value::as_str).unwrap_or_default(),
+        );
+        let text = text.as_ref();
         let target = run.get("navigationEndpoint").and_then(endpoint_target);
 
         if text.trim() == "•" {
@@ -2569,7 +2575,7 @@ mod tests {
                 r.items.len()
             );
             let kinds: Vec<&str> = r.items.iter().map(Entry::kind).collect();
-            for want in ["ARTIST", "SONG", "ALBUM"] {
+            for want in ["Artist", "Song", "Album"] {
                 assert!(kinds.contains(&want), "{fixture}: no {want} in {kinds:?}");
             }
         }

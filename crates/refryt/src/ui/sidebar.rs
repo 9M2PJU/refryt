@@ -418,7 +418,7 @@ fn rail_row(
 
         let x = art_rect.right() + 10.0;
         let w = (rect.right() - 8.0 - x).max(0.0);
-        let title_font = theme::medium(13.0);
+        let title_font = theme::medium(13.5);
         crate::emoji::paint_line(
             ui,
             egui::pos2(x, rect.center().y - 9.0),
@@ -430,7 +430,7 @@ fn rail_row(
                 palette.text
             },
         );
-        let detail_font = theme::regular(11.0);
+        let detail_font = theme::regular(11.5);
         crate::emoji::paint_line(
             ui,
             egui::pos2(x, rect.center().y + 9.0),

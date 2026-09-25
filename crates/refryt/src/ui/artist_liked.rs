@@ -127,12 +127,14 @@ fn header(app: &mut App, ui: &mut egui::Ui, tracks: &[crate::model::Track]) {
         ui.add_space(out.art_bottom - art_top + 12.0);
         out
     };
-    // Shuffle and sort, on the header's own row just past Play — the playlist page's sort
-    // anchor, extended with a second control.
+    // Shuffle and sort, on the header's own row just past Play. `controls_end` carries the 20 pt
+    // the header leaves after Play for Save and •••, which this page has neither of; starting
+    // there left Shuffle 24 px out from Play. Pulled back so Play, Shuffle and sort sit 12 px
+    // apart, a group rather than three stragglers.
     let mut shuffled = false;
     if let Some(anchor) = out.controls_end {
         let rect =
-            egui::Rect::from_min_size(anchor + egui::vec2(3.0, -15.0), egui::vec2(300.0, 30.0));
+            egui::Rect::from_min_size(anchor + egui::vec2(-8.0, -15.0), egui::vec2(300.0, 30.0));
         let mut cui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect)
@@ -142,7 +144,9 @@ fn header(app: &mut App, ui: &mut egui::Ui, tracks: &[crate::model::Track]) {
         if widgets::chip(&mut cui, &p, "Shuffle", false).clicked() {
             shuffled = true;
         }
-        cui.add_space(2.0);
+        // The chip's pill and the sort glyph each sit inside a larger hit box, which left 16 px of
+        // air between them; pulled in so it matches Play → Shuffle.
+        cui.add_space(-4.0);
         const OPTIONS: &[PlaylistSort] = &[
             PlaylistSort::Default,
             PlaylistSort::Reverse,

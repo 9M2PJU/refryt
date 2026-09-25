@@ -18,10 +18,12 @@ use crate::theme;
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    crate::ui::page_title(ui, &app.palette, "Settings");
-
+    // The title scrolls away with the page rather than staying pinned over it.
     crate::ui::page_scroll(app, "settings").show(ui, |ui| {
-        ui.set_max_width(COLUMN_MAX_W.min(ui.available_width()));
+        crate::ui::page_title(ui, &app.palette, "Settings");
+        // Capped, and held clear of the card's right edge: with the queue or lyrics open the
+        // card is narrower than the cap, and the switches sat on its edge, against the panel.
+        ui.set_max_width(COLUMN_MAX_W.min(ui.available_width() - RIGHT_GUTTER));
         appearance(app, ui);
         ui.add_space(28.0);
         playback(app, ui);
@@ -165,6 +167,9 @@ const LABEL_W: f32 = 104.0;
 /// How wide the settings column gets. Past this the switches, right-aligned, drifted a window's
 /// width away from the words that name them.
 const COLUMN_MAX_W: f32 = 720.0;
+/// Room kept between the settings column and the card's right edge when the card is narrower
+/// than [`COLUMN_MAX_W`].
+const RIGHT_GUTTER: f32 = 40.0;
 
 fn labeled_row(
     palette: &theme::Palette,
@@ -189,7 +194,15 @@ fn labeled_row(
                     );
                 },
             );
-            contents(ui);
+            // Wrapping, within what is left of the column: the Theme row's dropdown and folder
+            // button are wider than a narrow card (queue open), and a row that overflows widens
+            // the column itself — which pushed every switch below it out against the panel.
+            // Wrapped, the button drops under the dropdown instead.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                contents,
+            );
         });
     });
 }
@@ -285,32 +298,46 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
         // A slider, not chips: transparency is a continuum, and four names only ever made the
         // setting look like a choice of four windows. The label centres on the slider's own row.
         let mut sheer = app.settings.opacity.sheer();
-        labeled_row(&app.palette, ui, "Transparency", |ui| {
-            // `--decorated` gives the window back to the OS, which paints its own opaque
-            // background — the slider would do nothing, so it is dimmed and inert rather than
-            // silently pretending.
-            ui.add_enabled_ui(!app.decorated, |ui| {
-                widgets::slider(ui, &app.palette, &mut sheer, 0.0..=Opacity::MAX, 220.0);
-                ui.add_space(6.0);
-                // The number the slider only implies: a percentage is what "how transparent is
-                // it" is actually asked and answered in, and the label's x is fixed by the
-                // slider's own width, so the changing digits move nothing else. A percentage of
-                // the slider's whole range, which reaches past the old maximum — not of the
-                // composite alpha.
-                ui.label(
-                    RichText::new(format!("{:.0}%", sheer / Opacity::MAX * 100.0))
-                        .font(theme::regular(12.0))
-                        .color(app.palette.text),
-                );
-            });
-        });
-        ui.add_space(4.0);
-        if app.decorated {
-            note(app, ui, "Not available with `--decorated`.");
-        } else {
-            note(app, ui, "How much of the desktop shows through.");
-        }
-        ui.add_space(8.0);
+        // The same shape as the switches below it — title, a line under it, the control at the
+        // right — rather than a grey label-column row with its note floating a line lower: in a
+        // narrow card (queue or lyrics open) the two styles side by side, with the slider's end
+        // short of the switches' edge, read as a page that had come apart.
+        let decorated = app.decorated;
+        let percent = format!("{:.0}%", sheer / Opacity::MAX * 100.0);
+        widgets::setting_row(
+            ui,
+            &app.palette,
+            "Transparency",
+            if decorated {
+                "Not available with `--decorated`."
+            } else {
+                "How much of the desktop shows through."
+            },
+            |ui| {
+                // `--decorated` gives the window back to the OS, which paints its own opaque
+                // background — the slider would do nothing, so it is dimmed and inert rather
+                // than silently pretending.
+                ui.add_enabled_ui(!decorated, |ui| {
+                    // The number the slider only implies, in a fixed slot at the row's right
+                    // edge so the changing digits move nothing: a percentage of the slider's
+                    // whole range, which reaches past the old maximum — not of the composite
+                    // alpha.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(34.0, 20.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                RichText::new(&percent)
+                                    .font(theme::regular(12.0))
+                                    .color(app.palette.text),
+                            );
+                        },
+                    );
+                    ui.add_space(4.0);
+                    widgets::slider(ui, &app.palette, &mut sheer, 0.0..=Opacity::MAX, 150.0);
+                });
+            },
+        );
 
         let blur_available = app.blur.available();
         let blur_useful = sheer > 0.0;

@@ -2804,6 +2804,7 @@ dependencies = [
  "icu_provider",
  "smallvec",
  "utf16_iter",
+ "utf8_iter",
  "write16",
  "zerovec",
 ]
@@ -4910,6 +4911,7 @@ dependencies = [
  "embed-resource",
  "glib",
  "gtk",
+ "icu_normalizer",
  "image",
  "libmpv2",
  "libmpv2-sys",

@@ -24,9 +24,8 @@ fn link_target(link: &crate::model::ExploreLink) -> Option<(Icon, Route)> {
 }
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    crate::ui::page_title(ui, &app.palette, "Explore");
-
     if app.explore_loading && app.explore.is_none() {
+        crate::ui::page_title(ui, &app.palette, "Explore");
         // Same reasoning as `home.rs`: several titled carousels, mixing grids and row-lists,
         // not one untitled block.
         widgets::skeleton_shelf(
@@ -45,11 +44,14 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     if let Some(err) = app.explore_error.clone() {
+        crate::ui::page_title(ui, &app.palette, "Explore");
         failed(app, ui, err, App::retry_route);
         return;
     }
 
+    // The title scrolls away with the page rather than staying pinned over it.
     crate::ui::page_scroll(app, "explore").show(ui, |ui| {
+        crate::ui::page_title(ui, &app.palette, "Explore");
         top_buttons(app, ui);
 
         // One snapshot for the frame — a refcount bump, not a copy of every shelf. The

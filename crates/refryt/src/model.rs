@@ -270,12 +270,12 @@ impl Entry {
     /// The word shown in the row's type badge.
     pub fn kind(&self) -> &'static str {
         match self {
-            Entry::Song(_) => "SONG",
-            Entry::Video(_) => "VIDEO",
-            Entry::Artist(_) => "ARTIST",
-            Entry::Album(_) => "ALBUM",
-            Entry::Playlist(_) => "PLAYLIST",
-            Entry::Mood(_) => "MOOD",
+            Entry::Song(_) => "Song",
+            Entry::Video(_) => "Video",
+            Entry::Artist(_) => "Artist",
+            Entry::Album(_) => "Album",
+            Entry::Playlist(_) => "Playlist",
+            Entry::Mood(_) => "Mood",
         }
     }
 
@@ -856,9 +856,67 @@ pub fn parse_duration(s: &str) -> Option<u64> {
     any.then_some(total)
 }
 
+/// Fold "styled" letters back to plain ones: 𝐓𝐢𝐦𝐞𝐥𝐞𝐬𝐬 → Timeless.
+///
+/// Channels write titles in Unicode's Mathematical Alphanumeric Symbols (U+1D400–U+1D7FF) for
+/// bold or script looks. No font we load covers that block, so they drew as a row of boxes, and
+/// each box measured narrower than it painted, so the title ran out of its card. Compatibility
+/// normalisation (NFKC) maps each to the letter or digit it styles. Only that block is touched —
+/// NFKC over whole titles would also rewrite full-width letters, superscripts and ™ — and a
+/// title without any comes back borrowed, untouched.
+pub fn fold_styled_letters(text: &str) -> std::borrow::Cow<'_, str> {
+    let styled = |c: char| ('\u{1D400}'..='\u{1D7FF}').contains(&c);
+    if !text.chars().any(styled) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let nfkc = icu_normalizer::ComposingNormalizerBorrowed::new_nfkc();
+    let mut out = String::with_capacity(text.len());
+    let mut buf = [0u8; 4];
+    for c in text.chars() {
+        if styled(c) {
+            out.push_str(&nfkc.normalize(c.encode_utf8(&mut buf)));
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Styled letters and digits fold to plain ones; everything else passes through untouched,
+    /// and a title with nothing to fold is not copied.
+    #[test]
+    fn styled_letters_fold_to_plain_ones() {
+        assert_eq!(
+            fold_styled_letters("𝐓𝐢𝐦𝐞𝐥𝐞𝐬𝐬 - 𝐏𝐥𝐚𝐲𝐛𝐨𝐢 𝐂𝐚𝐫𝐭𝐢"),
+            "Timeless - Playboi Carti"
+        );
+        assert_eq!(
+            fold_styled_letters("𝘪𝘵𝘢𝘭𝘪𝘤 𝕕𝕠𝕦𝕓𝕝𝕖 𝟐𝟎𝟐𝟒"),
+            "italic double 2024"
+        );
+        assert_eq!(fold_styled_letters("Mix 𝐅𝐫𝐞𝐬𝐡 ²™"), "Mix Fresh ²™");
+        for plain in ["Timeless", "Приятного вечера", "夜に駆ける", "ＦＵＬＬ"]
+        {
+            assert!(
+                matches!(fold_styled_letters(plain), std::borrow::Cow::Borrowed(_)),
+                "{plain}"
+            );
+        }
+    }
+
+    #[test]
+    fn result_kinds_read_as_words() {
+        let mood = Entry::Mood(MoodRef {
+            title: "Chill".to_owned(),
+            params: String::new(),
+            colour: None,
+        });
+        assert_eq!(mood.kind(), "Mood");
+    }
 
     fn song(id: &str) -> Entry {
         Entry::Song(Track {

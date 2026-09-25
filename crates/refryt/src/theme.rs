@@ -589,6 +589,26 @@ mod tests {
         ctx
     }
 
+    /// An emoji written with VARIATION SELECTOR-16 takes its image's width plus a point, whatever
+    /// the text face's own advance for the character — Inter's arrows are much narrower than the
+    /// image, and counting the selector as a box put a wide gap after each. Invisible characters
+    /// take no room.
+    #[test]
+    fn emoji_arrows_sit_side_by_side() {
+        let ctx = fonts_ready();
+        let font = medium(13.5);
+        let one = crate::emoji::emoji_side(13.5) + 1.0;
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let w = |s: &str| crate::widgets::text_width(ui, s, &font);
+            assert!((w("↖\u{FE0F}") - one).abs() < 0.01, "{}", w("↖\u{FE0F}"));
+            assert!((w("↖\u{FE0F}↗\u{FE0F}↘\u{FE0F}") - 3.0 * one).abs() < 0.01);
+            assert_eq!(w("\u{200D}\u{FE0E}\u{2060}"), 0.0);
+            // A character wider than its image keeps its own advance.
+            assert!(w("🫧\u{FE0F}") >= w("🫧"));
+        });
+        frame.textures_delta.clear();
+    }
+
     /// Real playlist names from a real library. Every character has to be drawable — the
     /// alternative is not a missing emoji but a replacement box, which is how these read before
     /// Noto Emoji was bundled: egui's own emoji faces are a 2006 subset with no 🫧 in them, and

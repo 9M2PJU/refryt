@@ -31,6 +31,12 @@ const CACHE_PX: u32 = 48;
 /// Emoji are drawn slightly larger than the nominal font size, as fonts draw them.
 const SIZE_FACTOR: f32 = 1.15;
 
+/// The side of an emoji image drawn at `font_size` — what the text measurer sizes an emoji
+/// written with VARIATION SELECTOR-16 to, so the two agree.
+pub(crate) fn emoji_side(font_size: f32) -> f32 {
+    font_size * SIZE_FACTOR
+}
+
 /// VARIATION SELECTOR-16: "draw the previous character as an emoji". It carries no glyph of its
 /// own and is consumed with the character it follows.
 const VS16: char = '\u{FE0F}';

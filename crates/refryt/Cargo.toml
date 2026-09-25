@@ -53,6 +53,10 @@ rfd = "0.17.2"
 lofty = "0.25.1"
 walkdir = "2.5.0"
 discord-rich-presence = "1.1"
+# Folds the "styled" letters channels write titles in (𝐓𝐢𝐦𝐞𝐥𝐞𝐬𝐬, Unicode's Mathematical
+# Alphanumeric Symbols) back to plain ones, which no bundled font covers. Already compiled for
+# reqwest's IDNA support, at this version, so it adds nothing to the build.
+icu_normalizer = "2.0.1"
 
 # Real acrylic on KDE Wayland: asking KWin to blur what shows through. Two protocols for one
 # job, both already resolved to versions already in the tree — winit pulls the same

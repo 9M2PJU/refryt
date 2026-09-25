@@ -581,7 +581,7 @@ pub struct TrackRow<'a> {
     /// button shows Pause instead of Play when this is set, so you can tell (and press) it to
     /// pause the track that's already going instead of restarting it.
     pub playing: bool,
-    /// A small right-aligned type label ("ARTIST", "ALBUM"), for mixed lists where the rows are
+    /// A small right-aligned type label ("Artist", "Album"), for mixed lists where the rows are
     /// not all songs. Shown in place of the duration, which those rows do not have.
     pub badge: Option<&'a str>,
     pub art: Option<&'a egui::TextureHandle>,
@@ -942,7 +942,14 @@ pub fn marquee_line(
 ) -> Option<egui::Response> {
     let full = text_width(ui, text, &font);
     if full <= max_width {
-        crate::emoji::paint_line(ui, pos, text, font, color);
+        // Clipped to the slot even though it measured as fitting: a measuring mistake must not
+        // paint over whatever sits past the text's own room.
+        let slot = Rect::from_min_max(
+            egui::pos2(pos.x, pos.y - MARQUEE_HIT_H),
+            egui::pos2(pos.x + max_width, pos.y + MARQUEE_HIT_H),
+        )
+        .intersect(ui.clip_rect());
+        crate::emoji::paint_clipped_line(ui, slot, pos, text, font, color);
         return None;
     }
     let id = ui.id().with(id_salt);
@@ -1706,6 +1713,11 @@ fn corner_shares_duration(width: f32, show_rating: bool, has_menu: bool, signed_
     width < 520.0 && show_rating && has_menu && signed_in
 }
 
+/// The type label a mixed list's row carries ("Artist", "Playlist"): quiet, but readable.
+fn badge_font() -> egui::FontId {
+    theme::medium(11.0)
+}
+
 /// A single track row: number (optional), art, title with an explicit badge, artist with play
 /// count, duration.
 ///
@@ -1770,7 +1782,7 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
     // is showing this frame.
     let duration_w = match duration {
         Some(d) => text_width(ui, &fmt_duration(d), &theme::regular(12.0)) + 12.0,
-        None => badge.map_or(0.0, |b| text_width(ui, b, &theme::semibold(9.0)) + 12.0),
+        None => badge.map_or(0.0, |b| text_width(ui, b, &badge_font()) + 12.0),
     }
     .max(if share_corner { 76.0 } else { 44.0 });
     // Reserved whether or not the thumbs are drawn, so a row does not re-truncate its title as
@@ -2057,7 +2069,7 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
                     egui::pos2(rect.right() - right_pad, rect.center().y),
                     egui::Align2::RIGHT_CENTER,
                     badge,
-                    theme::semibold(9.0),
+                    badge_font(),
                     palette.dim,
                 );
             }
@@ -3010,9 +3022,73 @@ fn card_popup<'a>(
         .at_pointer_fixed()
 }
 
+/// Characters that take no room and are never drawn: variation selectors, joiners, bidi marks,
+/// tag characters. They must measure as nothing even though no face "has" them — `has_glyph`
+/// answers no for everything in the emoji face (see `theme::tests::can_draw`), and counting
+/// them as replacement boxes put a box-wide gap after every "↖️".
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x034F
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xE0000..=0xE007F
+            | 0xE0100..=0xE01EF
+    )
+}
+
+/// How wide `c` is painted, after a character `prev` wide.
+///
+/// - A character no font has is drawn as a replacement box by egui, though it measures zero;
+///   measuring the box keeps a title of them from measuring as fitting and running out of its
+///   card.
+/// - VARIATION SELECTOR-16 turns the character before it into a colour emoji, drawn as an
+///   image of its own size ([`crate::emoji`]) whatever the text face's advance for it — Inter's
+///   "↖" is 10.5 pt wide against a 15.5 pt image. The selector makes up the difference, plus a
+///   point of air, so emoji neither overlap nor stand apart.
+/// - Other invisible characters take no room.
+fn painted_width(
+    f: &mut egui::epaint::text::FontsView<'_>,
+    font: &egui::FontId,
+    c: char,
+    prev: f32,
+) -> f32 {
+    if c == '\u{FE0F}' {
+        return (crate::emoji::emoji_side(font.size) + 1.0 - prev).max(0.0);
+    }
+    if is_invisible(c) {
+        return 0.0;
+    }
+    let w = f.glyph_width(font, c);
+    if w == 0.0 && !f.has_glyph(font, c) {
+        f.glyph_width(font, '◻')
+    } else {
+        w
+    }
+}
+
+/// [`painted_width`] summed over `text`.
+fn painted_text_width(
+    f: &mut egui::epaint::text::FontsView<'_>,
+    font: &egui::FontId,
+    text: &str,
+) -> f32 {
+    let mut prev = 0.0;
+    text.chars()
+        .map(|c| {
+            prev = painted_width(f, font, c, prev);
+            prev
+        })
+        .sum()
+}
+
 /// How wide `text` renders in `font`. One font lock, as with [`truncate_to`].
 pub fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
-    ui.fonts_mut(|f| text.chars().map(|c| f.glyph_width(font, c)).sum())
+    ui.fonts_mut(|f| painted_text_width(f, font, text))
 }
 
 /// The largest size in `min..=max` — 2pt steps — at which `text` still fits `max_width`.
@@ -3088,15 +3164,17 @@ pub fn truncate_to<'t>(
     // thousands of acquisitions per frame on a long list, twice per row. The common case —
     // text that already fits — is returned borrowed, with no allocation at all.
     ui.fonts_mut(|f| {
-        let total: f32 = text.chars().map(|c| f.glyph_width(&font, c)).sum();
+        let total = painted_text_width(f, &font, text);
         if total <= max_width {
             return Cow::Borrowed(text);
         }
         let ellipsis_w = f.glyph_width(&font, '…');
         let mut out = String::with_capacity(text.len());
         let mut used = 0.0;
+        let mut prev = 0.0;
         for ch in text.chars() {
-            let w = f.glyph_width(&font, ch);
+            let w = painted_width(f, &font, ch, prev);
+            prev = w;
             if used + w + ellipsis_w > max_width {
                 break;
             }
@@ -3927,6 +4005,31 @@ pub fn volume_slider(ui: &mut Ui, palette: &Palette, volume: f64, unmute_to: f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A character no font has is painted as a replacement box, so it must measure as one: a
+    /// title of them used to measure zero wide, skip truncation, and run out of its card.
+    #[test]
+    fn a_missing_glyph_measures_as_the_box_it_paints() {
+        let ctx = egui::Context::default();
+        let font = egui::FontId::proportional(13.0);
+        // U+E000 is private use: no face covers it, bundled or ours.
+        let (missing, cut) = {
+            let mut out = (0.0, String::new());
+            let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+                out = (
+                    text_width(ui, "\u{E000}\u{E000}\u{E000}", &font),
+                    truncate_to(ui, &"\u{E000}".repeat(40), font.clone(), 60.0).into_owned(),
+                );
+            });
+            frame.textures_delta.clear();
+            out
+        };
+        assert!(missing > 10.0, "three boxes measured {missing}");
+        assert!(
+            cut.ends_with('…') && cut.chars().count() < 40,
+            "not truncated: {cut:?}"
+        );
+    }
 
     /// A skeleton waits 150 ms into its load and then shows; one with no timed load shows at once.
     #[test]
