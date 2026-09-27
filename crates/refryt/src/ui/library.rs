@@ -11,9 +11,9 @@ use crate::ui::{ListClick, art_texture, card_is_visible, centered, failed, track
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
-    crate::ui::page_title(ui, &app.palette, "Your library");
-
+    // The title scrolls away with the page rather than staying pinned over it.
     crate::ui::page_scroll(app, "library").show(ui, |ui| {
+        crate::ui::page_title(ui, &app.palette, "Your library");
         // One section at a time, as the site does. Stacking all five down one page is what left
         // the sidebar duplicating them, and it made every section a scroll away from the sort.
         let mut picked = None;

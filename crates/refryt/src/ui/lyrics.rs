@@ -13,20 +13,9 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     // the end needs its rounded edges.
     let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
     widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &p);
-    ui.add_space(8.0);
-    // The panel's own title, a hair right of the lyrics below it by eye — the same nudge the
-    // queue's own header takes.
-    ui.horizontal(|ui| {
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new("Lyrics")
-                .font(theme::semibold(14.0))
-                .color(p.text),
-        );
-    });
-    ui.add_space(8.0);
 
     if app.lyrics_loading {
+        title(ui, &p);
         ui.horizontal(|ui| {
             ui.add_space(2.0);
             ui.vertical(|ui| widgets::skeleton_lines(ui, &p, 8));
@@ -34,6 +23,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     let Some(lyrics) = app.lyrics.as_ref() else {
+        title(ui, &p);
         let message = app
             .lyrics_error
             .clone()
@@ -69,6 +59,8 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     app.lyrics_active = active;
 
     area.show(ui, |ui| {
+        // Inside the scroll: the title scrolls away with the lyrics rather than staying pinned.
+        title(ui, &p);
         for (i, line) in lyrics.lines.iter().enumerate() {
             let is_active = Some(i) == active;
             let text = egui::RichText::new(if line.text.is_empty() {
@@ -95,4 +87,19 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     // The card's rounded corners, over everything the lyrics drew: the list runs to the card's
     // bottom edge now.
     widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, &p);
+}
+
+/// The panel's own title, a hair right of the lyrics below it by eye — the same nudge the
+/// queue's own header takes.
+fn title(ui: &mut egui::Ui, p: &theme::Palette) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Lyrics")
+                .font(theme::semibold(14.0))
+                .color(p.text),
+        );
+    });
+    ui.add_space(8.0);
 }
