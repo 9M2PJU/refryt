@@ -386,6 +386,10 @@ impl SearchScope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shelf {
     pub title: String,
+    /// The small line YouTube puts above a shelf's title — "Similar to" over an artist's name,
+    /// the account's own name over "Listen again". Without it "Bad Bunny" reads as that artist's
+    /// own shelf rather than artists like them.
+    pub strapline: Option<String>,
     pub items: Vec<Entry>,
     /// Opaque params for fetching the full list, when YouTube offers a "more" button.
     pub more_params: Option<String>,
@@ -842,6 +846,9 @@ pub struct HomeChip {
 pub struct HomeFeed {
     pub shelves: Vec<Shelf>,
     pub chips: Vec<HomeChip>,
+    /// Where the feed continues: the rest is loaded as the listener scrolls toward the end.
+    /// `None` once YouTube has sent it all.
+    pub next: Option<String>,
 }
 
 /// Parse YouTube Music's `"m:ss"` / `"h:mm:ss"` duration strings.

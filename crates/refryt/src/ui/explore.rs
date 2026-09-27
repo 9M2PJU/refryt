@@ -63,7 +63,14 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         for s in shelves.iter() {
             // The Moods & genres shelf knows its full list; the rest scroll with arrows.
             let more = s.is_mood_list().then_some(Route::Moods);
-            shelf_carousel(app, ui, "explore", s, more);
+            shelf_carousel(
+                app,
+                ui,
+                "explore",
+                s,
+                more,
+                crate::ui::MoreButton::Pill("More"),
+            );
         }
     });
 }

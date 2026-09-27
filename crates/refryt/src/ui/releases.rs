@@ -39,7 +39,14 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             return;
         };
         for s in shelves.iter() {
-            shelf_carousel(app, ui, "releases", s, None);
+            shelf_carousel(
+                app,
+                ui,
+                "releases",
+                s,
+                None,
+                crate::ui::MoreButton::Pill("More"),
+            );
         }
     });
 }

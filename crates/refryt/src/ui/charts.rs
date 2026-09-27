@@ -40,7 +40,14 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(8.0);
         }
         for s in feed.shelves.iter() {
-            shelf_carousel(app, ui, "charts", s, None);
+            shelf_carousel(
+                app,
+                ui,
+                "charts",
+                s,
+                None,
+                crate::ui::MoreButton::Pill("More"),
+            );
         }
     });
 }

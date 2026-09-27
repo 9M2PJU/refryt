@@ -9,7 +9,7 @@ use crate::app::{App, Route};
 use crate::auth::AuthState;
 use crate::icons::Icon;
 use crate::theme;
-use crate::ui::{failed, shelf};
+use crate::ui::{failed, shelf_carousel, song_shelf};
 use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
@@ -55,8 +55,109 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             return;
         };
         for s in shelves.iter() {
-            shelf(app, ui, s);
+            home_shelf(app, ui, s);
         }
+
+        // The feed goes on past what is loaded: YouTube serves it three shelves at a time, and
+        // the site keeps loading as you scroll. Within a screen of the end, ask for the next
+        // page; a placeholder shelf stands in while it comes.
+        if app.home_has_more() || app.home_more_loading {
+            let near_end = ui.cursor().top() < ui.clip_rect().bottom() + ui.clip_rect().height();
+            if near_end {
+                app.load_home_more();
+            }
+            if app.home_more_loading {
+                widgets::skeleton_shelf(
+                    ui,
+                    &app.palette,
+                    widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
+                    4,
+                );
+            }
+        }
+        ui.add_space(theme::PAGE_INSET_X);
+    });
+}
+
+/// One Home shelf, in the shape YouTube Music's home gives it: songs as pages of rows, mood
+/// chips as chips, and everything else as one row of cards that scrolls sideways, with "Show
+/// all" opening the whole shelf. Wrapping every shelf's cards into a grid made each one several
+/// rows deep and the page a wall.
+fn home_shelf(app: &mut App, ui: &mut egui::Ui, s: &crate::model::Shelf) {
+    if s.items.is_empty() {
+        return;
+    }
+    if !s.is_mood_list() && s.items.iter().all(|e| e.track().is_some()) {
+        song_shelf(app, ui, "home", s);
+        return;
+    }
+    ui.add_space(20.0);
+    // "Show all" only where there is more than the row already holds — a shelf whose header
+    // names its own full list. Elsewhere the arrows reach every item, and a page repeating them
+    // would add nothing. YouTube Music's own "More" appears on the same shelves.
+    let more = (!s.is_mood_list() && s.more_browse_id.is_some() && s.more_params.is_some())
+        .then(|| Route::HomeShelf(s.title.clone()));
+    shelf_carousel(app, ui, "home", s, more, crate::ui::MoreButton::ShowAll);
+}
+
+/// A Home shelf's "Show all": every item in it, as a grid. Where the shelf named its own full
+/// list (a "more" target), that is fetched and shown; otherwise it is the items Home has.
+pub fn shelf_page(app: &mut App, ui: &mut egui::Ui, title: &str) {
+    let full = app
+        .home_shelf_full
+        .as_ref()
+        .filter(|(t, _)| t == title)
+        .map(|(_, shelf)| std::sync::Arc::clone(shelf));
+    let home = app.home.clone();
+    let from_home = home
+        .as_ref()
+        .and_then(|h| h.iter().find(|s| s.title == title));
+    crate::ui::page_scroll(app, "home-shelf").show(ui, |ui| {
+        crate::ui::page_title(ui, &app.palette, title);
+        let Some(shelf) = full.as_deref().or(from_home) else {
+            if app.home_loading {
+                widgets::skeleton_cards(ui, &app.palette, 10, widgets::ArtShape::Square);
+            } else {
+                crate::ui::centered(app, ui, "This shelf is no longer on Home.");
+            }
+            return;
+        };
+        if let Some(line) = &shelf.strapline {
+            ui.label(
+                egui::RichText::new(line)
+                    .font(theme::medium(12.0))
+                    .color(app.palette.dim),
+            );
+            ui.add_space(8.0);
+        }
+        let signed_in = app.signed_in();
+        let grid = {
+            let App {
+                palette,
+                images,
+                backend,
+                now,
+                library,
+                rail_cache,
+                album_cache,
+                ..
+            } = app;
+            let ctx = crate::ui::ReleaseCtx {
+                playlists: &library.playlists.items,
+                signed_in,
+                rail: rail_cache,
+                albums: album_cache,
+            };
+            crate::ui::entry_grid(ui, palette, images, backend, now, &shelf.items, &ctx)
+        };
+        crate::ui::finish_grid(app, shelf, grid);
+        // The full list is still coming: placeholder cards after the ones already here, so the
+        // page reads as loading the rest rather than as all there is.
+        if full.is_none() && app.home_shelf_loading(title) {
+            ui.add_space(8.0);
+            widgets::skeleton_cards(ui, &app.palette, 10, widgets::ArtShape::Square);
+        }
+        ui.add_space(theme::PAGE_INSET_X);
     });
 }
 

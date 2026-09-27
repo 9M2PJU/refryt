@@ -227,6 +227,8 @@ pub enum Event {
         filter: Option<String>,
         shelves: Vec<Shelf>,
         chips: Vec<crate::model::HomeChip>,
+        /// Where the feed continues; see `HomeFeed::next`.
+        next: Option<String>,
         /// See `LibraryLoaded::epoch`'s own doc comment.
         epoch: u64,
     },
@@ -234,6 +236,27 @@ pub enum Event {
         filter: Option<String>,
         error: String,
         epoch: u64,
+    },
+    /// The next page of the home feed, loaded on scroll.
+    HomeMore {
+        filter: Option<String>,
+        shelves: Vec<Shelf>,
+        next: Option<String>,
+        epoch: u64,
+    },
+    HomeMoreFailed {
+        filter: Option<String>,
+        error: String,
+        epoch: u64,
+    },
+    /// The full list behind a Home shelf's "Show all", from that shelf's own "more" target.
+    HomeShelfLoaded {
+        title: String,
+        items: Vec<crate::model::Entry>,
+    },
+    HomeShelfFailed {
+        title: String,
+        error: String,
     },
     MoodPlaylistsLoaded {
         params: String,
@@ -1407,12 +1430,51 @@ impl Backend {
                     filter,
                     shelves: feed.shelves,
                     chips: feed.chips,
+                    next: feed.next,
                     epoch,
                 },
                 Err(e) => Event::HomeFailed {
                     filter,
                     error: format!("{e:#}"),
                     epoch,
+                },
+            };
+            Self::emit(&tx, &ctx, event);
+        });
+    }
+
+    /// The next page of the home feed; see `Api::home_more`.
+    pub fn fetch_home_more(&self, token: String, filter: Option<String>, epoch: u64) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let event = match api.home_more(token).await {
+                Ok((shelves, next)) => Event::HomeMore {
+                    filter,
+                    shelves,
+                    next,
+                    epoch,
+                },
+                Err(e) => Event::HomeMoreFailed {
+                    filter,
+                    error: format!("{e:#}"),
+                    epoch,
+                },
+            };
+            Self::emit(&tx, &ctx, event);
+        });
+    }
+
+    /// The full list behind a Home shelf's "Show all". The request is the one an artist shelf's
+    /// "Show all" makes — `Api::artist_albums` takes any shelf's (browse id, params) pair and
+    /// picks that shelf's own section out of whatever page answers.
+    pub fn fetch_home_shelf(&self, browse_id: String, params: String, title: String) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let event = match api.artist_albums(&browse_id, &params, &title).await {
+                Ok(items) => Event::HomeShelfLoaded { title, items },
+                Err(e) => Event::HomeShelfFailed {
+                    title,
+                    error: format!("{e:#}"),
                 },
             };
             Self::emit(&tx, &ctx, event);

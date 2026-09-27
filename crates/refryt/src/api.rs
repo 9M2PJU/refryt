@@ -1089,7 +1089,22 @@ impl Api {
         if shelves.is_empty() {
             anyhow::bail!("YouTube returned an empty home feed");
         }
-        Ok(model::HomeFeed { shelves, chips })
+        Ok(model::HomeFeed {
+            shelves,
+            chips,
+            next: token,
+        })
+    }
+
+    /// One more page of the home feed, from the token the last page ended on — what loads as the
+    /// listener scrolls toward the end. The token already names the feed (and its filter), so
+    /// nothing else is needed. Returns the shelves and where the feed continues after them.
+    pub async fn home_more(&self, token: String) -> Result<(Vec<model::Shelf>, Option<String>)> {
+        let json = self.run_browse(BrowseQuery::next_page(token), HOME).await?;
+        Ok((
+            innertube::parse_browse_shelves(&json),
+            innertube::continuation_token(&json),
+        ))
     }
 
     /// The Explore landing: new albums & singles, mood chips, new music videos.
@@ -2590,6 +2605,7 @@ fn map_artist(a: GetArtist) -> model::Artist {
             .collect();
         if !items.is_empty() {
             shelves.push(model::Shelf {
+                strapline: None,
                 title: title.to_owned(),
                 items,
                 more_params,

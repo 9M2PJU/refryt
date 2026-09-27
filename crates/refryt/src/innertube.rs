@@ -1051,6 +1051,7 @@ pub fn parse_browse_shelves(root: &Value) -> Vec<Shelf> {
                     .unwrap_or_default();
                 return (!items.is_empty()).then_some(Shelf {
                     title,
+                    strapline: None,
                     items,
                     more_params: None,
                     more_browse_id: None,
@@ -2117,19 +2118,57 @@ pub fn parse_carousel(carousel: &Value) -> Option<Shelf> {
         .and_then(Value::as_str)
         .map(str::to_owned);
 
+    let strapline = header
+        .and_then(|h| h.get("strapline"))
+        .map(text)
+        .and_then(non_empty)
+        .map(|s| sentence_case(&s));
+
+    // Cards, or song rows: Quick picks, "Covers and remixes" and the other song lists on Home
+    // arrive as carousels of `musicResponsiveListItemRenderer` rows (2026-09), not the
+    // `musicShelfRenderer` they used to — read as cards only, every one of them was dropped.
     let items: Vec<Entry> = carousel
         .get("contents")
         .and_then(Value::as_array)
-        .map(|list| list.iter().filter_map(parse_card).collect())
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| {
+                    parse_card(item)
+                        .or_else(|| parse_search_row(item.get("musicResponsiveListItemRenderer")?))
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     (!items.is_empty()).then_some(Shelf {
         title,
+        strapline,
         items,
         more_params,
         more_browse_id,
         expanded: false,
     })
+}
+
+/// "SIMILAR TO" → "Similar to": YouTube writes its strapline *labels* in capitals, and the app
+/// draws no text in all caps.
+///
+/// A strapline can also be the account's own name (over "Listen again"), and nothing in the
+/// header says which it is — both carry a thumbnail and the same header style. Labels are
+/// phrases and names here are one word ("IV"), so only an all-caps line of several words is
+/// recased; anything else is left exactly as written.
+fn sentence_case(s: &str) -> String {
+    if s.chars().any(char::is_lowercase) || s.split_whitespace().count() < 2 {
+        return s.to_owned();
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first
+            .to_uppercase()
+            .chain(chars.flat_map(char::to_lowercase))
+            .collect(),
+        None => String::new(),
+    }
 }
 
 /// One carousel item: a card, or a "Moods & genres" chip.
@@ -2579,6 +2618,61 @@ mod tests {
                 assert!(kinds.contains(&want), "{fixture}: no {want} in {kinds:?}");
             }
         }
+    }
+
+    /// Quick picks as YouTube sends it since 2026-09: a carousel of song *rows*
+    /// (`musicResponsiveListItemRenderer`), not cards. Read as cards only, it vanished.
+    #[test]
+    fn a_carousel_of_song_rows_is_a_shelf_of_songs() {
+        let raw = include_str!("../fixtures/home-quick-picks-carousel.json");
+        let section: Value = serde_json::from_str(raw).unwrap();
+        let shelf = parse_carousel(&section["musicCarouselShelfRenderer"]).expect("parsed");
+        assert_eq!(shelf.title, "Quick picks");
+        let titles: Vec<&str> = shelf.items.iter().map(Entry::title).collect();
+        assert_eq!(titles, ["promise", "ALL SPEAKERS GO TO HEAVEN", "群青"]);
+        assert!(
+            shelf.items.iter().all(|e| e.track().is_some()),
+            "all playable songs"
+        );
+        let first = shelf.items[0].track().unwrap();
+        assert!(!first.video_id.is_empty());
+        assert_eq!(first.artists[0].name, "slayr");
+    }
+
+    /// A strapline label is recased; a name standing in the same slot is not.
+    #[test]
+    fn straplines_are_read_and_labels_lose_their_capitals() {
+        let header = |strap: &str| {
+            serde_json::json!({
+                "header": {"musicCarouselShelfBasicHeaderRenderer": {
+                    "title": {"runs": [{"text": "Bad Bunny"}]},
+                    "strapline": {"runs": [{"text": strap}]},
+                }},
+                "contents": [{"musicTwoRowItemRenderer": {
+                    "title": {"runs": [{"text": "Artist"}]},
+                    "navigationEndpoint": {"browseEndpoint": {
+                        "browseId": "UC123",
+                        "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"}}
+                    }}
+                }}],
+            })
+        };
+        let similar = parse_carousel(&header("SIMILAR TO")).expect("parsed");
+        assert_eq!(similar.title, "Bad Bunny");
+        assert_eq!(similar.strapline.as_deref(), Some("Similar to"));
+        let name = parse_carousel(&header("IV")).expect("parsed");
+        assert_eq!(
+            name.strapline.as_deref(),
+            Some("IV"),
+            "a one-word name keeps its case"
+        );
+
+        assert_eq!(
+            sentence_case("DANCE YOUR STRESS AWAY"),
+            "Dance your stress away"
+        );
+        assert_eq!(sentence_case("Made for you"), "Made for you");
     }
 
     /// The old `musicShelfRenderer` shape still parses, so a flip back is not an outage.

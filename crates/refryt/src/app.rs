@@ -272,6 +272,8 @@ enum Load {
     Charts,
     Moods,
     Library,
+    /// A Home shelf's full list, behind its "Show all".
+    HomeShelf,
     /// The radio topping the queue up. Nobody asked for it this moment.
     Radio,
     /// The sidebar's playlists refreshing in the background.
@@ -286,6 +288,15 @@ impl Load {
     fn shows_skeleton(self) -> bool {
         !matches!(self, Load::Radio | Load::SidebarPlaylists | Load::Song)
     }
+}
+
+/// How old the home feed may get before a visit to Home reloads it.
+const HOME_STALE: Duration = Duration::from_secs(30 * 60);
+
+/// Whether a feed fetched at `loaded_at` is due a refresh by `now`. A feed with no time is
+/// not stale: it has not loaded yet, and loading it is `load_home`'s job.
+fn home_is_stale(loaded_at: Option<Instant>, now: Instant) -> bool {
+    loaded_at.is_some_and(|at| now.saturating_duration_since(at) >= HOME_STALE)
 }
 
 /// How long a playing track's position may go unsaved. A crash loses at most this much of where
@@ -487,6 +498,9 @@ pub enum Route {
     Playlist(String),
     /// A mood's playlists. The payload is the opaque params string from `MoodRef`.
     Mood(String),
+    /// A Home shelf's "Show all": every item in it, by the shelf's title. The title rather than
+    /// its position, so loading more of the feed or refreshing it does not repoint the page.
+    HomeShelf(String),
 }
 
 impl Route {
@@ -511,6 +525,7 @@ impl Route {
                 Some(("artistliked", id)) => Some(Route::ArtistLiked(id.to_owned())),
                 Some(("album", id)) => Some(Route::Album(id.to_owned())),
                 Some(("playlist", id)) => Some(Route::Playlist(id.to_owned())),
+                Some(("homeshelf", title)) => Some(Route::HomeShelf(title.to_owned())),
                 _ => None,
             },
         }
@@ -1269,6 +1284,18 @@ pub struct App {
     /// goes through `Arc::make_mut`, which copies once and leaves the frame's snapshot alone.
     pub(crate) home: Option<Arc<Vec<crate::model::Shelf>>>,
     pub(crate) home_loading: bool,
+    /// Where the feed continues past what is loaded; the next page is fetched as the listener
+    /// scrolls toward the end. `None` once YouTube has sent it all.
+    home_next: Option<String>,
+    pub(crate) home_more_loading: bool,
+    /// When the feed on screen was fetched: a visit to Home after [`HOME_STALE`] reloads it.
+    home_loaded_at: Option<Instant>,
+    /// A stale feed is being replaced: the old shelves stay up until the new ones land.
+    home_refreshing: bool,
+    /// The full list behind the "Show all" page open now, by shelf title, when that shelf had a
+    /// "more" target to fetch it from. Without one the page shows the shelf's own items.
+    pub(crate) home_shelf_full: Option<(String, Arc<crate::model::Shelf>)>,
+    home_shelf_loading: Option<String>,
     pub(crate) home_error: Option<String>,
     /// The mood bar above the feed (Workout, Relax, …). Parsed from the same browse.
     pub(crate) home_chips: Vec<crate::model::HomeChip>,
@@ -1720,6 +1747,12 @@ impl App {
             artist_liked_sort: PlaylistSort::default(),
             home: None,
             home_loading: false,
+            home_next: None,
+            home_more_loading: false,
+            home_loaded_at: None,
+            home_refreshing: false,
+            home_shelf_full: None,
+            home_shelf_loading: None,
             home_error: None,
             home_chips: Vec::new(),
             home_filter: None,
@@ -1928,7 +1961,7 @@ impl App {
         self.liked_buffer.clear();
         self.liked_dirty = false;
         crate::liked::remove();
-        self.home = None;
+        self.clear_home();
         self.home_error = None;
         self.history_shelves = None;
         self.history_error = None;
@@ -2690,6 +2723,9 @@ impl App {
     /// new visit has begun. The shelves on screen are deliberately kept: a revisit refreshes
     /// underneath the old list rather than flashing the skeleton.
     fn note_route_entered(&mut self) {
+        if matches!(self.current_route(), Route::Home) {
+            self.refresh_home_if_stale();
+        }
         if matches!(self.current_route(), Route::History) {
             self.history_error = None;
             self.history_invalidate();
@@ -2781,6 +2817,11 @@ impl App {
             Route::Mood(params) => self.load_mood_playlists(params),
             Route::Library => self.load_library(),
             Route::Home => self.load_home(),
+            // Its shelf comes from the home feed, so the feed must be there first.
+            Route::HomeShelf(title) => {
+                self.load_home();
+                self.load_home_shelf(&title);
+            }
             Route::Explore => self.load_explore(),
             Route::NewReleases => self.load_new_releases(),
             Route::Charts(params) => self.load_charts(params),
@@ -2945,6 +2986,88 @@ impl App {
         }
     }
 
+    /// Empty the home feed and everything that hangs off it — for a sign-out, an account
+    /// switch, a new filter.
+    fn clear_home(&mut self) {
+        self.home = None;
+        self.home_error = None;
+        self.home_next = None;
+        self.home_more_loading = false;
+        self.home_loaded_at = None;
+        self.home_refreshing = false;
+        self.home_shelf_full = None;
+        self.home_shelf_loading = None;
+    }
+
+    /// Fetch the next page of the home feed, once, if there is one.
+    pub(crate) fn load_home_more(&mut self) {
+        if self.home_more_loading || self.home_loading {
+            return;
+        }
+        let Some(token) = self.home_next.clone() else {
+            return;
+        };
+        self.home_more_loading = true;
+        tracing::debug!("home: loading the next page of the feed");
+        self.backend
+            .fetch_home_more(token, self.home_filter.clone(), self.account_epoch);
+    }
+
+    /// Whether the full list behind this shelf's "Show all" is on its way.
+    pub(crate) fn home_shelf_loading(&self, title: &str) -> bool {
+        self.home_shelf_loading.as_deref() == Some(title)
+    }
+
+    /// Whether the feed still has pages to load.
+    pub(crate) fn home_has_more(&self) -> bool {
+        self.home_next.is_some()
+    }
+
+    /// Opening Home to a feed older than [`HOME_STALE`] reloads it underneath the shelves on
+    /// screen, which stay until the new ones land. Only on entering the page: a feed is never
+    /// swapped out while it is being looked at.
+    fn refresh_home_if_stale(&mut self) {
+        if self.home.is_none() || self.home_loading || self.home_refreshing {
+            return;
+        }
+        if !home_is_stale(self.home_loaded_at, Instant::now()) {
+            return;
+        }
+        tracing::info!("home feed is stale; refreshing it");
+        self.home_refreshing = true;
+        self.home_loading = true;
+        self.backend
+            .fetch_home(self.home_filter.clone(), self.account_epoch);
+    }
+
+    /// The full list behind a Home shelf's "Show all", when the shelf names where to get it.
+    fn load_home_shelf(&mut self, title: &str) {
+        if self
+            .home_shelf_full
+            .as_ref()
+            .is_some_and(|(t, _)| t == title)
+            || self.home_shelf_loading.as_deref() == Some(title)
+        {
+            return;
+        }
+        let Some(shelf) = self
+            .home
+            .as_ref()
+            .and_then(|h| h.iter().find(|s| s.title == title))
+        else {
+            return;
+        };
+        let (Some(browse_id), Some(params)) =
+            (shelf.more_browse_id.clone(), shelf.more_params.clone())
+        else {
+            return;
+        };
+        self.home_shelf_full = None;
+        self.home_shelf_loading = Some(title.to_owned());
+        self.backend
+            .fetch_home_shelf(browse_id, params, title.to_owned());
+    }
+
     /// Filter the home feed through a mood-bar chip. `None` clears back to the default feed,
     /// as the site does when the selected chip is clicked again. The scroll reset is sticky:
     /// the filtered feed arrives frames later, and it must open at the top, not at the old
@@ -2954,7 +3077,7 @@ impl App {
             return;
         }
         self.home_filter = params;
-        self.home = None;
+        self.clear_home();
         self.home_error = None;
         self.home_loading = true;
         self.scroll_to_top = true;
@@ -3017,7 +3140,7 @@ impl App {
             }
             Route::Home => {
                 self.home_error = None;
-                self.home = None;
+                self.clear_home();
             }
             Route::Explore => {
                 self.explore_error = None;
@@ -3040,6 +3163,10 @@ impl App {
                 self.history_error = None;
                 self.history_shelves = None;
                 self.history_invalidate();
+            }
+            Route::HomeShelf(_) => {
+                self.home_shelf_full = None;
+                self.home_shelf_loading = None;
             }
             Route::Search | Route::Settings => return,
         }
@@ -3199,6 +3326,7 @@ impl App {
             (self.charts_loading, Load::Charts),
             (self.moods_loading, Load::Moods),
             (self.library_loading, Load::Library),
+            (self.home_shelf_loading.is_some(), Load::HomeShelf),
             (self.radio_loading, Load::Radio),
             (self.library.playlists.loading, Load::SidebarPlaylists),
             (self.now.resolving, Load::Song),
@@ -3946,6 +4074,7 @@ impl App {
                     filter,
                     shelves,
                     chips,
+                    next,
                     epoch,
                 } => {
                     // A reply for a filter since changed, or an account since switched away
@@ -3953,8 +4082,12 @@ impl App {
                     // another's chips, or one account's feed under another's.
                     if self.home_filter == filter && epoch == self.account_epoch {
                         self.home_loading = false;
+                        self.home_refreshing = false;
                         self.home = Some(Arc::new(shelves));
                         self.home_chips = chips;
+                        self.home_next = next;
+                        self.home_more_loading = false;
+                        self.home_loaded_at = Some(Instant::now());
                     }
                 }
                 Event::HomeFailed {
@@ -3964,7 +4097,66 @@ impl App {
                 } => {
                     if self.home_filter == filter && epoch == self.account_epoch {
                         self.home_loading = false;
-                        self.home_error = Some(error);
+                        if self.home_refreshing {
+                            // A refresh that failed keeps the feed already on screen.
+                            self.home_refreshing = false;
+                            tracing::warn!(%error, "home refresh failed; keeping the old feed");
+                        } else {
+                            self.home_error = Some(error);
+                        }
+                    }
+                }
+                Event::HomeMore {
+                    filter,
+                    shelves,
+                    next,
+                    epoch,
+                } => {
+                    if self.home_filter == filter && epoch == self.account_epoch {
+                        self.home_more_loading = false;
+                        tracing::debug!(
+                            shelves = shelves.len(),
+                            more = next.is_some(),
+                            "home: next page landed"
+                        );
+                        self.home_next = next;
+                        if let Some(home) = &mut self.home {
+                            Arc::make_mut(home).extend(shelves);
+                        }
+                    }
+                }
+                Event::HomeMoreFailed {
+                    filter,
+                    error,
+                    epoch,
+                } => {
+                    if self.home_filter == filter && epoch == self.account_epoch {
+                        self.home_more_loading = false;
+                        // The end of what can be loaded, rather than asking again every frame.
+                        self.home_next = None;
+                        tracing::warn!(%error, "could not load more of the home feed");
+                    }
+                }
+                Event::HomeShelfLoaded { title, items } => {
+                    if self.home_shelf_loading.as_deref() == Some(title.as_str()) {
+                        self.home_shelf_loading = None;
+                        let base = self
+                            .home
+                            .as_ref()
+                            .and_then(|h| h.iter().find(|s| s.title == title).cloned());
+                        if let Some(mut shelf) = base
+                            && !items.is_empty()
+                        {
+                            shelf.items = items;
+                            shelf.expanded = true;
+                            self.home_shelf_full = Some((title, Arc::new(shelf)));
+                        }
+                    }
+                }
+                Event::HomeShelfFailed { title, error } => {
+                    if self.home_shelf_loading.as_deref() == Some(title.as_str()) {
+                        self.home_shelf_loading = None;
+                        tracing::warn!(%title, %error, "could not load a home shelf in full");
                     }
                 }
 
@@ -4025,7 +4217,7 @@ impl App {
                             // user can see, the same content.
                             if !was_checking {
                                 self.account_epoch += 1;
-                                self.home = None;
+                                self.clear_home();
                                 self.home_error = None;
                                 self.history_shelves = None;
                                 self.history_error = None;
@@ -4065,7 +4257,7 @@ impl App {
                             // stay visible signed out too.
                             self.resync_local_playlists();
                             // The feed is personalised; a session change invalidates it.
-                            self.home = None;
+                            self.clear_home();
                             self.home_error = None;
                             self.history_shelves = None;
                             self.history_error = None;
@@ -6233,6 +6425,7 @@ impl eframe::App for App {
                     Route::NewReleases => ui::releases::page(self, ui),
                     Route::Charts(_) => ui::charts::page(self, ui),
                     Route::Moods => ui::moods::page(self, ui),
+                    Route::HomeShelf(title) => ui::home::shelf_page(self, ui, &title),
                     Route::History => ui::history::page(self, ui),
                     Route::Home => ui::home::page(self, ui),
                     Route::Library => ui::library::page(self, ui),
@@ -6480,6 +6673,20 @@ mod tests {
 
     fn artist(id: &str) -> Route {
         Route::Artist(id.to_owned())
+    }
+
+    /// A feed is due a refresh once it is `HOME_STALE` old, and never before it has loaded.
+    #[test]
+    fn home_goes_stale_after_half_an_hour() {
+        let now = Instant::now() + HOME_STALE * 2;
+        assert!(!home_is_stale(None, now));
+        assert!(!home_is_stale(Some(now - Duration::from_secs(60)), now));
+        assert!(!home_is_stale(
+            Some(now - (HOME_STALE - Duration::from_secs(1))),
+            now
+        ));
+        assert!(home_is_stale(Some(now - HOME_STALE), now));
+        assert!(home_is_stale(Some(now - HOME_STALE * 2), now));
     }
 
     /// Background work and the song's own load never show page skeletons; every page load does.

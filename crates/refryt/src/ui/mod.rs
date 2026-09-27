@@ -640,13 +640,18 @@ fn paint_grid_cell<'d>(
     (click, hit.action)
 }
 
-/// Rows in one page of a track grid. Three columns of five is the target; see [`spec_pages`].
+/// Rows in one page of the artist page's Top songs grid: three columns of five. Home's song
+/// shelves page four rows at a time, the way YouTube Music's own home does; see
+/// [`HOME_SONG_ROWS`].
 const ROWS_PER_PAGE: usize = 5;
+
+/// Rows in one page of a Home song shelf (Quick picks and the like).
+pub(crate) const HOME_SONG_ROWS: usize = 4;
 
 /// The queue position a paged grid cell shows. Columns fill top to bottom before the next
 /// begins, so the numbers read 1-5, 6-10, 11-15 rather than across the rows.
-fn grid_index(start: usize, col: usize, row: usize) -> usize {
-    start + col * ROWS_PER_PAGE + row
+fn grid_index(start: usize, col: usize, row: usize, rows: usize) -> usize {
+    start + col * rows + row
 }
 
 /// A short, bounded track list — Top Songs — capped to 5 rows with ‹ › arrows to page through
@@ -664,12 +669,14 @@ fn spec_pages<'d>(
     backend: &Backend,
     stats: &mut crate::stats::Stats,
     heading: &str,
+    strapline: Option<&str>,
     count: usize,
     cols: usize,
+    rows: usize,
     id_salt: impl std::hash::Hash + std::fmt::Debug,
     spec: impl Fn(usize) -> RowSpec<'d>,
 ) -> ListOutcome {
-    let per_page = (cols * ROWS_PER_PAGE).max(1);
+    let per_page = (cols * rows).max(1);
     let pages = count.div_ceil(per_page).max(1);
 
     let id = ui.id().with(("track-shelf-page", id_salt));
@@ -680,6 +687,9 @@ fn spec_pages<'d>(
         .min(pages - 1);
 
     ui.add_space(20.0);
+    if let Some(line) = strapline {
+        shelf_strapline(ui, palette, line);
+    }
     let heading_label = || {
         egui::RichText::new(heading)
             .font(theme::bold(theme::SECTION_PT))
@@ -737,11 +747,11 @@ fn spec_pages<'d>(
     // Filled down each column, not across the rows: the numbers read 1-5 down the first
     // column, 6-10 down the second, and so on. A row-major fill put 1,2,3 across the top, so
     // reading a column gave 1,4,7,10.
-    let rows_here = (end - start).min(ROWS_PER_PAGE);
+    let rows_here = (end - start).min(rows);
     for r in 0..rows_here {
         let top_left = ui.cursor().min;
         for c in 0..cols {
-            let i = grid_index(start, c, r);
+            let i = grid_index(start, c, r, rows);
             if i >= end {
                 break;
             }
@@ -899,47 +909,66 @@ pub(crate) fn track_shelf_pages(
         backend,
         stats,
         heading,
+        None,
         tracks.len(),
         cols,
+        ROWS_PER_PAGE,
         id_salt,
         |i| {
-            let t = &tracks[i];
-            RowSpec {
-                number: numbered.then_some(i + 1),
-                rank: t.rank.as_deref(),
-                trend: t.trend,
-                title: &t.title,
-                album_id: t.album_id.as_deref(),
-                // No album in this shelf's subtitle, at any column count: the list is drawn in
-                // narrow columns (1–3 of them inside the artist page's own layout), where
-                // "artist • album • plays" is clipped mid-word before the plays even show. The
-                // title itself still links to the album.
-                subtitle: track_subtitle_inner(t, true),
-                duration: t.duration,
-                plays: t.plays.as_deref(),
-                explicit: t.explicit,
-                active: is_active(now, &t.video_id),
-                playing: is_active(now, &t.video_id) && !now.paused,
-                badge: None,
-                // Square, always: `t.wide` marks a music video for playback (the resolver
-                // swaps in an audio-only id), but the cover art in a song list is the
-                // album/playlist art and a 16:9 slot only crops it.
-                shape: widgets::ArtShape::Square,
-                hide_art: false,
-                thumbnail: t.thumbnail.as_ref(),
-                menu: Some(widgets::RowMenu {
-                    track: t,
-                    playlist_id: None,
-                    playlists,
-                    signed_in,
-                    queue_index: None,
-                }),
-                like: t.like,
-                show_rating: true,
-                quiet_like: false,
-            }
+            shelf_track_spec(
+                &tracks[i],
+                numbered.then_some(i + 1),
+                now,
+                playlists,
+                signed_in,
+            )
         },
     )
+}
+
+/// One song in a paged song shelf — the artist page's Top songs and Home's song shelves draw
+/// their rows the same way.
+pub(crate) fn shelf_track_spec<'a>(
+    t: &'a crate::model::Track,
+    number: Option<usize>,
+    now: &crate::player::NowPlaying,
+    playlists: &'a [PlaylistRef],
+    signed_in: bool,
+) -> RowSpec<'a> {
+    RowSpec {
+        number,
+        rank: t.rank.as_deref(),
+        trend: t.trend,
+        title: &t.title,
+        album_id: t.album_id.as_deref(),
+        // No album in this shelf's subtitle, at any column count: the list is drawn in
+        // narrow columns (1–3 of them inside the artist page's own layout), where
+        // "artist • album • plays" is clipped mid-word before the plays even show. The
+        // title itself still links to the album.
+        subtitle: track_subtitle_inner(t, true),
+        duration: t.duration,
+        plays: t.plays.as_deref(),
+        explicit: t.explicit,
+        active: is_active(now, &t.video_id),
+        playing: is_active(now, &t.video_id) && !now.paused,
+        badge: None,
+        // Square, always: `t.wide` marks a music video for playback (the resolver
+        // swaps in an audio-only id), but the cover art in a song list is the
+        // album/playlist art and a 16:9 slot only crops it.
+        shape: widgets::ArtShape::Square,
+        hide_art: false,
+        thumbnail: t.thumbnail.as_ref(),
+        menu: Some(widgets::RowMenu {
+            track: t,
+            playlist_id: None,
+            playlists,
+            signed_in,
+            queue_index: None,
+        }),
+        like: t.like,
+        show_rating: true,
+        quiet_like: false,
+    }
 }
 
 /// A grid of cards for a list of entries. Returns the index that was clicked.
@@ -1195,8 +1224,37 @@ pub(crate) struct GridOutcome {
 
 /// One page step inside a carousel: never leaves `0..=max`, so the arrows cannot strand the
 /// row halfway past either end. Pure, so the bounds are unit-testable without an egui context.
-fn carousel_step(off: f32, dir: f32, view: f32, total: f32) -> f32 {
-    (off + dir * view).clamp(0.0, (total - view).max(0.0))
+///
+/// Steps land on whole pages — `page` is exactly one screenful of cards, gap included — so
+/// every page starts on a card's edge, and the last one is pulled back to end on the last card.
+fn carousel_step(off: f32, dir: f32, page: f32, view: f32, total: f32) -> f32 {
+    let max = (total - view).max(0.0);
+    let from = if page > 0.0 {
+        (off / page).round()
+    } else {
+        0.0
+    };
+    ((from + dir) * page).clamp(0.0, max)
+}
+
+/// Where a carousel scrolled to `off` belongs after its cards change size: the card that was
+/// first in view (by the old `pitch`, card plus gap) keeps the left edge at the new `pitch`.
+fn carousel_refit(off: f32, old_pitch: f32, new_pitch: f32, max: f32) -> f32 {
+    let first = if old_pitch > 0.0 {
+        (off / old_pitch).round()
+    } else {
+        0.0
+    };
+    (first * new_pitch).clamp(0.0, max)
+}
+
+/// How many cards a carousel shows across `view`, and how wide each is, so a whole number of
+/// them fills the row exactly — no card cut in half at the right edge. The count is the one
+/// nearest to cards of `base` width, so cards stay about their usual size and only stretch or
+/// shrink by the fraction it takes to fit.
+fn carousel_fit(view: f32, gap: f32, base: f32) -> (usize, f32) {
+    let n = ((view + gap) / (base + gap)).round().max(1.0);
+    (n as usize, ((view - (n - 1.0) * gap) / n).max(1.0))
 }
 
 /// A shelf as a horizontal carousel: the reference's shape, with ‹ › arrows scrolling by a
@@ -1213,10 +1271,12 @@ pub(crate) fn carousel(
     backend: &Backend,
     now: &crate::player::NowPlaying,
     title: &str,
+    strapline: Option<&str>,
     salt: impl std::hash::Hash + std::fmt::Debug + Copy,
     items: &[Entry],
     ctx: &ReleaseCtx<'_>,
     more: Option<Route>,
+    more_button: MoreButton,
 ) -> GridOutcome {
     let mut clicked = None;
     let mut played = None;
@@ -1228,9 +1288,29 @@ pub(crate) fn carousel(
     let off: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
     let view = ui.available_width();
     let gap = 8.0;
-    let total = items.len() as f32 * CARD_W + items.len().saturating_sub(1) as f32 * gap;
+    // Cards sized so the row holds a whole number of them; the arrows then move by exactly
+    // that many, so no page ever shows half a card at its edge.
+    let (per_page, card_w) = carousel_fit(view, gap, CARD_W);
+    let page = per_page as f32 * (card_w + gap);
+    let total = items.len() as f32 * card_w + items.len().saturating_sub(1) as f32 * gap;
     let max = (total - view).max(0.0);
 
+    // The row's width changed — the window resized, the queue or lyrics opened or closed — so
+    // the cards did too, and an offset kept in points would now land partway into one. Keep the
+    // card that was first in view at the left edge instead.
+    let width_id = id.with("width");
+    let last_card_w: Option<f32> = ui.ctx().data(|d| d.get_temp(width_id));
+    ui.ctx().data_mut(|d| d.insert_temp(width_id, card_w));
+    if let Some(old_w) = last_card_w
+        && (old_w - card_w).abs() > 0.5
+    {
+        let refit = carousel_refit(off, old_w + gap, card_w + gap, max);
+        ui.ctx().data_mut(|d| d.insert_temp(id, refit));
+    }
+
+    if let Some(line) = strapline {
+        shelf_strapline(ui, palette, line);
+    }
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(title)
@@ -1240,24 +1320,51 @@ pub(crate) fn carousel(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let left_on = off > 1.0;
             let right_on = off < max - 1.0;
-            ui.add_enabled_ui(right_on, |ui| {
-                if widgets::icon_button(ui, palette, crate::icons::Icon::ChevronRight, 14.0, false)
+            // No arrows when the whole shelf fits: there is nowhere for them to go. A narrower
+            // window (or the queue or lyrics opening) that leaves cards out of view brings them
+            // in; once there is somewhere to scroll, both show, the unusable one dimmed.
+            // Not drawn at all (not merely hidden), so "Show all" moves to the edge they held.
+            if max > 1.0 {
+                ui.add_enabled_ui(right_on, |ui| {
+                    if widgets::icon_button(
+                        ui,
+                        palette,
+                        crate::icons::Icon::ChevronRight,
+                        14.0,
+                        false,
+                    )
                     .clicked()
-                {
-                    let next = carousel_step(off, 1.0, view, total);
-                    ui.ctx().data_mut(|d| d.insert_temp(id, next));
-                }
-            });
-            ui.add_enabled_ui(left_on, |ui| {
-                if widgets::icon_button(ui, palette, crate::icons::Icon::ChevronLeft, 14.0, false)
+                    {
+                        let next = carousel_step(off, 1.0, page, view, total);
+                        ui.ctx().data_mut(|d| d.insert_temp(id, next));
+                    }
+                });
+                ui.add_enabled_ui(left_on, |ui| {
+                    if widgets::icon_button(
+                        ui,
+                        palette,
+                        crate::icons::Icon::ChevronLeft,
+                        14.0,
+                        false,
+                    )
                     .clicked()
-                {
-                    let next = carousel_step(off, -1.0, view, total);
-                    ui.ctx().data_mut(|d| d.insert_temp(id, next));
+                    {
+                        let next = carousel_step(off, -1.0, page, view, total);
+                        ui.ctx().data_mut(|d| d.insert_temp(id, next));
+                    }
+                });
+            }
+            if more.is_some() {
+                let pressed = match more_button {
+                    MoreButton::Pill(label) => widgets::pill_button(ui, palette, label).clicked(),
+                    MoreButton::ShowAll => {
+                        ui.add_space(6.0);
+                        shelf_show_all(ui, palette).clicked()
+                    }
+                };
+                if pressed {
+                    more_pressed = true;
                 }
-            });
-            if more.is_some() && widgets::pill_button(ui, palette, "More").clicked() {
-                more_pressed = true;
             }
         });
     });
@@ -1274,7 +1381,7 @@ pub(crate) fn carousel(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for (i, item) in items.iter().enumerate() {
-                let card = grid_card(ui, palette, images, backend, now, item, ctx, CARD_W);
+                let card = grid_card(ui, palette, images, backend, now, item, ctx, card_w);
                 if action.is_none() {
                     action = card.action;
                 }
@@ -1388,46 +1495,6 @@ pub(crate) fn mood_chips<'a>(
     clicked
 }
 
-/// Render one shelf — a track list when it is all songs, a card grid otherwise — and report what
-/// the user did with it.
-pub(crate) fn shelf(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: &Shelf) {
-    if shelf.items.is_empty() {
-        return;
-    }
-    section(ui, &app.palette, &shelf.title);
-
-    if shelf.is_mood_list() {
-        if let Some(i) = mood_chips(ui, &app.palette, shelf.items.iter().map(entry_chip))
-            && let Some(route) = shelf.items.get(i).and_then(entry_route)
-        {
-            app.navigate(route);
-        }
-        return;
-    }
-
-    let signed_in = app.signed_in();
-    let grid = {
-        let crate::app::App {
-            palette,
-            images,
-            backend,
-            now,
-            library,
-            rail_cache,
-            album_cache,
-            ..
-        } = app;
-        let ctx = ReleaseCtx {
-            playlists: &library.playlists.items,
-            signed_in,
-            rail: rail_cache,
-            albums: album_cache,
-        };
-        entry_grid(ui, palette, images, backend, now, &shelf.items, &ctx)
-    };
-    finish_grid(app, shelf, grid);
-}
-
 /// The same shelf with its card grid as a carousel — the reference's shape. Track lists and
 /// mood chips are unchanged; only grids scroll sideways. `more` is the carousel's More pill
 /// destination, if the caller has somewhere for it to go.
@@ -1437,6 +1504,7 @@ pub(crate) fn shelf_carousel(
     page_salt: &str,
     shelf: &Shelf,
     more: Option<Route>,
+    more_button: MoreButton,
 ) {
     if shelf.items.is_empty() {
         return;
@@ -1476,12 +1544,14 @@ pub(crate) fn shelf_carousel(
             backend,
             now,
             &shelf.title,
+            shelf.strapline.as_deref(),
             // Hashed into the carousel's scroll-offset id — a tuple hashes without the
             // per-shelf-per-frame `format!` a joined string needed.
             (page_salt, shelf.title.as_str()),
             &shelf.items,
             &ctx,
             more.clone(),
+            more_button,
         )
     };
     if grid.more
@@ -2412,7 +2482,7 @@ pub(crate) fn entry_rows(app: &mut crate::app::App, ui: &mut egui::Ui, items: &[
 }
 
 /// What a card grid — wrapped or carousel — does with a click or a menu choice.
-fn finish_grid(app: &mut crate::app::App, shelf: &Shelf, grid: GridOutcome) {
+pub(crate) fn finish_grid(app: &mut crate::app::App, shelf: &Shelf, grid: GridOutcome) {
     if let Some(action) = grid.action {
         app.row_action(action);
     }
@@ -2513,6 +2583,77 @@ pub(crate) fn page_title(ui: &mut egui::Ui, palette: &theme::Palette, text: &str
 const PAGE_TITLE_LEAD: f32 = theme::PAGE_TITLE_PT * 0.18;
 
 /// A section heading, e.g. "Top songs" between blocks of a page.
+/// How a carousel offers the rest of its shelf.
+#[derive(Clone, Copy)]
+pub(crate) enum MoreButton {
+    /// A pill with this label — Explore's "More", a way on to a different page.
+    Pill(&'static str),
+    /// The quiet "Show all" link the artist page's shelves use: the whole of this shelf.
+    ShowAll,
+}
+
+/// The small line over a shelf's title — "Similar to" over an artist's name.
+fn shelf_strapline(ui: &mut egui::Ui, palette: &theme::Palette, line: &str) {
+    ui.label(
+        egui::RichText::new(line)
+            .font(theme::medium(11.0))
+            .color(palette.dim),
+    );
+    ui.add_space(-4.0);
+}
+
+/// A shelf of songs — Quick picks and the other song lists on Home — as pages of
+/// [`HOME_SONG_ROWS`] rows in up to three columns, paged sideways with the heading's arrows, the
+/// way YouTube Music's own home lays them out. The same rows as the artist page's Top songs.
+pub(crate) fn song_shelf(
+    app: &mut crate::app::App,
+    ui: &mut egui::Ui,
+    page_salt: &str,
+    shelf: &Shelf,
+) {
+    let signed_in = app.signed_in();
+    let out = {
+        let crate::app::App {
+            palette,
+            images,
+            backend,
+            stats,
+            now,
+            library,
+            ..
+        } = app;
+        // Narrower than Top songs' 400 pt columns: Home has the whole card to itself, and
+        // YouTube Music fits three columns of songs across it.
+        let cols = ((ui.available_width() / 250.0).floor() as usize).clamp(1, 3);
+        // Every item is a track here (the caller checks); a non-track, which cannot happen, is
+        // skipped by drawing nothing rather than panicking mid-frame.
+        let tracks: Vec<&crate::model::Track> =
+            shelf.items.iter().filter_map(Entry::track).collect();
+        spec_pages(
+            ui,
+            palette,
+            images,
+            backend,
+            stats,
+            &shelf.title,
+            shelf.strapline.as_deref(),
+            tracks.len(),
+            cols,
+            HOME_SONG_ROWS,
+            (page_salt, shelf.title.as_str()),
+            |i| shelf_track_spec(tracks[i], None, now, &library.playlists.items, signed_in),
+        )
+    };
+    match out.click {
+        Some(ListClick::Row(i)) => app.play_row(shelf.tracks(), i),
+        Some(ListClick::Link(route)) => app.navigate(route),
+        None => {}
+    }
+    if let Some(action) = out.action {
+        app.row_action(action);
+    }
+}
+
 pub(crate) fn section(ui: &mut egui::Ui, palette: &theme::Palette, name: &str) {
     ui.add_space(20.0);
     ui.label(
@@ -2690,10 +2831,45 @@ mod tests {
     /// wider than the row never moves at all.
     #[test]
     fn carousel_paging_stays_on_its_rails() {
-        assert_eq!(carousel_step(0.0, 1.0, 500.0, 1200.0), 500.0);
-        assert_eq!(carousel_step(600.0, 1.0, 500.0, 1200.0), 700.0);
-        assert_eq!(carousel_step(0.0, -1.0, 500.0, 1200.0), 0.0);
-        assert_eq!(carousel_step(0.0, 1.0, 1500.0, 1200.0), 0.0);
+        // A 500-wide page (a whole number of cards plus their gaps) in a 492-wide view.
+        assert_eq!(carousel_step(0.0, 1.0, 500.0, 492.0, 1200.0), 500.0);
+        // Pulled back at the end: the last page ends on the last card.
+        assert_eq!(carousel_step(500.0, 1.0, 500.0, 492.0, 1200.0), 708.0);
+        assert_eq!(carousel_step(0.0, -1.0, 500.0, 492.0, 1200.0), 0.0);
+        // A drag left between pages: the arrow snaps to the next page's edge.
+        assert_eq!(carousel_step(260.0, 1.0, 500.0, 492.0, 1200.0), 708.0);
+        assert_eq!(carousel_step(0.0, 1.0, 1500.0, 1492.0, 1200.0), 0.0);
+    }
+
+    /// A resize keeps the first card in view at the left edge, on a card boundary.
+    #[test]
+    fn a_resized_carousel_keeps_its_first_card() {
+        // Four cards in (pitch 140), the cards grow to a 150 pitch: still the fifth card first.
+        assert_eq!(carousel_refit(560.0, 140.0, 150.0, 2000.0), 600.0);
+        // Part-way into a card: the nearest one leads.
+        assert_eq!(carousel_refit(600.0, 140.0, 150.0, 2000.0), 600.0);
+        // Never past the end.
+        assert_eq!(carousel_refit(1400.0, 140.0, 150.0, 900.0), 900.0);
+        assert_eq!(carousel_refit(0.0, 140.0, 150.0, 900.0), 0.0);
+    }
+
+    /// A whole number of cards fills the row exactly, each close to its usual width.
+    #[test]
+    fn carousel_cards_fill_the_row_exactly() {
+        for view in [500.0_f32, 764.0, 1000.0, 1333.0, 1900.0] {
+            let (n, w) = carousel_fit(view, 8.0, CARD_W);
+            let used = n as f32 * w + (n - 1) as f32 * 8.0;
+            assert!((used - view).abs() < 0.01, "{view}: {n} × {w} uses {used}");
+            assert!(
+                (w / CARD_W - 1.0).abs() < 0.2,
+                "{view}: card {w} drifted from {CARD_W}"
+            );
+        }
+        assert_eq!(
+            carousel_fit(50.0, 8.0, CARD_W).0,
+            1,
+            "never fewer than one card"
+        );
     }
 
     fn subtitle_track() -> crate::model::Track {
@@ -2774,11 +2950,11 @@ mod tests {
     /// The paged grid numbers down its columns: 1-5 in the first, 6-10 in the second.
     #[test]
     fn the_paged_grid_numbers_down_its_columns() {
-        assert_eq!(grid_index(0, 0, 0), 0);
-        assert_eq!(grid_index(0, 0, 4), 4);
-        assert_eq!(grid_index(0, 1, 0), 5);
-        assert_eq!(grid_index(0, 2, 4), 14);
+        assert_eq!(grid_index(0, 0, 0, ROWS_PER_PAGE), 0);
+        assert_eq!(grid_index(0, 0, 4, ROWS_PER_PAGE), 4);
+        assert_eq!(grid_index(0, 1, 0, ROWS_PER_PAGE), 5);
+        assert_eq!(grid_index(0, 2, 4, ROWS_PER_PAGE), 14);
         // The next page continues where the last column ended.
-        assert_eq!(grid_index(15, 0, 0), 15);
+        assert_eq!(grid_index(15, 0, 0, ROWS_PER_PAGE), 15);
     }
 }
