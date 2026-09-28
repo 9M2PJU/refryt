@@ -131,6 +131,12 @@ pub enum Event {
         id: String,
         error: String,
     },
+    /// Whether the account holds YouTube Premium. `None` when it could not be asked (offline,
+    /// an error): the last answer stands. `epoch` is the account it was asked for.
+    PremiumChecked {
+        premium: Option<bool>,
+        epoch: u64,
+    },
     /// The answer to [`Backend::probe_connection`]: whether YouTube Music answered at all.
     Connection {
         online: bool,
@@ -1297,6 +1303,21 @@ impl Backend {
                 }
             };
             Self::emit(&tx, &ctx, Event::PlaylistSuggestions { id, suggestions });
+        });
+    }
+
+    /// Ask whether the signed-in account holds YouTube Premium, which downloads need.
+    pub fn check_premium(&self, epoch: u64) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let premium = match api.is_premium().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "could not check for YouTube Premium");
+                    None
+                }
+            };
+            Self::emit(&tx, &ctx, Event::PremiumChecked { premium, epoch });
         });
     }
 

@@ -143,6 +143,20 @@ pub(crate) fn set_downloaded(
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("ytm-downloaded"), ids));
 }
 
+/// Whether the account holds YouTube Premium, published beside [`set_downloaded`] so the menus
+/// can offer downloads only where YouTube itself would.
+pub(crate) fn set_premium(ctx: &egui::Context, premium: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ytm-premium"), premium));
+}
+
+fn premium(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("ytm-premium")))
+        .unwrap_or(false)
+}
+
+/// What a disabled Download item says under the pointer.
+const DOWNLOAD_NEEDS_PREMIUM: &str = "Downloads need YouTube Premium";
+
 fn is_downloaded(ctx: &egui::Context, id: &str) -> bool {
     ctx.data(|d| {
         d.get_temp::<std::sync::Arc<std::collections::HashSet<String>>>(egui::Id::new(
@@ -2346,23 +2360,29 @@ pub(crate) fn row_menu(
             // user's own local file is already on disk, so neither applies.
             if t.local_path.is_none() {
                 let downloaded = is_downloaded(mui.ctx(), &t.video_id);
-                if menu_item(
-                    mui,
-                    palette,
-                    if downloaded {
-                        Icon::Trash2
-                    } else {
-                        Icon::Download
-                    },
-                    if downloaded {
-                        "Remove download"
-                    } else {
-                        "Download"
-                    },
-                    None,
-                )
-                .clicked()
-                {
+                // Saving needs Premium, as it does on YouTube; removing a file never does.
+                let allowed = downloaded || premium(mui.ctx());
+                let item = mui
+                    .add_enabled_ui(allowed, |mui| {
+                        menu_item(
+                            mui,
+                            palette,
+                            if downloaded {
+                                Icon::Trash2
+                            } else {
+                                Icon::Download
+                            },
+                            if downloaded {
+                                "Remove download"
+                            } else {
+                                "Download"
+                            },
+                            None,
+                        )
+                    })
+                    .inner
+                    .on_disabled_hover_text(DOWNLOAD_NEEDS_PREMIUM);
+                if item.clicked() {
                     choice = Some(if downloaded {
                         RowAction::RemoveDownload(t.video_id.clone())
                     } else {
@@ -2564,11 +2584,18 @@ pub(crate) fn page_menu(
                 }
                 // Offline: save the whole page to disk. Only for YouTube tracks — a folder of
                 // local files is already on disk.
-                if menu.tracks.iter().all(|t| t.local_path.is_none())
-                    && menu_item(mui, palette, Icon::Download, "Download all", None).clicked()
-                {
-                    choice = Some(RowAction::DownloadMany(tracks()));
-                    mui.close();
+                if menu.tracks.iter().all(|t| t.local_path.is_none()) {
+                    let allowed = premium(mui.ctx());
+                    let item = mui
+                        .add_enabled_ui(allowed, |mui| {
+                            menu_item(mui, palette, Icon::Download, "Download all", None)
+                        })
+                        .inner
+                        .on_disabled_hover_text(DOWNLOAD_NEEDS_PREMIUM);
+                    if item.clicked() {
+                        choice = Some(RowAction::DownloadMany(tracks()));
+                        mui.close();
+                    }
                 }
             }
             // Only the playlists you can actually add to, and only ones of the same source —

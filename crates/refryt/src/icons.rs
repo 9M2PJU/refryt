@@ -74,6 +74,7 @@ icons! {
     Volume1 => "volume-1",
     Volume2 => "volume-2",
     VolumeX => "volume-x",
+    WifiOff => "wifi-off",
     X => "x",
 }
 

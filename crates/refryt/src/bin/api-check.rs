@@ -39,6 +39,14 @@ async fn main() -> Result<()> {
             Err(e) => println!("could not check the stored session ({e:#}); keeping it"),
         }
     }
+    // Downloads follow this.
+    if api.is_signed_in().await {
+        match api.is_premium().await {
+            Ok(p) => println!("premium: {p}"),
+            Err(e) => println!("premium: could not check ({e:#})"),
+        }
+    }
+
     // One specific playlist by id, for chasing a shape that only sometimes arrives.
     if let Some(id) = std::env::var_os("REFRYT_PLAYLIST_ID") {
         let id = id.to_string_lossy().into_owned();

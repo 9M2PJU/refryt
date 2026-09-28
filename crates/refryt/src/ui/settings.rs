@@ -732,20 +732,31 @@ fn signed_in(app: &mut App, ui: &mut egui::Ui) {
         app.backend.fetch_accounts(app.account_epoch);
     }
     // Naming the account is the point: it is YouTube confirming the session, not us assuming it.
-    ui.label(
-        RichText::new(if account.is_empty() {
-            "Signed in".to_owned()
-        } else {
-            format!("Signed in as {account}")
-        })
-        .font(theme::medium(13.0))
-        .color(app.palette.text),
-    );
+    // The Premium badge rides the same line: downloads follow it, so it should be seen.
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(if account.is_empty() {
+                "Signed in".to_owned()
+            } else {
+                format!("Signed in as {account}")
+            })
+            .font(theme::medium(13.0))
+            .color(app.palette.text),
+        );
+        if app.premium {
+            ui.add_space(6.0);
+            premium_badge(ui, &app.palette);
+        }
+    });
     ui.add_space(6.0);
     ui.label(
-        RichText::new("Your library and Home feed are synced.")
-            .font(theme::regular(12.0))
-            .color(app.palette.secondary),
+        RichText::new(if app.premium {
+            "Your library and Home feed are synced, and downloads are on."
+        } else {
+            "Your library and Home feed are synced. Downloads need YouTube Premium."
+        })
+        .font(theme::regular(12.0))
+        .color(app.palette.secondary),
     );
     ui.add_space(14.0);
     channels(app, ui);
@@ -787,4 +798,19 @@ fn channels(app: &mut App, ui: &mut egui::Ui) {
         app.update_settings(&ctx, |s| s.account_page_id = page_id);
         app.forget_account_data();
     }
+}
+
+/// "YouTube Premium · Active": a small accent-tinted pill beside the account name.
+fn premium_badge(ui: &mut egui::Ui, palette: &crate::theme::Palette) {
+    egui::Frame::NONE
+        .fill(palette.accent.gamma_multiply(0.16))
+        .corner_radius(egui::CornerRadius::same(255))
+        .inner_margin(egui::Margin::symmetric(9, 3))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("YouTube Premium · Active")
+                    .font(theme::semibold(11.0))
+                    .color(palette.accent),
+            );
+        });
 }

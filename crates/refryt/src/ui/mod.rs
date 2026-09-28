@@ -2765,9 +2765,10 @@ pub(crate) fn failed(
     message: String,
     retry: impl FnOnce(&mut crate::app::App),
 ) {
-    // No connection is not an error to read out: the raw chain ("error sending request for url
-    // …") only says what the banner already does. Anything else keeps YouTube's own words.
-    let offline = crate::api::looks_offline(&message);
+    if crate::api::looks_offline(&message) {
+        offline_page(app, ui, retry);
+        return;
+    }
     // A third of the way down rather than dead centre: centring the message in the whole page
     // with `centered_and_justified` took every point of height, and the Try again button under
     // it was pushed off the bottom of the card.
@@ -2775,25 +2776,11 @@ pub(crate) fn failed(
     let mut again = false;
     ui.vertical_centered(|ui| {
         ui.set_max_width(ui.available_width().min(460.0));
-        if offline {
-            ui.label(
-                egui::RichText::new("This page needs a connection")
-                    .font(theme::bold(16.0))
-                    .color(app.palette.text),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("It loads again by itself once you're back online.")
-                    .font(theme::regular(13.0))
-                    .color(app.palette.secondary),
-            );
-        } else {
-            ui.label(
-                egui::RichText::new(message)
-                    .font(theme::regular(13.0))
-                    .color(app.palette.danger),
-            );
-        }
+        ui.label(
+            egui::RichText::new(message)
+                .font(theme::regular(13.0))
+                .color(app.palette.danger),
+        );
         ui.add_space(14.0);
         again = crate::widgets::pill_button(ui, &app.palette, "Try again").clicked();
     });
@@ -2802,34 +2789,104 @@ pub(crate) fn failed(
     }
 }
 
-/// The strip across the top of the page while the app has no connection: what is going on, and
-/// the one place that still works without one.
+/// A page that could not load for want of a connection: an empty state rather than an error. The
+/// raw chain ("error sending request for url …") says nothing the reader can act on, so this says
+/// what is going on, that it will sort itself out, and where music still is — the downloads.
+/// Draws in place of the top banner too (see [`offline_banner`]), so it is said once.
+fn offline_page(
+    app: &mut crate::app::App,
+    ui: &mut egui::Ui,
+    retry: impl FnOnce(&mut crate::app::App),
+) {
+    app.offline_page_shown = true;
+    let p = app.palette;
+    const ICON: f32 = 40.0;
+    // Optically centred: a touch above the middle, where a lone block of content sits right.
+    let block_h = ICON + 18.0 + 26.0 + 8.0 + 20.0 + 24.0 + 36.0;
+    ui.add_space(((ui.available_height() - block_h) * 0.42).max(24.0));
+    let (mut again, mut downloads) = (false, false);
+    ui.vertical_centered(|ui| {
+        ui.set_max_width(ui.available_width().min(420.0));
+        // On the page's own background: just the glyph, nothing behind it.
+        let (slot, _) = ui.allocate_exact_size(egui::vec2(ICON, ICON), egui::Sense::hover());
+        crate::icons::Icon::WifiOff
+            .image(p.dim, ICON)
+            .paint_at(ui, slot);
+        ui.add_space(18.0);
+        ui.label(
+            egui::RichText::new("You're offline")
+                .font(theme::bold(22.0))
+                .color(p.text),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                "This page loads by itself once you're back online. Your downloads play without one.",
+            )
+            .font(theme::regular(13.0))
+            .color(p.secondary),
+        );
+        ui.add_space(24.0);
+        // The two buttons side by side, centred: a horizontal row does not centre itself, so it
+        // is placed by the width it took last frame.
+        let id = ui.id().with("offline-actions");
+        let width: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+            let start = ui.cursor().min.x;
+            again = crate::widgets::pill_button(ui, &p, "Try again").clicked();
+            ui.add_space(4.0);
+            let last = crate::widgets::outline_button(ui, &p, "Downloads");
+            downloads = last.clicked();
+            let used = last.rect.right() - start;
+            ui.ctx().data_mut(|d| d.insert_temp(id, used));
+        });
+    });
+    if again {
+        retry(app);
+    } else if downloads {
+        app.rail_filter = crate::app::RailFilter::Downloads;
+        app.navigate(Route::Library);
+    }
+}
+
+/// The strip across the top of the page while the app has no connection, on pages that did load
+/// (or loaded before it went): what is going on, and the one place that still works. A page that
+/// could not load at all says it in full instead, so the strip steps aside there.
 pub(crate) fn offline_banner(app: &mut crate::app::App, ui: &mut egui::Ui) {
     let p = app.palette;
     let mut open = false;
     ui.add_space(12.0);
-    egui::Frame::NONE
-        .fill(p.surface)
-        .corner_radius(egui::CornerRadius::same(theme::RADIUS))
-        .inner_margin(egui::Margin::symmetric(12, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new("You're offline")
-                        .font(theme::semibold(13.0))
-                        .color(p.text),
-                );
-                ui.label(
-                    egui::RichText::new("· Downloaded songs still play")
-                        .font(theme::regular(13.0))
-                        .color(p.secondary),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    open = crate::widgets::outline_button(ui, &p, "Downloads").clicked();
-                });
-            });
-        });
+    // A fixed-height strip, painted by hand: a `Frame` takes the height its parent offers, and on
+    // a page laid out to fill (Settings) it grew into a pale slab across the whole card.
+    let (strip, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(strip, egui::CornerRadius::same(18), p.surface);
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(strip.shrink2(egui::vec2(14.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let (slot, _) = row.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    crate::icons::Icon::WifiOff
+        .image(p.secondary, 16.0)
+        .paint_at(&row, slot);
+    row.add_space(4.0);
+    row.label(
+        egui::RichText::new("You're offline")
+            .font(theme::semibold(13.0))
+            .color(p.text),
+    );
+    row.label(
+        egui::RichText::new("Downloaded songs still play.")
+            .font(theme::regular(13.0))
+            .color(p.secondary),
+    );
+    row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.add_space(-8.0);
+        open = crate::widgets::outline_button(ui, &p, "Downloads").clicked();
+    });
     ui.add_space(10.0);
     if open {
         app.rail_filter = crate::app::RailFilter::Downloads;

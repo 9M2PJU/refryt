@@ -1220,10 +1220,15 @@ pub struct App {
     /// A request failed for want of a connection, and none has got through since. Drives the
     /// offline banner and the quiet probe that notices the connection coming back.
     pub(crate) offline: bool,
+    /// The signed-in account holds YouTube Premium, per its memberships page. Downloads need it,
+    /// as they do on YouTube. False until the check answers, and for signed-out use.
+    pub(crate) premium: bool,
     /// When the next probe may go out while offline.
     offline_probe_at: Option<Instant>,
     /// A probe is in flight; its answer arrives as `Event::Connection`.
     offline_probing: bool,
+    /// The page drew the full offline screen last frame, so the banner stays out of its way.
+    pub(crate) offline_page_shown: bool,
     /// Whether each resizable panel's edge was being dragged last frame, so the width is saved
     /// once, when the drag ends — not on every frame of it, and not when the window's own size
     /// clamps the panel.
@@ -1799,8 +1804,10 @@ impl App {
             results_generation: 0,
             status: None,
             offline: false,
+            premium: false,
             offline_probe_at: None,
             offline_probing: false,
+            offline_page_shown: false,
             panel_dragging: [false; 2],
             panel_save: [0; 2],
             panels_seeded: false,
@@ -2059,6 +2066,11 @@ impl App {
     /// screen after a switch would be showing one account's data under another's name.
     pub(crate) fn forget_account_data(&mut self) {
         self.account_epoch += 1;
+        // Asked again for whichever channel comes next; until it answers, no downloads.
+        self.premium = false;
+        if self.signed_in() {
+            self.backend.check_premium(self.account_epoch);
+        }
         self.library = crate::model::Library::default();
         self.library_loaded = false;
         self.library_error = None;
@@ -2642,6 +2654,10 @@ impl App {
     }
 
     fn start_download(&mut self, track: Track) {
+        if !self.premium {
+            self.toast_error("Downloads need YouTube Premium");
+            return;
+        }
         if self.downloads.entries.contains_key(&track.video_id) {
             self.toast("Already downloaded");
             return;
@@ -2656,6 +2672,10 @@ impl App {
     }
 
     fn start_download_many(&mut self, tracks: Vec<Track>) {
+        if !self.premium {
+            self.toast_error("Downloads need YouTube Premium");
+            return;
+        }
         let pending: Vec<Track> = tracks
             .into_iter()
             .filter(|t| {
@@ -3479,6 +3499,9 @@ impl App {
             self.backend.verify_session();
         }
         self.load_sidebar_playlists();
+        if self.signed_in() {
+            self.backend.check_premium(self.account_epoch);
+        }
         match self.current_route() {
             Route::Search => {
                 if self.status.is_some() && !self.searched.is_empty() {
@@ -3892,6 +3915,15 @@ impl App {
                 self.note_offline();
             }
             match event {
+                Event::PremiumChecked { premium, epoch } if epoch == self.account_epoch => {
+                    if let Some(premium) = premium {
+                        tracing::info!(premium, "YouTube Premium checked");
+                        // A test aid: see the app as a free account does. It can only turn
+                        // downloads off, never on.
+                        self.premium = premium && std::env::var_os("REFRYT_ASSUME_FREE").is_none();
+                    }
+                }
+                Event::PremiumChecked { .. } => {}
                 Event::Connection { online } => {
                     self.offline_probing = false;
                     if online {
@@ -4574,6 +4606,8 @@ impl App {
                             // The topbar's photo chip reads these; asking once here beats
                             // every-frame refires from the pages that display them.
                             self.backend.fetch_accounts(self.account_epoch);
+                            // Downloads follow the account's own Premium, as on YouTube.
+                            self.backend.check_premium(self.account_epoch);
                             // Liked Songs is also how a restored or card-played track's like
                             // status gets backfilled (`reconcile_state`).
                             self.load_library();
@@ -4584,6 +4618,7 @@ impl App {
                         }
                         crate::auth::AuthState::SignedOut => {
                             self.account_epoch += 1;
+                            self.premium = false;
                             // Session data, all of it: the channels belong to the account that
                             // just left, and the signed-out menu on Windows would otherwise
                             // still list them. Clearing the chosen channel through
@@ -6580,6 +6615,7 @@ impl eframe::App for App {
         crate::widgets::set_double_click_play(&ctx, self.settings.double_click_to_play);
         self.publish_loading(&ctx);
         crate::widgets::set_downloaded(&ctx, std::sync::Arc::clone(&self.downloaded_ids));
+        crate::widgets::set_premium(&ctx, self.premium);
 
         let maximized = Self::is_maximized(&ctx);
         // Square on Windows, where the shell is opaque: the outer corner pixels of a rounded
@@ -6823,7 +6859,10 @@ impl eframe::App for App {
                 }
                 let card = widgets::card_rect(top, theme::PAGE_INSET);
                 widgets::clip_card_content(ui, card, theme::PAGE_INSET_X, &p);
-                if self.offline {
+                // Last frame's answer: the page draws after the banner, and a page that is itself
+                // the offline screen says it in full, so the strip would only repeat it.
+                let offline_page = std::mem::take(&mut self.offline_page_shown);
+                if self.offline && !offline_page {
                     ui::offline_banner(self, ui);
                 }
                 match route {

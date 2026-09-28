@@ -1583,6 +1583,88 @@ pub fn parse_edit_reply(root: &Value) -> EditReply {
     }
 }
 
+/// Whether the account holds YouTube Premium, from the "Paid memberships" page
+/// (`FEmemberships_and_purchases`).
+///
+/// Each membership is a `cardItemContainerRenderer`. A held one carries two things that read the
+/// same in every language: the product's logo, an image under `…/ytu_mobile_premium_logo_…`, and
+/// a click that opens its own detail page — a continuation token that decodes to
+/// `FEmembership_detail`. An advert for Premium would have the logo but no detail page to open,
+/// so both are required. Premium Lite (no downloads, no background play) is not Premium here.
+pub fn parse_premium(root: &Value) -> bool {
+    let mut cards = Vec::new();
+    collect_key(root, "cardItemContainerRenderer", &mut cards);
+    cards.iter().any(|card| {
+        let premium_logo = any_string(card, &|s| {
+            (s.contains("premium_logo") || s.contains("music_premium")) && !s.contains("lite")
+        });
+        let held = card
+            .pointer("/onClickCommand/continuationCommand/token")
+            .and_then(Value::as_str)
+            .is_some_and(|token| {
+                let bytes = decode_base64_lossy(token);
+                bytes
+                    .windows(b"FEmembership_detail".len())
+                    .any(|w| w == b"FEmembership_detail")
+            });
+        premium_logo && held
+    })
+}
+
+/// Every value under `key`, anywhere in the document.
+fn collect_key<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Object(map) => {
+            for (k, value) in map {
+                if k == key {
+                    out.push(value);
+                } else {
+                    collect_key(value, key, out);
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|i| collect_key(i, key, out)),
+        _ => {}
+    }
+}
+
+/// Whether any string anywhere under `v` passes `test`.
+fn any_string(v: &Value, test: &dyn Fn(&str) -> bool) -> bool {
+    match v {
+        Value::String(s) => test(s),
+        Value::Object(map) => map.values().any(|x| any_string(x, test)),
+        Value::Array(items) => items.iter().any(|x| any_string(x, test)),
+        _ => false,
+    }
+}
+
+/// Base64 of either alphabet, decoded as far as it goes: padding (plain or `%3D`) and anything
+/// outside the alphabet are skipped, and a trailing partial byte is dropped. Enough to look
+/// inside a continuation token, which is base64 around a protobuf, without a crate for it.
+fn decode_base64_lossy(token: &str) -> Vec<u8> {
+    let token = token.replace("%3D", "");
+    let mut out = Vec::with_capacity(token.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in token.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
 /// Whether a browse response is YouTube's "sign in" prompt rather than a page.
 ///
 /// Signed out, a personal feed that needs the account (VLLM — "Liked Music") does not come back
@@ -4708,6 +4790,69 @@ mod tests {
         assert_eq!(parse_edit_reply(&done), EditReply::Done);
         let other = serde_json::json!({"status": "STATUS_FAILED"});
         assert_eq!(parse_edit_reply(&other), EditReply::Refused(String::new()));
+    }
+
+    /// A membership card in the shape the "Paid memberships" page sent it (2026-09-28), price
+    /// left out: the Premium logo, and a click into the membership's own detail page.
+    fn membership_card(logo: &str, detail: bool) -> Value {
+        let mut card = serde_json::json!({"cardItemContainerRenderer": {
+            "baseRenderer": {"cardItemRenderer": {"headingRenderer": {
+                "cardItemTextWithImageRenderer": {"imageRenderer": {"themedImageRenderer": {
+                    "imageLight": {"thumbnails": [{"url": logo}],
+                        "accessibility": {"accessibilityData": {"label": "YouTube Premium"}}}
+                }}}}}}
+        }});
+        if detail {
+            card["cardItemContainerRenderer"]["onClickCommand"] = serde_json::json!({
+                "continuationCommand": {
+                    "token": "4qmFsgLrARITRkVtZW1iZXJzaGlwX2RldGFpbBqQ",
+                    "request": "CONTINUATION_REQUEST_TYPE_BROWSE"}});
+        }
+        serde_json::json!({"contents": {"singleColumnBrowseResultsRenderer": {"tabs": [
+            {"tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+                {"itemSectionRenderer": {"contents": [card]}}]}}}}]}}})
+    }
+
+    #[test]
+    fn premium_is_a_held_membership_with_the_premium_logo() {
+        let logo = "https://www.gstatic.com/youtube/img/unlimited/ytu_mobile_premium_logo_short_195x40.png";
+        assert!(
+            parse_premium(&membership_card(logo, true)),
+            "the user's own card"
+        );
+        assert!(
+            !parse_premium(&membership_card(logo, false)),
+            "a logo with nothing to manage is an advert, not a membership"
+        );
+        let lite = "https://www.gstatic.com/youtube/img/unlimited/ytu_mobile_premium_lite_logo.png";
+        assert!(
+            !parse_premium(&membership_card(lite, true)),
+            "Lite has no downloads"
+        );
+        let empty = serde_json::json!({"contents": {"singleColumnBrowseResultsRenderer": {}}});
+        assert!(!parse_premium(&empty));
+
+        // What a free account's page actually holds (2026-09-28): "Offers from YouTube", each an
+        // `offerItemRenderer` with a Premium image and a Learn more button — no membership.
+        let offers = serde_json::json!({"contents": {"singleColumnBrowseResultsRenderer": {
+        "tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+            {"itemSectionRenderer": {"contents": [{"offerItemRenderer": {
+                "imageRenderer": {"themedImageRenderer": {"imageLight": {"thumbnails": [{
+                    "url": "https://gstatic.com/youtube/img/unlimited/ytu_desktop_premium_offer_225x127.png"
+                }]}}},
+                "additionalInfoRenderer": {"cardItemActionsRenderer": {"primaryButtonRenderer": {
+                    "buttonRenderer": {"navigationEndpoint": {"browseEndpoint": {
+                        "browseId": "SPunlimited", "canonicalBaseUrl": "/youtube_premium"}}}}}}
+            }}]}}]}}}}]}}});
+        assert!(!parse_premium(&offers), "an offer is not a membership");
+    }
+
+    #[test]
+    fn base64_tokens_decode_as_far_as_they_go() {
+        let bytes = decode_base64_lossy("4qmFsgLrARITRkVtZW1iZXJzaGlwX2RldGFpbBqQ");
+        assert!(String::from_utf8_lossy(&bytes).contains("FEmembership_detail"));
+        assert_eq!(decode_base64_lossy("aGk%3D"), b"hi");
+        assert_eq!(decode_base64_lossy("aGk="), b"hi");
     }
 
     /// A song row as the playlist and Suggestions shelves send it.

@@ -345,8 +345,10 @@ impl Api {
         let _ = auth::delete_oauth();
         // The sign-in window keeps Google's own session in its profile, and that is a credential
         // too: left behind, the next Log in would silently re-capture the same account instead
-        // of asking who is signing in.
-        #[cfg(target_os = "windows")]
+        // of asking who is signing in. Both platforms: the window runs on Linux too (WebKitGTK),
+        // and gating this on Windows alone is why Log in right after Sign out there signed the
+        // same account straight back in.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         crate::webview_login::forget();
     }
 
@@ -1177,6 +1179,18 @@ impl Api {
     /// signed-out placeholder shape is: that one really does mean something went wrong (an
     /// expired session slipping through as if it were anonymous), which `looks_signed_out`
     /// already recognises for the library feed's own empty state.
+    /// Whether the signed-in account holds YouTube Premium, read off its "Paid memberships"
+    /// page — see [`innertube::parse_premium`]. Signed out is `Ok(false)`: there is no account
+    /// to hold anything.
+    pub async fn is_premium(&self) -> Result<bool> {
+        if !self.is_signed_in().await {
+            return Ok(false);
+        }
+        let json = self.browse(MEMBERSHIPS).await?;
+        dump("REFRYT_DUMP_MEMBERSHIPS", &json);
+        Ok(innertube::parse_premium(&json))
+    }
+
     pub async fn history(&self) -> Result<Vec<model::Shelf>> {
         let json = self.browse(HISTORY).await?;
         if innertube::looks_signed_out(&json) {
@@ -2214,6 +2228,8 @@ const CHARTS: &str = "FEmusic_charts";
 /// Dated shelves — Today, This week, and so on. Answers "Sign in to view your history" signed
 /// out, which is why the app gates the page rather than the call.
 const HISTORY: &str = "FEmusic_history";
+/// The site's "Paid memberships" page, linked from the account menu.
+const MEMBERSHIPS: &str = "FEmemberships_and_purchases";
 /// Below this many shelves, the feed is the signed-out one and is worth supplementing.
 const THIN_HOME: usize = 4;
 
