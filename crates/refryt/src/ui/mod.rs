@@ -2716,11 +2716,16 @@ pub(crate) fn song_shelf(
     }
 }
 
-/// How many columns of songs a Home song shelf lays out at `width`. Narrower than Top songs' 400
-/// pt columns: Home has the whole card to itself, and YouTube Music fits three across it.
+/// How many columns of songs a Home song shelf lays out at `width`: up to three, as YouTube Music
+/// fits across a wide window, but never under [`SONG_COLUMN_MIN`] each.
 pub(crate) fn song_shelf_columns(width: f32) -> usize {
-    ((width / 250.0).floor() as usize).clamp(1, 3)
+    ((width / SONG_COLUMN_MIN).floor() as usize).clamp(1, 3)
 }
+
+/// The narrowest a Home song column may get. At 250 a portrait screen's ~770 pt card took three
+/// columns, and after the cover, the gaps and the thumbs each title had about 150 pt — a few
+/// words and an ellipsis. At 340 that card takes two, with room to read the name.
+const SONG_COLUMN_MIN: f32 = 340.0;
 
 pub(crate) fn section(ui: &mut egui::Ui, palette: &theme::Palette, name: &str) {
     ui.add_space(20.0);
@@ -3011,6 +3016,17 @@ mod tests {
 
     /// Carousel paging never leaves its rails: a step past either end clamps, and a view
     /// wider than the row never moves at all.
+    /// A portrait screen's card gets two readable columns, not three cramped ones; a wide window
+    /// still gets YouTube Music's three.
+    #[test]
+    fn song_shelves_only_split_where_titles_still_fit() {
+        assert_eq!(song_shelf_columns(560.0), 1);
+        assert_eq!(song_shelf_columns(770.0), 2);
+        assert_eq!(song_shelf_columns(1000.0), 2);
+        assert_eq!(song_shelf_columns(1100.0), 3);
+        assert_eq!(song_shelf_columns(2400.0), 3);
+    }
+
     #[test]
     fn carousel_paging_stays_on_its_rails() {
         // A 500-wide page (a whole number of cards plus their gaps) in a 492-wide view.
