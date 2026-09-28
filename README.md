@@ -4,125 +4,148 @@
 
 <h1 align="center">refryt</h1>
 
-<p align="center">A fast, native YouTube Music client.</p>
+<p align="center">A native YouTube Music client. One binary, no browser inside it.</p>
 
 > [!WARNING]
-> refryt is an unofficial, experimental client, not affiliated with YouTube or Google in any
-> way. "YouTube Music" is a trademark of Google LLC. It talks to YouTube's internal API, so it
-> can break when YouTube changes something, and you use it at your own risk.
-
-## What this is
-
-YouTube Music's web app is fine, but it's a browser tab pretending to be an app: slow to open,
-heavy at idle, and it comes with everything else a browser drags along. refryt is a real desktop
-app instead. It's one binary, with no Electron, and it talks to YouTube Music the same way the
-web app does. There is no official API for this, so the client is reverse-engineered and can
-break when YouTube changes something. It usually doesn't take long to fix when that happens.
-
-Sign-in imports the session from a browser you're already signed into. That happens locally, on
-your own machine, and credentials never pass through anything but your browser and YouTube.
-
-## What it does
-
-- **Search that actually searches.** The mixed, ranked response YouTube returns can bury a real
-  match behind a handful of vaguely related songs. Narrowing to Artists, Albums, Songs and the
-  rest asks YouTube for that category specifically, instead of filtering the same short list.
-- **A real library.** Create, rename, delete and reorder playlists, or point Settings at a folder
-  of your own files and browse it like a file explorer, down to turning any folder into a local
-  playlist. Liked songs, listening history and downloads for offline listening sit alongside.
-- **Radio and autoplay**, ratings, moods and genres, and charts: the usual shape of YouTube
-  Music, without the rest of the browser around it.
-- **Music videos, lyrics and queue.** A track that has a music video can play it in the app, and
-  a lyrics panel and an editable Up Next queue sit next to the usual transport.
-- **Desktop integration.** A tray icon, start on boot, media keys and the OS media controls
-  (MPRIS on Linux, SMTC on Windows), Discord Rich Presence, and the keyboard shortcuts you'd
-  expect from Spotify's desktop app (space to play or pause, arrows to skip, and so on).
-- **A translucent, blurred shell**, with real compositor blur where the desktop offers it (KDE
-  Wayland today; Windows hides transparency and blur for now), and 22 colour themes that are
-  [plain CSS files](docs/THEMES.md) in your config folder: edit one and the app repaints as
-  you save, delete one and it's gone, add your own.
-- **Sign-in from the app or from a browser.** The in-app sign-in window works on Linux and
-  Windows, and importing the session from Chrome, Firefox, Brave, Vivaldi or Edge works
-  everywhere. No pasting cookies, no device codes.
-
-## Status
-
-refryt is pre-1.0 and changes quickly. Expect rough edges, and grab the current build from
-[Releases](https://github.com/gridoe/refryt/releases).
-
-- **Linux is the tested platform.** The AppImage is what the project is developed and used on.
-  The Windows installer and zip build from the same source, but have not had real testing on
-  Windows hardware yet.
-- **YouTube changes can break it.** Everything is reverse-engineered, and there is no advance
-  notice when an endpoint or a token changes. A fix usually lands within a few days.
-- **Unofficial clients fall outside YouTube's terms of service.** That is a risk taken
-  knowingly, and no one here can promise your account is exempt from it.
-- **Transparency and blur are Linux-only for now** (blur where the compositor offers it; Windows
-  hides both). Podcasts and episodes are not supported at all.
-
-## Screenshots
+> Unofficial, and not affiliated with YouTube or Google. "YouTube Music" is a trademark of
+> Google LLC. It talks to YouTube's internal API, which can change on any given Tuesday, so
+> things break now and then. Use it at your own risk.
 
 <p align="center">
   <a href="assets/screenshots/home-classic.png"><img src="assets/screenshots/home-classic.png" width="49%" alt="Home in the classic dark theme"></a>
   <a href="assets/screenshots/home-catppuccin-frappe-blur.png"><img src="assets/screenshots/home-catppuccin-frappe-blur.png" width="49%" alt="Home with the Catppuccin Frappe scheme at 75% opacity and compositor blur"></a>
 </p>
 
-The classic dark theme, and Catppuccin Frappe at 75% opacity with compositor blur on KDE
-Wayland. Transparency and blur are Linux-only for now; Windows hides both.
+I listen to YouTube Music most of the day, and the web app is a browser tab dressed up as an
+app. It's slow to open, heavy when it's doing nothing, and closing the wrong tab stops the
+music. So this is a real desktop app instead. Rust, no Electron, and it talks to YouTube the
+same way the website does.
 
-## Tech stack
+With the home feed loaded and its covers on screen it sits at about 96 MB of its own memory,
+and a frame costs well under a millisecond to draw. `scripts/perf.sh` measures both, and it
+fails if either creeps up.
 
-- **Rust**, one binary, with [`egui`/`eframe`](https://github.com/emilk/egui) for the UI
-- **[`mpv`](https://mpv.io/)** (via `libmpv2`) for playback
-- YouTube's own `player` endpoint for stream resolution, with **[`yt-dlp`](https://github.com/yt-dlp/yt-dlp)** as the fallback
-- **[`ytmapi-rs`](https://github.com/nick42d/youtui)** for YouTube Music's InnerTube protocol
-- **`tokio`** and **`reqwest`**/`rustls` for async networking
-- **`glow`** (OpenGL) on Linux, **`wgpu`** (DX12) on Windows, for rendering
-- **`lofty`**, **`walkdir`** and **`rfd`** for local files and folders
+## What it does
 
-## Installing
+The usual YouTube Music stuff: Home, Explore, search, your library, radio, charts, moods,
+lyrics, a queue you can edit, and music videos when a song has one. A few things it does on
+purpose:
 
-**Linux.** Grab the AppImage from
-[Releases](https://github.com/gridoe/refryt/releases), or build it yourself:
+- **Search actually searches.** YouTube's mixed results can bury the thing you typed under
+  a pile of vaguely related songs. Picking Songs or Albums asks YouTube for that category
+  directly, instead of filtering the same short list.
+- **Your playlists behave.** Create, rename, reorder, and get told when a song is already in
+  one instead of quietly adding it twice. Your own playlists get YouTube's Suggestions
+  underneath, with a + to add them.
+- **Local files too.** Point Settings at a folder and browse it like a file explorer. Any
+  folder can become a playlist. Downloads for offline listening live next to it.
+- **Offline doesn't fall over.** No connection gets you a banner and a way to your downloads.
+  When it comes back, the page reloads by itself.
+- **It fits on the desktop.** Tray icon, start on boot, media keys, the OS media controls
+  (MPRIS on Linux, SMTC on Windows) and Discord Rich Presence.
+
+## Keys
+
+They're Spotify's desktop shortcuts, because my fingers already knew them.
+
+| key | what it does |
+|---|---|
+| space | play / pause |
+| up / down | previous / next |
+| m | mute |
+| ctrl + s | shuffle |
+| ctrl + r | cycle repeat |
+| ctrl + k or ctrl + l | jump to search |
+| ? or F1 | the full list |
+
+Songs select on one click and play on two, like Spotify. If you'd rather one click plays,
+that's a toggle in Settings.
+
+## Themes
+
+22 of them, and each one is a [plain CSS file](docs/THEMES.md) in your config folder. Edit
+one and the app repaints when you save. Delete one and it's gone. Drop in your own and it
+shows up in the list.
+
+The shell can be see-through with real compositor blur behind it. That only works where the
+compositor offers blur, which today means KDE on Wayland. Windows hides both settings,
+because what shows through there is a washed-out grey, not your desktop.
+
+## Signing in
+
+Either sign in from the app's own window (Linux and Windows), or let it borrow the session
+from a browser you're already signed into: Chrome, Firefox, Brave, Vivaldi or Edge. It all
+happens on your machine. There are no cookies to paste and no codes to type on another device.
+
+## Status
+
+Pre-1.0, and it moves quickly. Things worth knowing:
+
+- **Linux is where it's used and tested.** The Windows installer and zip build from the
+  same source but haven't spent much time on real Windows hardware.
+- **YouTube will break it occasionally.** Nothing here is documented by YouTube, and they
+  don't send notice when they change something. Fixes usually land within a few days.
+- **Unofficial clients are outside YouTube's terms.** I use it anyway, but I can't promise
+  your account is exempt from that.
+- **No podcasts.** Episodes aren't supported at all.
+
+## Install
+
+**Linux.** Grab the AppImage from [releases](https://github.com/gridoe/refryt/releases),
+or build it:
 
 ```sh
 ./scripts/build-appimage.sh
-./scripts/appimage-install.sh install   # ~/.local/bin, with a desktop launcher entry
+./scripts/appimage-install.sh install   # into ~/.local/bin, with a launcher entry
 ```
 
-**Windows.** A real installer and a portable zip both exist
-(`./scripts/build-windows.sh`); see [`docs/BUILDING.md`](docs/BUILDING.md) for the build setup.
+**Windows.** There's an installer and a portable zip on the same releases page. Both come
+out of `./scripts/build-windows.sh`, which cross-builds from Linux.
 
-## Building from source
+## Build
 
-See [`docs/BUILDING.md`](docs/BUILDING.md) for the full setup, the dev-loop commands (there's a
-`Justfile` for all of it), and how the Windows cross-build works.
+It's a Cargo workspace with a `Justfile` on top. `just` builds and runs it,
+`just release` does the optimised build, and `just check` runs formatting, clippy and the
+tests.
 
-## License
+You'll need Rust and libmpv. yt-dlp is optional but worth having, because it's the fallback
+when YouTube won't hand a stream over directly. [docs/BUILDING.md](docs/BUILDING.md) has the
+full setup and the Windows cross-build.
 
-[GPL-3.0-or-later](LICENSE).
+What's inside:
 
-## Inspiration
+- **Rust** with [`egui`/`eframe`](https://github.com/emilk/egui) for the UI
+- **[`mpv`](https://mpv.io/)** through `libmpv2` for playback
+- YouTube's own `player` endpoint for streams, with
+  **[`yt-dlp`](https://github.com/yt-dlp/yt-dlp)** behind it when that says no
+- **[`ytmapi-rs`](https://github.com/nick42d/youtui)** for YouTube Music's InnerTube API
+- **`tokio`** and **`reqwest`**/`rustls` for networking
+- **`glow`** (OpenGL) on Linux and **`wgpu`** (DX12) on Windows for drawing
+- **`lofty`**, **`walkdir`** and **`rfd`** for local files
 
-Ideas this project took from others, and where they show up:
+## Where ideas came from
 
 - **[Sonora](https://github.com/sonorahq/sonora)** and its
-  [`ytmusic-rs`](https://github.com/sonorahq/ytmusic-rs): playback asks YouTube's `player`
-  endpoint as the visionOS client, which returns direct stream URLs, and when YouTube refuses the
-  visitor it retries with the one the refusal issues.
-- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**: the fallback resolver, and the reference for
-  how YouTube gates anonymous clients.
-- **[youtui](https://github.com/nick42d/youtui)**: `ytmapi-rs` for the InnerTube API, and its
-  maintained `rusty_ytdl` fork behind the optional native resolver.
-- **[ytmdesktop](https://github.com/ytmdesktop/ytmdesktop)**: what happens when the queue runs
-  out.
-- **Spotify's desktop app**: the keyboard shortcuts, single-click-to-select with double-click to
-  play, and the shape of the album, playlist and artist pages.
+  [`ytmusic-rs`](https://github.com/sonorahq/ytmusic-rs): asking YouTube's `player` endpoint
+  as the visionOS client, which hands back direct stream URLs, and retrying with the visitor
+  id a refusal issues.
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**: the fallback resolver, and the reference
+  for how YouTube gates anonymous clients.
+- **[youtui](https://github.com/nick42d/youtui)**: `ytmapi-rs` for the InnerTube API, and
+  its maintained `rusty_ytdl` fork behind the optional native resolver.
+- **[ytmdesktop](https://github.com/ytmdesktop/ytmdesktop)**: what happens when the queue
+  runs out.
+- **Spotify's desktop app**: the shortcuts, select-then-play clicks, and the shape of the
+  album, playlist and artist pages.
 - **Theme palettes**: [Catppuccin](https://github.com/catppuccin/palette),
   [Nord](https://www.nordtheme.com/docs/colors-and-palettes),
   [Gruvbox](https://github.com/morhetz/gruvbox),
   [Tokyo Night](https://github.com/folke/tokyonight.nvim),
   [Dracula](https://spec.draculatheme.com), [Rosé Pine](https://github.com/rose-pine/palette),
   [Everforest](https://github.com/sainnhe/everforest) and
-  [Solarized](https://ethanschoonover.com/solarized). Each theme file in `crates/refryt/themes`
+  [Solarized](https://ethanschoonover.com/solarized). Each file in `crates/refryt/themes`
   names its source.
+
+## Licence
+
+[GPL-3.0-or-later](LICENSE).
