@@ -14,39 +14,29 @@
 I have YouTube Music on most of the day, and the web app is a browser tab dressed up as an
 app. It takes a while to open, it's heavy while it does nothing, and closing the wrong tab
 stops the music. So this is a real desktop app instead. It's written in Rust, there's no
-Electron, and it talks to YouTube the same way the website does.
+Electron, and it talks to YouTube the same way the website does. With the home feed loaded it
+uses around 100 MB of memory.
 
-## What this is, and what it isn't
+## Disclaimer
 
-It's a different front end for your own YouTube Music account. You sign in as yourself, and
-it shows your home feed, your library and your playlists, fetched from YouTube the way the
-website fetches them. Likes, playlist edits and listening history go back to your account, so
-the website and your phone see them too.
+> [!IMPORTANT]
+> **refryt is not a piracy tool.** It contains no music and does not host, share or unlock any
+> content. Every song is streamed from YouTube under the account you sign in with.
 
-It isn't pirate software. There's no music in this repo or in the builds, nothing is hosted
-or shared, and nothing is unlocked for anyone else's account. Every song plays from YouTube,
-as you. Downloads are files on your own disk for listening offline, and they're yours to keep
-off the internet.
+**YouTube Premium.** refryt is intended for use with a YouTube Premium or YouTube Music Premium
+subscription. It plays without ads and in the background, which YouTube offers as Premium
+features. Downloads are available only when the signed-in account holds Premium: the app
+checks the account's Paid memberships page and shows the result in Settings. Downloaded files
+are for personal offline listening and should not be redistributed.
 
-It also isn't official. It's not affiliated with or endorsed by YouTube or Google, and
-"YouTube Music" is their trademark. None of the API it uses is documented, and third-party
-clients sit outside YouTube's terms of service. I use it every day anyway, but that's a call
-you make for your own account. If you like an artist, pay them in whatever way they actually
-get paid.
+**Your account.** refryt is a front end for your own YouTube Music account. Likes, playlist
+edits and listening history are saved to that account, so they appear on the website and in
+the mobile apps as well.
 
-## Numbers
-
-Measured by `scripts/perf.sh` on a release build, with the home feed loaded and its covers on
-screen:
-
-| | |
-|---|---|
-| its own memory (private dirty) | ~96 MB |
-| its share of the system's (PSS) | ~141 MB |
-| drawing a frame | under 1 ms |
-| AppImage | 154 MB, most of which is mpv and yt-dlp |
-
-The script fails if any of those drift past their limits, so they don't quietly creep up.
+**Not affiliated.** refryt is an unofficial client and is not affiliated with, endorsed by or
+sponsored by YouTube or Google. "YouTube" and "YouTube Music" are trademarks of Google LLC. The
+app uses YouTube's undocumented internal API, and third-party clients fall outside YouTube's
+Terms of Service. Use it at your own discretion.
 
 ## What it does
 
@@ -64,9 +54,9 @@ are there on purpose:
   list. Each artist page has a tile with the songs you've liked by them.
 - **Local files.** Point Settings at a folder and browse it like a file explorer. Any folder
   can become a playlist.
-- **Downloads.** Any song or whole page can be saved for offline listening. The files land in
-  `~/Music/refryt` with their tags and cover art embedded, and a downloaded song plays from
-  disk even when you're online.
+- **Downloads, with Premium.** Any song or whole page can be saved for offline listening.
+  The files land in `~/Music/refryt` with their tags and cover art embedded, and a downloaded
+  song plays from disk even when you're online.
 - **Offline doesn't fall over.** No connection gets you a banner and a shortcut to your
   downloads. When the connection comes back, the page reloads by itself.
 - **Playback.** mpv underneath, with an audio quality setting, volume normalisation from
@@ -178,7 +168,7 @@ What's inside:
 - **`glow`** (OpenGL) on Linux and **`wgpu`** (DX12) on Windows for drawing
 - **`lofty`**, **`walkdir`** and **`rfd`** for local files
 
-## Where ideas came from
+## Credits
 
 - **[Sonora](https://github.com/sonorahq/sonora)** and its
   [`ytmusic-rs`](https://github.com/sonorahq/ytmusic-rs): asking YouTube's `player` endpoint
