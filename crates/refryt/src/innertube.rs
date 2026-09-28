@@ -1496,6 +1496,9 @@ pub struct PlaylistPage {
     /// read a song's state as the page's.
     pub library: Option<LibraryToggle>,
     pub page: Page,
+    /// The section list's own continuation — not more tracks, but what YouTube hangs below
+    /// them: the Suggestions shelf on your own playlists. See [`parse_playlist_suggestions`].
+    pub extras: Option<String>,
 }
 
 /// A playlist header's description. The text sits under `description/runs` on some pages and
@@ -1537,7 +1540,47 @@ pub fn parse_playlist(root: &Value) -> Option<PlaylistPage> {
         editable: find_key(root, "musicEditablePlaylistDetailHeaderRenderer").is_some(),
         library: find_header_toggle(root, "musicResponsiveHeaderRenderer"),
         page: parse_playlist_tracks(root),
+        extras: root
+            .pointer("/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/continuations")
+            .and_then(continuation_token),
     })
+}
+
+/// What a playlist edit's reply said. The call itself succeeds either way: a refusal comes back
+/// as `status: STATUS_FAILED`, which is how an add of a song already in the playlist answers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EditReply {
+    Done,
+    /// The song is already in the playlist. The reply offers "Add anyway", which is the same add
+    /// with `dedupeOption: DEDUPE_OPTION_SKIP`. Carries YouTube's own sentence for it.
+    Duplicate(String),
+    /// Refused for some other reason, in YouTube's words when it gave any.
+    Refused(String),
+}
+
+pub fn parse_edit_reply(root: &Value) -> EditReply {
+    if root.get("status").and_then(Value::as_str) != Some("STATUS_FAILED") {
+        return EditReply::Done;
+    }
+    let message = find_key(root, "responseText")
+        .map(text)
+        .and_then(non_empty)
+        .unwrap_or_default();
+    // Told apart by what the reply offers, not by its wording, which is in the account's
+    // language: only the duplicate refusal carries an add that skips the check.
+    let offers_anyway = find_key(root, "playlistEditEndpoint")
+        .and_then(|e| e.get("actions"))
+        .and_then(Value::as_array)
+        .is_some_and(|actions| {
+            actions.iter().any(|a| {
+                a.get("dedupeOption").and_then(Value::as_str) == Some("DEDUPE_OPTION_SKIP")
+            })
+        });
+    if offers_anyway {
+        EditReply::Duplicate(message)
+    } else {
+        EditReply::Refused(message)
+    }
 }
 
 /// Whether a browse response is YouTube's "sign in" prompt rather than a page.
@@ -1554,13 +1597,73 @@ pub fn sign_in_prompt(root: &Value) -> bool {
 }
 
 /// The tracks of a playlist response, first page or continuation.
+///
+/// Read from the playlist's own rows only: the playlist shelf on the first page, the append
+/// action after it. The section list around that shelf carries a continuation of its own, to the
+/// Suggestions below an owned playlist — a whole-document scan took that token for the next page
+/// of tracks and appended the seven suggested songs to the playlist as if they were in it.
 pub fn parse_playlist_tracks(root: &Value) -> Page {
+    let node = find_key(root, "musicPlaylistShelfRenderer")
+        .or_else(|| root.get("onResponseReceivedActions"))
+        .or_else(|| root.pointer("/continuationContents/musicPlaylistShelfContinuation"))
+        .unwrap_or(root);
     let mut items = Vec::new();
-    collect_rows(root, &mut items);
+    collect_rows(node, &mut items);
     Page {
         items,
-        next: continuation_token(root),
+        next: continuation_token(node),
     }
+}
+
+/// YouTube's suggested songs for one of your playlists, and how to ask for a fresh batch.
+#[derive(Debug, Default, Clone)]
+pub struct Suggestions {
+    /// The shelf's own heading — "Suggestions", in the account's language.
+    pub title: String,
+    pub tracks: Vec<Track>,
+    /// The shelf's Refresh button: the same shelf again, with other songs.
+    pub refresh: Option<String>,
+}
+
+/// The Suggestions shelf, from the playlist's [`PlaylistPage::extras`] continuation or from its
+/// own Refresh. The first arrives as a section-list continuation holding the shelf; a refresh
+/// answers with the shelf's continuation alone.
+pub fn parse_playlist_suggestions(root: &Value) -> Option<Suggestions> {
+    let shelf = root
+        .pointer("/continuationContents/sectionListContinuation/contents")
+        .and_then(Value::as_array)
+        .and_then(|items| items.iter().find_map(|i| i.get("musicShelfRenderer")))
+        .or_else(|| root.pointer("/continuationContents/musicShelfContinuation"))?;
+    let tracks: Vec<Track> = shelf
+        .get("contents")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| parse_search_row(r.get("musicResponsiveListItemRenderer")?))
+                .filter_map(|e| e.track().cloned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let refresh = shelf
+        .get("continuations")
+        .and_then(Value::as_array)
+        .and_then(|c| {
+            c.iter().find_map(|c| {
+                c.pointer("/reloadContinuationData/continuation")
+                    .and_then(Value::as_str)
+            })
+        })
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned);
+    Some(Suggestions {
+        title: shelf
+            .get("title")
+            .map(text)
+            .and_then(non_empty)
+            .unwrap_or_else(|| "Suggestions".to_owned()),
+        tracks,
+        refresh,
+    })
 }
 
 /// Every `musicResponsiveListItemRenderer` in a document, in order.
@@ -4583,6 +4686,115 @@ mod tests {
             .expect("a playable track")
             .clone();
         assert_eq!(t.set_video_id, None);
+    }
+
+    /// The replies to adding a song already in the playlist, as YouTube sent them (2026-09-28):
+    /// a failed status whose toast offers "Add anyway" with the dedupe check skipped.
+    #[test]
+    fn a_duplicate_add_is_told_from_a_refusal() {
+        let dup = serde_json::json!({"status": "STATUS_FAILED", "actions": [{"addToToastAction": {
+            "item": {"notificationActionRenderer": {
+                "responseText": {"runs": [{"text": "This track is already in the playlist"}]},
+                "actionButton": {"buttonRenderer": {
+                    "text": {"runs": [{"text": "Add anyway"}]},
+                    "command": {"playlistEditEndpoint": {"playlistId": "PLx", "actions": [
+                        {"addedVideoId": "vvvvvvvvvvv", "action": "ACTION_ADD_VIDEO",
+                         "dedupeOption": "DEDUPE_OPTION_SKIP"}]}}}}}}}}]});
+        assert_eq!(
+            parse_edit_reply(&dup),
+            EditReply::Duplicate("This track is already in the playlist".to_owned())
+        );
+        let done = serde_json::json!({"status": "STATUS_SUCCEEDED", "newHeader": {}});
+        assert_eq!(parse_edit_reply(&done), EditReply::Done);
+        let other = serde_json::json!({"status": "STATUS_FAILED"});
+        assert_eq!(parse_edit_reply(&other), EditReply::Refused(String::new()));
+    }
+
+    /// A song row as the playlist and Suggestions shelves send it.
+    fn song_row(id: &str, title: &str) -> Value {
+        serde_json::json!({"musicResponsiveListItemRenderer": {
+        "flexColumns": [
+            {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+                {"text": title, "navigationEndpoint": {"watchEndpoint": {"videoId": id,
+                    "watchEndpointMusicSupportedConfigs": {"watchEndpointMusicConfig":
+                        {"musicVideoType": "MUSIC_VIDEO_TYPE_ATV"}}}}}]}}},
+            {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+                {"text": "Someone"}]}}}
+        ]}})
+    }
+
+    /// An owned playlist's first page, in the shape of a real one (2026-09-28): every track in
+    /// the playlist shelf, and a continuation on the section list around it that leads to the
+    /// Suggestions, not to more tracks. Taking that one as the next page is what appended seven
+    /// suggested songs to a 52-song playlist.
+    #[test]
+    fn suggestions_are_not_tracks_of_the_playlist() {
+        let first = serde_json::json!({
+            "contents": {"twoColumnBrowseResultsRenderer": {
+                "tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+                    {"musicEditablePlaylistDetailHeaderRenderer": {"header": {
+                        "musicResponsiveHeaderRenderer": {
+                            "title": {"runs": [{"text": "Mine"}]}}}}}]}}}}],
+                "secondaryContents": {"sectionListRenderer": {
+                    "contents": [{"musicPlaylistShelfRenderer": {"contents": [
+                        song_row("aaaaaaaaaaa", "One"),
+                        song_row("bbbbbbbbbbb", "Two")
+                    ]}}],
+                    "continuations": [{"nextContinuationData": {"continuation": "EXTRAS"}}]
+                }}
+            }}
+        });
+        let page = parse_playlist(&first).expect("the page should parse");
+        assert_eq!(page.page.items.len(), 2);
+        assert_eq!(
+            page.page.next, None,
+            "the section's token is not another page of tracks"
+        );
+        assert_eq!(page.extras.as_deref(), Some("EXTRAS"));
+
+        let extras = serde_json::json!({"continuationContents": {"sectionListContinuation": {
+            "contents": [{"musicShelfRenderer": {
+                "title": {"runs": [{"text": "Suggestions"}]},
+                "contents": [song_row("ccccccccccc", "Three")],
+                "continuations": [{"reloadContinuationData": {"continuation": "AGAIN"}}]
+            }}],
+            "continuations": [{"nextContinuationData": {"continuation": "RELATED"}}]
+        }}});
+        let s = parse_playlist_suggestions(&extras).expect("the shelf should parse");
+        assert_eq!(s.title, "Suggestions");
+        assert_eq!(s.tracks.len(), 1);
+        assert_eq!(s.tracks[0].video_id, "ccccccccccc");
+        assert_eq!(s.refresh.as_deref(), Some("AGAIN"));
+
+        // Refresh answers with the shelf's continuation alone.
+        let again = serde_json::json!({"continuationContents": {"musicShelfContinuation": {
+            "contents": [song_row("ddddddddddd", "Four")],
+            "continuations": [{"reloadContinuationData": {"continuation": "AGAIN2"}}]
+        }}});
+        let s = parse_playlist_suggestions(&again).expect("the refresh should parse");
+        assert_eq!(s.tracks[0].video_id, "ddddddddddd");
+        assert_eq!(s.refresh.as_deref(), Some("AGAIN2"));
+
+        // A long playlist pages through its own shelf, and later pages through the append action.
+        let long = serde_json::json!({"contents": {"twoColumnBrowseResultsRenderer": {
+            "secondaryContents": {"sectionListRenderer": {
+                "contents": [{"musicPlaylistShelfRenderer": {"contents": [
+                    song_row("aaaaaaaaaaa", "One"),
+                    {"continuationItemRenderer": {"continuationEndpoint": {
+                        "continuationCommand": {"token": "PAGE2"}}}}
+                ]}}],
+                "continuations": [{"nextContinuationData": {"continuation": "EXTRAS"}}]
+            }}
+        }}});
+        assert_eq!(parse_playlist_tracks(&long).next.as_deref(), Some("PAGE2"));
+        let page2 = serde_json::json!({"onResponseReceivedActions": [
+            {"appendContinuationItemsAction": {"continuationItems": [
+                song_row("bbbbbbbbbbb", "Two")
+            ]}}
+        ]});
+        let p2 = parse_playlist_tracks(&page2);
+        assert_eq!(p2.items.len(), 1);
+        assert_eq!(p2.next, None);
     }
 
     /// Signed out, VLLM does not come back as an empty shell: it is a

@@ -18,9 +18,10 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
 
-    crate::ui::page_title(ui, &app.palette, &mood.title);
-
+    let title = mood.title.clone();
     crate::ui::page_scroll(app, "mood").show(ui, |ui| {
+        // Inside the scroll, so the title leaves with the page rather than sticking.
+        crate::ui::page_title(ui, &app.palette, &title);
         section(ui, &app.palette, "Playlists");
         let mut clicked = None;
         let mut played = None;

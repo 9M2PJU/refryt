@@ -26,6 +26,14 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 4);
             widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 4);
         }
+        AuthState::Failed(_) if app.offline => {
+            title(app, ui);
+            ui.label(
+                egui::RichText::new("Your history loads once you're back online.")
+                    .font(theme::regular(13.0))
+                    .color(app.palette.secondary),
+            );
+        }
         _ => {
             title(app, ui);
             ui.label(

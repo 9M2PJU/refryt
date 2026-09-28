@@ -615,7 +615,7 @@ impl LibrarySort {
 /// stand-in for that: YouTube serves an ordinary playlist oldest-added-first, so flipping the
 /// served order is a free "newest first" for those — but it is labelled as what it actually
 /// does, since an algorithmic playlist (a radio mix, say) has no "date added" for it to mean.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PlaylistSort {
     /// The order YouTube served the playlist in.
     #[default]
@@ -629,6 +629,15 @@ pub enum PlaylistSort {
 }
 
 impl PlaylistSort {
+    pub(crate) const ALL: [PlaylistSort; 6] = [
+        PlaylistSort::Default,
+        PlaylistSort::Reverse,
+        PlaylistSort::TitleAsc,
+        PlaylistSort::TitleDesc,
+        PlaylistSort::DurationAsc,
+        PlaylistSort::DurationDesc,
+    ];
+
     pub(crate) fn label(self) -> &'static str {
         match self {
             PlaylistSort::Default => "Default",
@@ -750,6 +759,8 @@ pub struct Options {
     /// reaching the end of a list, and there is no way to reproduce that from the outside on
     /// Wayland.
     pub autoscroll: bool,
+    /// Where `autoscroll` stops, in points. `None` scrolls on forever.
+    pub autoscroll_max: Option<f32>,
     /// Open the queue panel at startup. A test aid, like `autoscroll`: the panel is opened by a
     /// click in the player bar, and Wayland offers no way to synthesise one from outside.
     pub queue: bool,
@@ -894,6 +905,7 @@ pub(crate) fn build_local_playlist(
         saveable: false,
         tracks: crate::model::Paged::new(tracks, None),
         source: crate::model::PlaylistSource::Local,
+        extras: None,
     }
 }
 
@@ -1023,6 +1035,65 @@ fn apply_playlist_sort(
     }
 }
 
+/// The two panels whose width can be dragged.
+#[derive(Clone, Copy)]
+enum PanelEdge {
+    Sidebar,
+    Queue,
+}
+
+/// Switch off the line egui draws along a resizable panel's edge under the pointer and while
+/// dragging: it reads those two strokes from the parent's style, so blanking them there removes
+/// it without touching anything drawn inside the panels.
+fn quiet_panel_edges(ui: &mut egui::Ui) {
+    let widgets = &mut ui.visuals_mut().widgets;
+    widgets.hovered.fg_stroke.width = 0.0;
+    widgets.active.fg_stroke.width = 0.0;
+}
+
+/// How often, while offline, the app asks whether YouTube Music answers again.
+const OFFLINE_PROBE: Duration = Duration::from_secs(10);
+
+/// A save refused because the song is already in the playlist — what the dialog asks about.
+#[derive(Clone)]
+pub(crate) struct DuplicatePrompt {
+    pub playlist_id: String,
+    pub video_id: String,
+    /// YouTube's own sentence for it, in the account's language.
+    pub message: String,
+}
+
+/// A playlist's count line ("52 tracks", "4,782 songs") moved by `delta`, keeping YouTube's own
+/// wording. Text with no number in it comes back unchanged.
+fn bump_count(text: &str, delta: i64) -> String {
+    let Some(start) = text.find(|c: char| c.is_ascii_digit()) else {
+        return text.to_owned();
+    };
+    let len = text[start..]
+        .find(|c: char| !(c.is_ascii_digit() || c == ','))
+        .unwrap_or(text.len() - start);
+    let digits = &text[start..start + len];
+    let Ok(n) = digits.replace(',', "").parse::<i64>() else {
+        return text.to_owned();
+    };
+    let n = (n + delta).max(0);
+    // Thousands separators only where YouTube wrote them.
+    let shown = if digits.contains(',') {
+        let raw = n.to_string();
+        let mut out = String::new();
+        for (i, c) in raw.chars().enumerate() {
+            if i > 0 && (raw.len() - i).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    } else {
+        n.to_string()
+    };
+    format!("{}{shown}{}", &text[..start], &text[start + len..])
+}
+
 /// The local half of a playlist drag-reorder: move `items[from]` to sit immediately before
 /// whatever is at `to`. Returns the pair of playlist item ids (`setVideoId`s) the server call
 /// needs — the moved track, then the one it now precedes — or `None` when there is nothing to
@@ -1146,6 +1217,22 @@ pub struct App {
     /// can cache itself against this instead of re-filtering `results.items` every frame.
     pub(crate) results_generation: u64,
     pub(crate) status: Option<String>,
+    /// A request failed for want of a connection, and none has got through since. Drives the
+    /// offline banner and the quiet probe that notices the connection coming back.
+    pub(crate) offline: bool,
+    /// When the next probe may go out while offline.
+    offline_probe_at: Option<Instant>,
+    /// A probe is in flight; its answer arrives as `Event::Connection`.
+    offline_probing: bool,
+    /// Whether each resizable panel's edge was being dragged last frame, so the width is saved
+    /// once, when the drag ends — not on every frame of it, and not when the window's own size
+    /// clamps the panel.
+    panel_dragging: [bool; 2],
+    /// Frames left in which to save a just-dragged width: the release frame and the one after,
+    /// in case egui records the final size a frame late. An unchanged save writes nothing.
+    panel_save: [u8; 2],
+    /// The panels' widths have been set from Settings this session. See `seed_panel_widths`.
+    panels_seeded: bool,
     /// Which kind of result the search page is filtered to. `All` is a view over `results`
     /// (never a second request); every other scope drives a dedicated per-category fetch, since
     /// the mixed ranked response often surfaces far fewer of that kind than actually exist — see
@@ -1249,6 +1336,10 @@ pub struct App {
     /// The playlist page being shown.
     pub(crate) playlist: Option<crate::model::Playlist>,
     pub(crate) playlist_loading: bool,
+    /// The Suggestions under the open playlist, once fetched. Only your own playlists get them.
+    pub(crate) playlist_suggestions: Option<crate::innertube::Suggestions>,
+    /// A Suggestions fetch — first or Refresh — is in flight.
+    pub(crate) playlist_suggestions_loading: bool,
     pub(crate) playlist_error: Option<String>,
     playlist_for: Option<String>,
     /// How the open playlist's track list is currently shown — client-side and session-only,
@@ -1356,6 +1447,9 @@ pub struct App {
     pub(crate) playlist_edit: Option<PlaylistEditor>,
     /// A playlist awaiting delete confirmation: its id and title.
     pub(crate) playlist_delete: Option<(String, String)>,
+    /// A save YouTube refused because the song is already in that playlist, awaiting the
+    /// "Add anyway" / "Cancel" answer.
+    pub(crate) playlist_duplicate: Option<DuplicatePrompt>,
     /// A playlist whose editor should open as soon as its page loads (Edit from the rail).
     edit_on_load: Option<String>,
     /// The title a rename is reverting to if YouTube refuses it: (id, old title).
@@ -1436,6 +1530,7 @@ pub struct App {
 
     /// Debug autoscroll offset, advanced each frame when `--autoscroll` is set.
     pub(crate) autoscroll: Option<f32>,
+    autoscroll_max: f32,
     /// Set for one frame after opening a page, so it starts at the top. Back and Forward do not
     /// set it: returning to a page should return you to where you were on it.
     pub(crate) scroll_to_top: bool,
@@ -1581,6 +1676,7 @@ impl App {
             screenshot,
             page,
             autoscroll,
+            autoscroll_max,
             queue,
             lyrics,
             scheme,
@@ -1702,6 +1798,12 @@ impl App {
             results: SearchResults::default(),
             results_generation: 0,
             status: None,
+            offline: false,
+            offline_probe_at: None,
+            offline_probing: false,
+            panel_dragging: [false; 2],
+            panel_save: [0; 2],
+            panels_seeded: false,
             search_scope: SearchScope::default(),
             scoped_results: Vec::new(),
             scoped_loading: false,
@@ -1736,6 +1838,8 @@ impl App {
             last_liked_save: Instant::now(),
             playlist: None,
             playlist_loading: false,
+            playlist_suggestions: None,
+            playlist_suggestions_loading: false,
             playlist_error: None,
             playlist_for: None,
             playlist_sort: PlaylistSort::default(),
@@ -1782,6 +1886,7 @@ impl App {
             lyrics_for: None,
             playlist_edit: None,
             playlist_delete: None,
+            playlist_duplicate: None,
             edit_on_load: None,
             edit_revert: None,
             rail_cache: std::collections::HashMap::new(),
@@ -1821,6 +1926,7 @@ impl App {
             settings,
             accounts: Vec::new(),
             autoscroll: autoscroll.then_some(0.0),
+            autoscroll_max: autoscroll_max.unwrap_or(f32::INFINITY),
             scroll_to_top: true,
             queue_scroll_reset: false,
             lyrics_scroll_reset: false,
@@ -2882,10 +2988,13 @@ impl App {
         self.playlist_sort = PlaylistSort::default();
         self.playlist_sort_pending = false;
         self.playlist_original_order = None;
+        self.playlist_suggestions = None;
+        self.playlist_suggestions_loading = false;
         // No fetch, no loading state: a local playlist is already fully in memory, built fresh
         // each time so a rescan's updated tags show up without needing its own cache-busting.
         if let Some(lp) = self.local_playlists.iter().find(|p| p.id == id).cloned() {
             self.playlist = Some(self.local_playlist_as_playlist(&lp));
+            self.apply_default_playlist_sort();
             self.playlist_loading = false;
             self.playlist_error = None;
             // Never fires `Event::PlaylistLoaded` — the event that would otherwise consume
@@ -3255,6 +3364,218 @@ impl App {
         self.load_more_playlist();
     }
 
+    /// A song landed in one of your playlists: bring the open copy of it up to date, so the
+    /// count and the list say what the playlist now holds without a reload. Added from its own
+    /// Suggestions, the song moves out of them and into the list. A playlist that is not open but
+    /// was the last one opened is forgotten, so going back to it fetches it fresh rather than
+    /// showing the copy from before the save.
+    fn note_saved_to_playlist(&mut self, playlist_id: &str, video_id: &str) {
+        let bare = crate::model::bare_playlist_id;
+        let open = self
+            .playlist
+            .as_ref()
+            .is_some_and(|p| bare(&p.id) == bare(playlist_id));
+        if !open {
+            if self
+                .playlist_for
+                .as_deref()
+                .is_some_and(|id| bare(id) == bare(playlist_id))
+            {
+                self.playlist_for = None;
+            }
+            return;
+        }
+        let from_suggestions = self.playlist_suggestions.as_mut().and_then(|s| {
+            let i = s.tracks.iter().position(|t| t.video_id == video_id)?;
+            Some(s.tracks.remove(i))
+        });
+        let track = from_suggestions.or_else(|| {
+            let mut found = None;
+            self.for_each_track(|t| {
+                if found.is_none() && t.video_id == video_id {
+                    found = Some(t.clone());
+                }
+            });
+            found
+        });
+        let sort = self.playlist_sort;
+        let Some(pl) = self.playlist.as_mut() else {
+            return;
+        };
+        if let Some(text) = pl.track_count.as_deref() {
+            pl.track_count = Some(bump_count(text, 1));
+        }
+        // Only onto a list that is all here: appended to a partial one, it would sit in the
+        // middle once the next page arrived after it.
+        if pl.tracks.next.is_none()
+            && let Some(mut track) = track
+        {
+            // Not a row of this playlist yet as far as its item id goes; the next load has it.
+            track.set_video_id = None;
+            track.rank = None;
+            if let Some(order) = self.playlist_original_order.as_mut() {
+                order.push(track.video_id.clone());
+            }
+            pl.tracks.items.push(track);
+            if sort != PlaylistSort::Default || self.playlist_original_order.is_some() {
+                apply_playlist_sort(
+                    sort,
+                    &mut pl.tracks.items,
+                    &mut self.playlist_original_order,
+                );
+            }
+        }
+    }
+
+    /// The duplicate dialog's "Add anyway": the same save, with YouTube's check skipped.
+    pub(crate) fn add_duplicate_anyway(&mut self) {
+        if let Some(p) = self.playlist_duplicate.take() {
+            self.backend
+                .add_to_playlist(p.playlist_id, p.video_id, true);
+        }
+    }
+
+    /// A request found no connection. Everything else keeps failing the same way until one
+    /// comes back, so from here the app says so once, in the banner, and listens for it.
+    fn note_offline(&mut self) {
+        if self.offline {
+            return;
+        }
+        tracing::info!("offline: a request could not reach YouTube Music");
+        self.offline = true;
+        self.offline_probe_at = Some(Instant::now() + OFFLINE_PROBE);
+    }
+
+    /// While offline, ask every [`OFFLINE_PROBE`] whether YouTube Music answers again.
+    fn probe_while_offline(&mut self, ctx: &egui::Context) {
+        if !self.offline {
+            return;
+        }
+        let now = Instant::now();
+        if !self.offline_probing && self.offline_probe_at.is_none_or(|at| now >= at) {
+            self.offline_probing = true;
+            self.offline_probe_at = Some(now + OFFLINE_PROBE);
+            self.backend.probe_connection();
+        }
+        // An idle window paints nothing, so the clock that sends the next probe needs a frame.
+        ctx.request_repaint_after(OFFLINE_PROBE);
+    }
+
+    /// The connection is back: confirm the saved session that could not be checked, fill the
+    /// rail, and load again whatever the page on screen failed to load — no Try again needed.
+    fn back_online(&mut self) {
+        if !self.offline {
+            return;
+        }
+        tracing::info!("online again: reloading what failed");
+        self.offline = false;
+        self.offline_probe_at = None;
+        if matches!(self.auth, crate::auth::AuthState::Failed(_))
+            && self.backend.is_signed_in_sync()
+        {
+            // Back to `Checking`, as at launch, so the confirmation that follows is treated as
+            // the startup one and does not throw away what is already loaded.
+            self.auth = crate::auth::AuthState::Checking;
+            self.backend.verify_session();
+        }
+        self.load_sidebar_playlists();
+        match self.current_route() {
+            Route::Search => {
+                if self.status.is_some() && !self.searched.is_empty() {
+                    self.query = self.searched.clone();
+                    self.submit_search();
+                }
+            }
+            _ => self.retry_route(),
+        }
+    }
+
+    /// Start each session at the widths Settings holds, not the ones egui restored. egui persists
+    /// a panel's size with its memory, and brought it back a frame margin short: the sidebar lost
+    /// 8 pt on every launch until it hit its floor. Within a session its own record is
+    /// consistent, so this runs once, before the first panel is shown.
+    fn seed_panel_widths(&mut self, ctx: &egui::Context) {
+        if self.panels_seeded {
+            return;
+        }
+        self.panels_seeded = true;
+        let sidebar = self.settings.sidebar_width.unwrap_or(theme::SIDEBAR_WIDTH);
+        let sidebar_id = egui::Id::new("sidebar");
+        let queue_id = egui::Id::new("right-panel");
+        ctx.data_mut(|d| {
+            d.insert_persisted(
+                sidebar_id,
+                egui::containers::panel::PanelState {
+                    outer_rect: egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(sidebar, 1.0),
+                    ),
+                },
+            );
+            // The queue's starting width depends on the window (see its own panel), so its
+            // record is dropped and `default_size` decides.
+            d.remove::<egui::containers::panel::PanelState>(queue_id);
+        });
+    }
+
+    /// Save a panel's width to Settings when a drag of its edge ends. egui keeps the width in
+    /// its own memory too, but that is a cache it may drop; Settings is the record.
+    fn remember_panel_width(&mut self, ctx: &egui::Context, edge: PanelEdge) {
+        let (name, slot) = match edge {
+            PanelEdge::Sidebar => ("sidebar", 0),
+            PanelEdge::Queue => ("right-panel", 1),
+        };
+        let id = egui::Id::new(name);
+        // The drag handle egui registers for the edge: `<panel id>.with("__resize")`.
+        let dragging = ctx
+            .read_response(id.with("__resize"))
+            .is_some_and(|r| r.dragged());
+        if self.panel_dragging[slot] && !dragging {
+            self.panel_save[slot] = 2;
+        }
+        self.panel_dragging[slot] = dragging;
+        if self.panel_save[slot] == 0 {
+            return;
+        }
+        self.panel_save[slot] -= 1;
+        let Some(width) = egui::containers::panel::PanelState::load(ctx, id).map(|s| s.size().x)
+        else {
+            return;
+        };
+        let width = (width * 2.0).round() / 2.0;
+        self.update_settings(ctx, |s| match edge {
+            PanelEdge::Sidebar => s.sidebar_width = Some(width),
+            PanelEdge::Queue => s.panel_width = Some(width),
+        });
+    }
+
+    /// Swap the open playlist's Suggestions for another batch.
+    pub(crate) fn refresh_playlist_suggestions(&mut self) {
+        if self.playlist_suggestions_loading {
+            return;
+        }
+        let (Some(id), Some(token)) = (
+            self.playlist.as_ref().map(|p| p.id.clone()),
+            self.playlist_suggestions
+                .as_ref()
+                .and_then(|s| s.refresh.clone()),
+        ) else {
+            return;
+        };
+        self.playlist_suggestions_loading = true;
+        self.backend.fetch_playlist_suggestions(id, token);
+    }
+
+    /// Open a freshly loaded playlist in the order Settings asks for. Through [`Self::sort_playlist`],
+    /// so a long playlist loads the rest first, exactly as picking it from the page's own menu.
+    /// Mixes stay as served: `sort_playlist` leaves an expanding one alone.
+    fn apply_default_playlist_sort(&mut self) {
+        let sort = self.settings.playlist_default_sort;
+        if sort != PlaylistSort::Default {
+            self.sort_playlist(sort);
+        }
+    }
+
     /// Ask for the next page of the open playlist's tracks.
     pub(crate) fn load_more_playlist(&mut self) {
         let Some(playlist) = self.playlist.as_mut() else {
@@ -3567,7 +3888,16 @@ impl App {
             self.forward();
         }
         for event in self.backend.drain() {
+            if event.error().is_some_and(crate::api::looks_offline) {
+                self.note_offline();
+            }
             match event {
+                Event::Connection { online } => {
+                    self.offline_probing = false;
+                    if online {
+                        self.back_online();
+                    }
+                }
                 // A slow search that finished after the user typed something else must not
                 // replace fresher results.
                 Event::SearchDone { query, results } if query == self.searched => {
@@ -3763,7 +4093,16 @@ impl App {
                     self.playlist_loading = false;
                     // Keep it for the rail's context menu too.
                     self.cache_rail_playlist(&id, &playlist);
+                    // Suggestions only under your own lists, as on the site: a public playlist's
+                    // extras are other playlists, not songs to add.
+                    if playlist.editable
+                        && let Some(token) = playlist.extras.clone()
+                    {
+                        self.playlist_suggestions_loading = true;
+                        self.backend.fetch_playlist_suggestions(id.clone(), token);
+                    }
                     self.playlist = Some(playlist);
+                    self.apply_default_playlist_sort();
                     // Edit from the rail: the page has arrived, so open its editor now.
                     if self.edit_on_load.as_deref() == Some(id.as_str()) {
                         self.edit_on_load = None;
@@ -3814,6 +4153,14 @@ impl App {
                     self.playlist_sort_pending = false;
                 }
                 Event::PlaylistMore { .. } | Event::PlaylistMoreFailed { .. } => {}
+                Event::PlaylistSuggestions { id, suggestions } if self.playlist_is_for(&id) => {
+                    self.playlist_suggestions_loading = false;
+                    // A failed Refresh keeps the batch on screen rather than emptying the shelf.
+                    if suggestions.is_some() {
+                        self.playlist_suggestions = suggestions;
+                    }
+                }
+                Event::PlaylistSuggestions { .. } => {}
 
                 Event::PlaylistFailed { id, error } if self.playlist_is_for(&id) => {
                     self.playlist_loading = false;
@@ -4543,10 +4890,17 @@ impl App {
                 Event::PlaylistBulkSaved {
                     playlist_id,
                     added,
+                    duplicates,
                     total,
                 } => {
-                    tracing::debug!(%playlist_id, added, total, "bulk save landed");
-                    if added == 0 {
+                    tracing::debug!(%playlist_id, added, duplicates, total, "bulk save landed");
+                    if duplicates > 0 && added + duplicates == total {
+                        self.toast(&match (added, duplicates) {
+                            (0, 1) => "Already in that playlist".to_owned(),
+                            (0, _) => "All of these are already in that playlist".to_owned(),
+                            (a, d) => format!("{a} saved to playlist, {d} already in it"),
+                        });
+                    } else if added == 0 {
                         self.toast_error("Could not save to that playlist");
                     } else if added < total {
                         self.toast(&format!("{added} of {total} songs saved to playlist"));
@@ -4562,6 +4916,19 @@ impl App {
                 } => {
                     tracing::debug!(%playlist_id, %video_id, "saved to playlist");
                     self.toast("Saved to playlist");
+                    self.note_saved_to_playlist(&playlist_id, &video_id);
+                }
+                Event::PlaylistDuplicate {
+                    playlist_id,
+                    video_id,
+                    message,
+                } => {
+                    tracing::debug!(%playlist_id, %video_id, "already in the playlist; asking");
+                    self.playlist_duplicate = Some(DuplicatePrompt {
+                        playlist_id,
+                        video_id,
+                        message,
+                    });
                 }
                 Event::PlaylistSaveFailed {
                     playlist_id,
@@ -4577,6 +4944,13 @@ impl App {
                 } => {
                     tracing::debug!(%playlist_id, %video_id, "removed from playlist");
                     self.toast("Removed from playlist");
+                    if let Some(pl) = self.playlist.as_mut().filter(|p| {
+                        crate::model::bare_playlist_id(&p.id)
+                            == crate::model::bare_playlist_id(&playlist_id)
+                    }) && let Some(text) = pl.track_count.as_deref()
+                    {
+                        pl.track_count = Some(bump_count(text, -1));
+                    }
                 }
                 Event::PlaylistRemoveFailed {
                     playlist_id,
@@ -5193,7 +5567,7 @@ impl App {
                     self.toast_error("Sign in to edit playlists");
                     return;
                 }
-                self.backend.add_to_playlist(playlist_id, video_id);
+                self.backend.add_to_playlist(playlist_id, video_id, false);
             }
             RowAction::RemoveFromPlaylist {
                 playlist_id,
@@ -6178,6 +6552,7 @@ impl eframe::App for App {
             self.stats.enabled = !self.stats.enabled;
         }
         self.handle_events(&ctx);
+        self.probe_while_offline(&ctx);
         self.poll_tray(&ctx);
         self.poll_media(&ctx);
         self.reload_custom_themes(&ctx);
@@ -6288,9 +6663,20 @@ impl eframe::App for App {
             )
             .show(ui, |ui| ui::player_bar::player_bar(self, ui));
 
+        // Resizable by its inner edge, within limits: narrower cuts playlist names to nothing,
+        // wider takes the page's room for no gain. egui keeps the dragged width in its own
+        // persisted memory, so it survives a restart.
+        // egui marks a resizable edge with a full-height line in the hover/active text colour
+        // while the pointer is on it — a bright seam through the gutter. The resize cursor is
+        // the cue here; the line is switched off for the panels' edges and the panels' own
+        // contents get the ordinary style back.
+        self.seed_panel_widths(&ctx);
+        let widgets = ui.visuals().widgets.clone();
+        quiet_panel_edges(ui);
         egui::Panel::left("sidebar")
-            .exact_size(theme::SIDEBAR_WIDTH)
-            .resizable(false)
+            .default_size(self.settings.sidebar_width.unwrap_or(theme::SIDEBAR_WIDTH))
+            .size_range(theme::SIDEBAR_MIN..=theme::SIDEBAR_MAX)
+            .resizable(true)
             .show_separator_line(false)
             .frame(
                 card(p.card_fill(), theme::CARD_INSET).outer_margin(egui::Margin {
@@ -6300,7 +6686,12 @@ impl eframe::App for App {
                     bottom: 0,
                 }),
             )
-            .show(ui, |ui| ui::sidebar::sidebar(self, ui));
+            .show(ui, |ui| {
+                ui.visuals_mut().widgets = widgets.clone();
+                self.remember_panel_width(&ctx, PanelEdge::Sidebar);
+                ui::sidebar::sidebar(self, ui)
+            });
+        ui.visuals_mut().widgets = widgets.clone();
 
         egui::Panel::top("topbar")
             .exact_size(theme::TITLEBAR_HEIGHT)
@@ -6318,25 +6709,33 @@ impl eframe::App for App {
             // of a 750pt window, and the card behind it fell to scraps — every name in the
             // artist and playlist headers ellipsising while a third of the window sat in an
             // empty queue. Down to a floor it keeps enough rail to be a queue.
-            let queue_w = theme::UPNEXT_WIDTH
-                .min(
-                    ui.ctx()
-                        .input(|i| i.raw.screen_rect.map_or(0.0, |r| r.width()))
-                        * 0.30,
-                )
-                .max(200.0);
+            //
+            // Dragged by its inner edge, it keeps to a range: never under what the lyrics need
+            // to set a line without breaking every other word, and never more than 40% of the
+            // window, so a wide panel dragged on a big screen still yields on a small one.
+            let screen_w = ui
+                .ctx()
+                .input(|i| i.raw.screen_rect.map_or(0.0, |r| r.width()));
+            let queue_w = self
+                .settings
+                .panel_width
+                .unwrap_or(theme::UPNEXT_WIDTH.min(screen_w * 0.30))
+                .max(theme::UPNEXT_MIN);
+            let queue_max = (screen_w * 0.40).clamp(theme::UPNEXT_MIN, theme::UPNEXT_MAX);
             let show_queue = self.upnext_open;
             let show_lyrics = self.lyrics_open;
             // The card insets: a small side padding, and none top or bottom — content runs to
             // the card's own top and bottom edges.
             let margins = theme::CARD_INSET;
+            quiet_panel_edges(ui);
             if show_queue && show_lyrics {
                 // Two *cards* sharing the column, not one card split by a hairline: the right
                 // panel itself is transparent, and each half is rounded with the shell's gutter
                 // between them, exactly like the sidebar and the page card.
                 egui::Panel::right("right-panel")
-                    .exact_size(queue_w)
-                    .resizable(false)
+                    .default_size(queue_w)
+                    .size_range(theme::UPNEXT_MIN..=queue_max)
+                    .resizable(true)
                     .show_separator_line(false)
                     .frame(egui::Frame::NONE.outer_margin(egui::Margin {
                         left: 0,
@@ -6345,6 +6744,7 @@ impl eframe::App for App {
                         bottom: 0,
                     }))
                     .show(ui, |ui| {
+                        ui.visuals_mut().widgets = widgets.clone();
                         let half = ((ui.available_height() - f32::from(g)) / 2.0).max(80.0);
                         egui::Panel::top("queue-card")
                             .exact_size(half + f32::from(g))
@@ -6366,8 +6766,9 @@ impl eframe::App for App {
                     });
             } else if show_queue || show_lyrics {
                 egui::Panel::right("right-panel")
-                    .exact_size(queue_w)
-                    .resizable(false)
+                    .default_size(queue_w)
+                    .size_range(theme::UPNEXT_MIN..=queue_max)
+                    .resizable(true)
                     .show_separator_line(false)
                     .frame(card(p.card_fill(), margins).outer_margin(egui::Margin {
                         left: 0,
@@ -6376,6 +6777,7 @@ impl eframe::App for App {
                         bottom: 0,
                     }))
                     .show(ui, |ui| {
+                        ui.visuals_mut().widgets = widgets.clone();
                         if show_queue {
                             ui::upnext::panel(self, ui);
                         } else {
@@ -6383,6 +6785,8 @@ impl eframe::App for App {
                         }
                     });
             }
+            ui.visuals_mut().widgets = widgets;
+            self.remember_panel_width(&ctx, PanelEdge::Queue);
         }
 
         // The video view takes the whole card: no inner margin, so its frame meets the card's
@@ -6419,6 +6823,9 @@ impl eframe::App for App {
                 }
                 let card = widgets::card_rect(top, theme::PAGE_INSET);
                 widgets::clip_card_content(ui, card, theme::PAGE_INSET_X, &p);
+                if self.offline {
+                    ui::offline_banner(self, ui);
+                }
                 match route {
                     Route::Search => ui::search::page(self, ui),
                     Route::Explore => ui::explore::page(self, ui),
@@ -6633,7 +7040,7 @@ impl eframe::App for App {
 
         // Advance the debug scroll, and keep painting so it can actually move.
         if let Some(offset) = &mut self.autoscroll {
-            *offset += 40.0;
+            *offset = (*offset + 40.0).min(self.autoscroll_max);
             ctx.request_repaint();
         }
 
@@ -6676,6 +7083,16 @@ mod tests {
     }
 
     /// A feed is due a refresh once it is `HOME_STALE` old, and never before it has loaded.
+    #[test]
+    fn a_count_line_moves_and_keeps_its_wording() {
+        assert_eq!(bump_count("52 tracks", 1), "53 tracks");
+        assert_eq!(bump_count("53 tracks", -1), "52 tracks");
+        assert_eq!(bump_count("4,782 songs", 1), "4,783 songs");
+        assert_eq!(bump_count("1,000 songs", -1), "999 songs");
+        assert_eq!(bump_count("0 songs", -1), "0 songs");
+        assert_eq!(bump_count("No tracks", 1), "No tracks");
+    }
+
     #[test]
     fn home_goes_stale_after_half_an_hour() {
         let now = Instant::now() + HOME_STALE * 2;

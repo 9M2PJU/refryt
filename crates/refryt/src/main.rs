@@ -45,7 +45,14 @@ fn main() -> eframe::Result {
         .and_then(|p| app::Route::parse(p));
 
     let stats = args.iter().any(|a| a == "--stats");
-    let autoscroll = args.iter().any(|a| a == "--autoscroll");
+    // `--autoscroll-max <pt>` stops there, so a screenshot can land on the end of a page: an
+    // offset past it draws nothing, since egui only clamps it after the frame is laid out.
+    let autoscroll_max = args
+        .iter()
+        .position(|a| a == "--autoscroll-max")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<f32>().ok());
+    let autoscroll = autoscroll_max.is_some() || args.iter().any(|a| a == "--autoscroll");
     let queue = args.iter().any(|a| a == "--queue");
     let lyrics = args.iter().any(|a| a == "--lyrics");
 
@@ -165,6 +172,10 @@ fn main() -> eframe::Result {
         .with_inner_size([1100.0, 720.0])
         .with_min_inner_size([760.0, 480.0]);
 
+    // A test aid: open maximized, for checking layouts at full-screen widths.
+    if args.iter().any(|a| a == "--maximized") {
+        viewport = viewport.with_maximized(true);
+    }
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -207,6 +218,7 @@ fn main() -> eframe::Result {
                         screenshot: screenshot.clone(),
                         page: page.clone(),
                         autoscroll,
+                        autoscroll_max,
                         queue,
                         lyrics,
                         scheme,

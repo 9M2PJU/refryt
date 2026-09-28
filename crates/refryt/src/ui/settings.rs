@@ -446,8 +446,30 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
         &mut double_click,
     );
 
+    ui.add_space(8.0);
+    let mut playlist_sort = app.settings.playlist_default_sort;
+    labeled_row(&app.palette, ui, "Playlist Order", |ui| {
+        for option in crate::app::PlaylistSort::ALL {
+            let label = match option {
+                // Named for what it shows in a playlist you add to: the latest songs on top.
+                crate::app::PlaylistSort::Default => "As saved",
+                crate::app::PlaylistSort::Reverse => "Newest added first",
+                other => other.label(),
+            };
+            if widgets::chip(ui, &app.palette, label, playlist_sort == option).clicked() {
+                playlist_sort = option;
+            }
+        }
+    });
+    note(
+        app,
+        ui,
+        "How playlists are ordered when you open them. The sort button on a playlist still changes it for that visit.",
+    );
+
     let ctx = ui.ctx().clone();
     app.update_settings(&ctx, |s| {
+        s.playlist_default_sort = playlist_sort;
         s.quality = quality;
         s.autoplay = autoplay;
         s.normalise_volume = normalise;

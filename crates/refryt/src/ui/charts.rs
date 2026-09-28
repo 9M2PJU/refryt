@@ -13,21 +13,27 @@ use crate::theme;
 use crate::ui::{failed, section, shelf_carousel};
 use crate::widgets;
 
-pub fn page(app: &mut App, ui: &mut egui::Ui) {
+/// The page's title, drawn by each state so it scrolls away with the list rather than sticking.
+fn title(app: &App, ui: &mut egui::Ui) {
     crate::ui::page_title(ui, &app.palette, "Charts");
+}
 
+pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.charts_loading && app.charts.is_none() {
+        title(app, ui);
         // A ranked section is a 3-column grid, not a single column of rows.
         widgets::skeleton_title(ui, &app.palette);
         widgets::skeleton_chart_grid(ui, &app.palette, 9);
         return;
     }
     if let Some(err) = app.charts_error.clone() {
+        title(app, ui);
         failed(app, ui, err, App::retry_route);
         return;
     }
 
     crate::ui::page_scroll(app, "charts").show(ui, |ui| {
+        title(app, ui);
         // One snapshot for the frame — a refcount bump, not a copy of every section. The
         // cells need `&mut App` for art and playback, which rules out borrowing the feed
         // out of `app` across the call.

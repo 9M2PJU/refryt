@@ -598,6 +598,9 @@ pub struct Playlist {
     /// Paged: a long playlist arrives 100 tracks at a time. "Liked music" is 5,042.
     pub tracks: Paged<Track>,
     pub source: PlaylistSource,
+    /// The token for what YouTube shows below the tracks — the Suggestions on your own
+    /// playlists. Never more tracks: those page through [`Self::tracks`].
+    pub extras: Option<String>,
 }
 
 impl Playlist {

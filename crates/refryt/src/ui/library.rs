@@ -47,6 +47,11 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         match &app.auth {
             AuthState::SignedIn { .. } => content(app, ui),
             AuthState::Checking => centered(app, ui, "Checking your saved session…"),
+            // The session could not be checked for want of a connection — not signed out, so
+            // no sign-in prompt; the banner above says why, and Downloads still works.
+            AuthState::Failed(_) if app.offline => {
+                centered(app, ui, "Your library loads once you're back online.")
+            }
             _ => prompt(app, ui),
         }
     });
@@ -172,6 +177,7 @@ fn downloads_list(app: &mut App, ui: &mut egui::Ui) {
             now,
             library,
             stats,
+            liked,
             ..
         } = app;
         crate::ui::track_rows(
@@ -180,6 +186,7 @@ fn downloads_list(app: &mut App, ui: &mut egui::Ui) {
             images,
             backend,
             stats,
+            liked,
             now,
             &tracks,
             false,
@@ -250,6 +257,7 @@ fn song_list(app: &mut App, ui: &mut egui::Ui) {
             images,
             backend,
             stats,
+            liked,
             now,
             library,
             ..
@@ -260,6 +268,7 @@ fn song_list(app: &mut App, ui: &mut egui::Ui) {
             images,
             backend,
             stats,
+            liked,
             now,
             &library.songs.items,
             false,
@@ -766,6 +775,7 @@ fn local_track_list(app: &mut App, ui: &mut egui::Ui, tracks: &[crate::model::Tr
             images,
             backend,
             stats,
+            liked,
             now,
             library,
             ..
@@ -776,6 +786,7 @@ fn local_track_list(app: &mut App, ui: &mut egui::Ui, tracks: &[crate::model::Tr
             images,
             backend,
             stats,
+            liked,
             now,
             tracks,
             false,

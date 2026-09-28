@@ -52,6 +52,7 @@ icons! {
     PlayFilled => "play-filled",
     Plus => "plus",
     Radio => "radio",
+    RefreshCw => "refresh-cw",
     Repeat => "repeat",
     Repeat1 => "repeat-1",
     Search => "search",

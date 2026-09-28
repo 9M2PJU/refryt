@@ -41,7 +41,140 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         // Breathing room between the header and the first row.
         ui.add_space(10.0);
         track_list(app, ui);
+        suggestions(app, ui);
     });
+}
+
+/// YouTube's suggested songs under one of your playlists, each with a + to add it — the shelf
+/// YouTube Music draws there, with its Refresh. Only once the whole list is in: below a
+/// partial one it would sit between pages of the playlist itself.
+fn suggestions(app: &mut App, ui: &mut egui::Ui) {
+    let complete = app
+        .playlist
+        .as_ref()
+        .is_some_and(|p| p.editable && p.tracks.next.is_none());
+    if !complete {
+        return;
+    }
+    let Some(shelf) = app.playlist_suggestions.clone() else {
+        if app.playlist_suggestions_loading {
+            ui.add_space(20.0);
+            widgets::skeleton_title(ui, &app.palette);
+            widgets::skeleton_track_rows(ui, &app.palette, 4, false);
+        }
+        return;
+    };
+    if shelf.tracks.is_empty() && shelf.refresh.is_none() {
+        return;
+    }
+    // Set apart by space and a quieter heading rather than a rule: a hairline across the card
+    // read as the end of the page, and the section is still part of the playlist's page.
+    ui.add_space(36.0);
+    let mut refresh = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(
+                egui::RichText::new(&shelf.title)
+                    .font(crate::theme::bold(crate::theme::SECTION_PT))
+                    .color(app.palette.text),
+            );
+            ui.label(
+                egui::RichText::new("Based on what's in this playlist")
+                    .font(crate::theme::regular(12.0))
+                    .color(app.palette.dim),
+            );
+        });
+        if shelf.refresh.is_some() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if app.playlist_suggestions_loading {
+                    // The icon's own footprint, turning, while the new batch comes.
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+                    widgets::paint_spinner(ui, rect.center(), 7.0, 2.0, app.palette.secondary);
+                } else {
+                    refresh = widgets::icon_button(
+                        ui,
+                        &app.palette,
+                        crate::icons::Icon::RefreshCw,
+                        18.0,
+                        false,
+                    )
+                    .on_hover_text("Other suggestions")
+                    .clicked();
+                }
+            });
+        }
+    });
+    ui.add_space(8.0);
+    let signed_in = app.signed_in();
+    let outcome = {
+        let App {
+            palette,
+            images,
+            backend,
+            stats,
+            liked,
+            now,
+            playlist,
+            library,
+            ..
+        } = app;
+        let add_to = playlist.as_ref().map(|p| p.id.as_str());
+        let tracks = &shelf.tracks;
+        crate::ui::spec_rows(
+            ui,
+            palette,
+            images,
+            backend,
+            stats,
+            liked,
+            tracks.len(),
+            |i| {
+                let t = &tracks[i];
+                crate::ui::RowSpec {
+                    number: None,
+                    rank: None,
+                    trend: crate::model::ChartTrend::Unknown,
+                    title: &t.title,
+                    album_id: t.album_id.as_deref(),
+                    subtitle: crate::ui::track_subtitle(t),
+                    duration: t.duration,
+                    plays: None,
+                    explicit: t.explicit,
+                    active: crate::ui::is_active(now, &t.video_id),
+                    playing: crate::ui::is_active(now, &t.video_id) && !now.paused,
+                    badge: None,
+                    shape: widgets::ArtShape::Square,
+                    hide_art: false,
+                    thumbnail: t.thumbnail.as_ref(),
+                    menu: Some(widgets::RowMenu {
+                        track: t,
+                        playlist_id: None,
+                        playlists: &library.playlists.items,
+                        signed_in,
+                        queue_index: None,
+                    }),
+                    // The + takes the thumbs' place: this is a list of songs to add, not to rate.
+                    show_rating: false,
+                    quiet_like: false,
+                    like: t.like,
+                    add_to,
+                }
+            },
+        )
+    };
+    if refresh {
+        app.refresh_playlist_suggestions();
+    }
+    match outcome.click {
+        Some(ListClick::Row(i)) => app.start_from(shelf.tracks.clone(), i),
+        Some(ListClick::Link(route)) => app.navigate(route),
+        None => {}
+    }
+    if let Some(action) = outcome.action {
+        app.row_action(action);
+    }
 }
 
 /// The sort icon, painted right on the header's own Play/Save/••• baseline, just past the
@@ -49,14 +182,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
 /// only — the playlist endpoints take no sort of their own, see [`PlaylistSort`]'s own doc
 /// comment.
 fn sort_control(app: &mut App, ui: &mut egui::Ui, anchor: egui::Pos2) {
-    const OPTIONS: &[PlaylistSort] = &[
-        PlaylistSort::Default,
-        PlaylistSort::Reverse,
-        PlaylistSort::TitleAsc,
-        PlaylistSort::TitleDesc,
-        PlaylistSort::DurationAsc,
-        PlaylistSort::DurationDesc,
-    ];
+    const OPTIONS: &[PlaylistSort] = &PlaylistSort::ALL;
     let rect = egui::Rect::from_min_size(anchor + egui::vec2(10.0, -15.0), egui::vec2(260.0, 30.0));
     let mut cui = ui.new_child(
         egui::UiBuilder::new()
@@ -323,6 +449,7 @@ fn track_list(app: &mut App, ui: &mut egui::Ui) {
             images,
             backend,
             stats,
+            liked,
             now,
             playlist,
             library,
@@ -344,6 +471,7 @@ fn track_list(app: &mut App, ui: &mut egui::Ui) {
             images,
             backend,
             stats,
+            liked,
             now,
             tracks,
             true,
@@ -382,6 +510,7 @@ fn track_list(app: &mut App, ui: &mut egui::Ui) {
 pub(crate) fn modals(app: &mut App, ui: &mut egui::Ui) {
     edit_modal(app, ui);
     delete_modal(app, ui);
+    duplicate_modal(app, ui);
 }
 
 fn edit_modal(app: &mut App, ui: &mut egui::Ui) {
@@ -488,16 +617,64 @@ fn edit_modal(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn delete_modal(app: &mut App, ui: &mut egui::Ui) {
-    let Some((id, title)) = app.playlist_delete.clone() else {
+    let Some((_, title)) = app.playlist_delete.clone() else {
         return;
     };
-    let Some(screen) = ui.ctx().input(|i| i.raw.screen_rect) else {
-        app.playlist_delete = Some((id, title));
+    match confirm_modal(
+        app,
+        ui,
+        "ytm-delete-playlist-modal",
+        "Delete playlist",
+        &format!("Delete \"{title}\"? This cannot be undone."),
+        "Delete",
+    ) {
+        // `confirm_delete_playlist` takes the pending entry and fires the request.
+        Some(true) => app.confirm_delete_playlist(),
+        Some(false) => app.playlist_delete = None,
+        None => {}
+    }
+}
+
+/// A save YouTube refused because the song is already there: add it again, or leave it. The
+/// question YouTube Music asks, in YouTube's own words.
+fn duplicate_modal(app: &mut App, ui: &mut egui::Ui) {
+    let Some(prompt) = app.playlist_duplicate.clone() else {
         return;
     };
+    let message = if prompt.message.is_empty() {
+        "This song is already in the playlist."
+    } else {
+        prompt.message.as_str()
+    };
+    match confirm_modal(
+        app,
+        ui,
+        "ytm-duplicate-modal",
+        "Already added",
+        message,
+        "Add anyway",
+    ) {
+        Some(true) => app.add_duplicate_anyway(),
+        Some(false) => app.playlist_duplicate = None,
+        None => {}
+    }
+}
+
+/// A small confirm card over a dimmed window: a title, a sentence, Cancel and one action.
+/// `Some(true)` on the action, `Some(false)` on Cancel, Escape or a click outside, `None` while
+/// it is still open.
+fn confirm_modal(
+    app: &App,
+    ui: &mut egui::Ui,
+    id: &str,
+    title: &str,
+    message: &str,
+    action: &str,
+) -> Option<bool> {
+    let screen = ui.ctx().input(|i| i.raw.screen_rect)?;
     let p = app.palette;
-    let (mut delete, mut cancel, mut dismissed) = (false, false, false);
-    egui::Area::new(egui::Id::new("ytm-delete-playlist-modal"))
+    let (mut confirm, mut cancel, mut dismissed) = (false, false, false);
+    egui::Area::new(egui::Id::new(id))
         .order(egui::Order::Middle)
         .fixed_pos(screen.min)
         .interactable(true)
@@ -532,21 +709,21 @@ fn delete_modal(app: &mut App, ui: &mut egui::Ui) {
                     .layout(egui::Layout::top_down(egui::Align::LEFT)),
             );
             body.label(
-                egui::RichText::new("Delete playlist")
+                egui::RichText::new(title)
                     .font(crate::theme::semibold(15.0))
                     .color(p.text),
             );
             body.add_space(6.0);
             body.label(
-                egui::RichText::new(format!("Delete \"{title}\"? This cannot be undone."))
+                egui::RichText::new(message)
                     .font(crate::theme::regular(12.0))
                     .color(p.secondary),
             );
             body.add_space(12.0);
             body.allocate_ui(egui::vec2(body.available_width(), 30.0), |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if widgets::chip(ui, &p, "Delete", true).clicked() {
-                        delete = true;
+                    if widgets::chip(ui, &p, action, true).clicked() {
+                        confirm = true;
                     }
                     if widgets::chip(ui, &p, "Cancel", false).clicked() {
                         cancel = true;
@@ -555,10 +732,11 @@ fn delete_modal(app: &mut App, ui: &mut egui::Ui) {
             });
             cancel = cancel || body.input(|i| i.key_pressed(egui::Key::Escape));
         });
-    if delete {
-        // `confirm_delete_playlist` takes the pending entry and fires the request.
-        app.confirm_delete_playlist();
+    if confirm {
+        Some(true)
     } else if cancel || dismissed {
-        app.playlist_delete = None;
+        Some(false)
+    } else {
+        None
     }
 }

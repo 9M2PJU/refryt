@@ -28,24 +28,14 @@ const HERO_MAX_H: f32 = 440.0;
 const SIDE_COL_MIN: f32 = 740.0;
 /// The "You Liked" tile's column.
 const SIDE_COL_W: f32 = 300.0;
+/// The You Liked tile's round cover, for its placeholder.
+const LIKED_ART: f32 = 96.0;
 /// How many segments approximate the hero's top corners. The same count the header wash uses.
 const HERO_ARC_STEPS: usize = 10;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.artist_loading {
-        widgets::skeleton_header(
-            ui,
-            &app.palette,
-            HEADER_ART_PT,
-            widgets::SkeletonHeaderKind::Artist,
-        );
-        widgets::skeleton_track_rows(ui, &app.palette, 6, false);
-        widgets::skeleton_shelf(
-            ui,
-            &app.palette,
-            widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
-            4,
-        );
+        skeleton(app, ui);
         return;
     }
     if let Some(err) = app.artist_error.clone() {
@@ -78,6 +68,122 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         circle_header(app, ui);
     }
     action_row(app, ui);
+}
+
+/// The page's placeholder, in the page's own shape: the hero band across the card, the control
+/// row under it, Popular's numbered rows beside a You Liked tile where the page will have one,
+/// then a shelf of cards. The old one — a small round header over a column of rows — looked like
+/// a different page until the real one replaced it.
+fn skeleton(app: &App, ui: &mut egui::Ui) {
+    let p = app.palette;
+    let inset_x = crate::theme::PAGE_INSET_X;
+    let top = ui.cursor().min;
+    let width = ui.available_width() + inset_x * 2.0;
+    let height = (width * crate::images::HERO_ASPECT).clamp(HERO_MIN_H, HERO_MAX_H);
+    let hero = egui::Rect::from_min_size(pos2(top.x - inset_x, top.y), vec2(width, height));
+    let card = egui::Rect::from_min_max(
+        pos2(app.content_rect.min.x - inset_x, app.content_rect.min.y),
+        pos2(app.content_rect.max.x + inset_x, app.content_rect.max.y),
+    );
+    let r = crate::theme::PANEL_RADIUS;
+    widgets::skeleton_fill_in(
+        ui,
+        hero,
+        egui::CornerRadius {
+            nw: r,
+            ne: r,
+            sw: 0,
+            se: 0,
+        },
+        &p,
+        card,
+    );
+    ui.add_space(height);
+
+    // The controls: Play, Mix and Shuffle, then Subscribe.
+    ui.add_space(14.0);
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), egui::Sense::hover());
+    let mid = row.center().y;
+    let round = |d: f32| egui::CornerRadius::same((d / 2.0) as u8);
+    let mut x = row.left();
+    for d in [56.0, 34.0, 34.0] {
+        widgets::skeleton_fill_in(
+            ui,
+            egui::Rect::from_min_size(pos2(x, mid - d / 2.0), vec2(d, d)),
+            round(d),
+            &p,
+            ui.clip_rect(),
+        );
+        x += d + 12.0;
+    }
+    widgets::skeleton_fill_in(
+        ui,
+        egui::Rect::from_min_size(pos2(x + 6.0, mid - 16.0), vec2(110.0, 32.0)),
+        round(32.0),
+        &p,
+        ui.clip_rect(),
+    );
+
+    // Popular, beside You Liked when the page will show it — known before the page is, from the
+    // liked index — and the card is wide enough for both.
+    let liked = app
+        .artist_id()
+        .map(|id| app.liked.count_for_artist(id))
+        .unwrap_or(0);
+    if liked > 0 && ui.available_width() >= SIDE_COL_MIN {
+        const GAP: f32 = 28.0;
+        let left_w = (ui.available_width() - SIDE_COL_W - GAP).max(0.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                vec2(left_w, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_min_width(left_w);
+                    widgets::skeleton_title(ui, &p);
+                    widgets::skeleton_track_rows(ui, &p, 5, false);
+                },
+            );
+            ui.add_space(GAP - ui.spacing().item_spacing.x);
+            ui.allocate_ui_with_layout(
+                vec2(SIDE_COL_W, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    // The tile: a round cover with the count and the credit beside it.
+                    widgets::skeleton_title(ui, &p);
+                    let (tile, _) = ui.allocate_exact_size(
+                        vec2(SIDE_COL_W, LIKED_ART + 16.0),
+                        egui::Sense::hover(),
+                    );
+                    let art = egui::Rect::from_min_size(
+                        tile.min + vec2(0.0, 8.0),
+                        vec2(LIKED_ART, LIKED_ART),
+                    );
+                    widgets::skeleton_fill_in(ui, art, round(LIKED_ART), &p, ui.clip_rect());
+                    for (dy, w, h) in [(-10.0, 90.0, 12.0), (8.0, 60.0, 9.0)] {
+                        widgets::skeleton_fill_in(
+                            ui,
+                            egui::Rect::from_min_size(
+                                pos2(art.right() + 16.0, art.center().y + dy),
+                                vec2(w, h),
+                            ),
+                            egui::CornerRadius::same(crate::theme::RADIUS_SMALL),
+                            &p,
+                            ui.clip_rect(),
+                        );
+                    }
+                },
+            );
+        });
+    } else {
+        widgets::skeleton_title(ui, &p);
+        widgets::skeleton_track_rows(ui, &p, 5, false);
+    }
+    widgets::skeleton_shelf(
+        ui,
+        &p,
+        widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
+        4,
+    );
 }
 
 /// The reference's hero: the banner painted across the card's own width, from its rounded top
@@ -550,6 +656,7 @@ fn top_songs(app: &mut App, ui: &mut egui::Ui) {
             images,
             backend,
             stats,
+            liked,
             now,
             artist,
             library,
@@ -572,6 +679,7 @@ fn top_songs(app: &mut App, ui: &mut egui::Ui) {
             images,
             backend,
             stats,
+            liked,
             heading,
             true,
             now,

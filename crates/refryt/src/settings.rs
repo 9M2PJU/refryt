@@ -292,6 +292,13 @@ pub struct Settings {
     /// Folders scanned for local audio files, shown in the Library's Local tab. Absolute paths,
     /// same shape as `playlist_order`.
     pub local_folders: Vec<String>,
+    /// The order a playlist opens in. `Default` is the playlist's own; `Reverse` puts the
+    /// newest additions first. The page's sort menu still changes it for that visit.
+    pub playlist_default_sort: crate::app::PlaylistSort,
+    /// The sidebar's width as last dragged, in points. `None` until it has been.
+    pub sidebar_width: Option<f32>,
+    /// The queue/lyrics panel's width as last dragged. Still capped by the window on the way in.
+    pub panel_width: Option<f32>,
 }
 
 impl Default for Settings {
@@ -317,6 +324,9 @@ impl Default for Settings {
             hide_tray_on_close: false,
             discord_rich_presence: false,
             local_folders: Vec::new(),
+            playlist_default_sort: crate::app::PlaylistSort::Default,
+            sidebar_width: None,
+            panel_width: None,
         }
     }
 }

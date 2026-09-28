@@ -51,7 +51,14 @@ pub const ROW_NUMBER_W: f32 = 26.0;
 pub const ROW_NUMBER_GAP: f32 = 12.0;
 pub const PLAYER_BAR_HEIGHT: f32 = 88.0;
 pub const SIDEBAR_WIDTH: f32 = 280.0;
+/// How far the sidebar can be dragged either way.
+pub const SIDEBAR_MIN: f32 = 200.0;
+pub const SIDEBAR_MAX: f32 = 400.0;
 pub const UPNEXT_WIDTH: f32 = 288.0;
+/// The queue/lyrics panel's drag range. The floor is what the lyrics need to set a line without
+/// breaking every other word; the ceiling is further capped at 40% of the window.
+pub const UPNEXT_MIN: f32 = 240.0;
+pub const UPNEXT_MAX: f32 = 480.0;
 pub const TITLEBAR_HEIGHT: f32 = 56.0;
 
 /// The gap between panels, through which the window background shows.

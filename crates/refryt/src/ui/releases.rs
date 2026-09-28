@@ -8,11 +8,15 @@ use crate::app::App;
 use crate::ui::{failed, shelf_carousel};
 use crate::widgets;
 
-pub fn page(app: &mut App, ui: &mut egui::Ui) {
+/// The page's title, drawn by each state so it scrolls away with the list rather than sticking.
+fn title(app: &App, ui: &mut egui::Ui) {
     crate::ui::page_title(ui, &app.palette, "New releases");
+}
 
+pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.releases_loading && app.releases.is_none() {
         // Always albums & singles — card shelves, never a track-list one, unlike Home/Explore.
+        title(app, ui);
         widgets::skeleton_shelf(
             ui,
             &app.palette,
@@ -28,11 +32,13 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     if let Some(err) = app.releases_error.clone() {
+        title(app, ui);
         failed(app, ui, err, App::retry_route);
         return;
     }
 
     crate::ui::page_scroll(app, "releases").show(ui, |ui| {
+        title(app, ui);
         // One snapshot for the frame: the carousel needs `&mut App`, which rules out
         // borrowing the feed out of `app` across the call.
         let Some(shelves) = app.releases.clone() else {

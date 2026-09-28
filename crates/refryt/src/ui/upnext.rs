@@ -44,6 +44,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                 images,
                 backend,
                 stats,
+                liked,
                 now,
                 queue,
                 library,
@@ -55,6 +56,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                 images,
                 backend,
                 stats,
+                liked,
                 queue.len() - start,
                 |i| {
                     let t = &queue[start + i];
@@ -97,6 +99,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                         // Rating a queued song is one click away on the player bar.
                         show_rating: false,
                         quiet_like: false,
+                        add_to: None,
                     }
                 },
             )
@@ -175,11 +178,12 @@ fn now_playing(app: &mut App, ui: &mut egui::Ui) {
                 images,
                 backend,
                 stats,
+                liked,
                 now,
                 ..
             } = app;
             let subtitle = track_subtitle_no_album(&track);
-            spec_rows(ui, palette, images, backend, stats, 1, |_| RowSpec {
+            spec_rows(ui, palette, images, backend, stats, liked, 1, |_| RowSpec {
                 number: None,
                 rank: track.rank.as_deref(),
                 trend: track.trend,
@@ -203,6 +207,7 @@ fn now_playing(app: &mut App, ui: &mut egui::Ui) {
                 like: track.like,
                 show_rating: false,
                 quiet_like: false,
+                add_to: None,
             })
         })
         .inner;

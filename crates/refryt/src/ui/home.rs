@@ -20,19 +20,21 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         // The real feed is several titled shelves, mixing grids and row-lists — never one
         // untitled block. Which shelves are coming can't be known before they load, so this is
         // a reasonable approximation of the shape, not a prediction of the exact content.
+        // In the order the feed usually opens with: Listen again's cards, Quick picks' song
+        // grid, then more cards.
         widgets::skeleton_shelf(
             ui,
             &app.palette,
             widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
             4,
         );
+        widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::SongGrid, 4);
         widgets::skeleton_shelf(
             ui,
             &app.palette,
             widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
             4,
         );
-        widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 4);
         return;
     }
     if let Some(err) = app.home_error.clone() {

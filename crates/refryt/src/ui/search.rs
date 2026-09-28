@@ -129,6 +129,7 @@ fn results_list(app: &mut App, ui: &mut egui::Ui) {
             images,
             backend,
             stats,
+            liked,
             now,
             results,
             scoped_results,
@@ -136,9 +137,16 @@ fn results_list(app: &mut App, ui: &mut egui::Ui) {
             ..
         } = app;
         let items: &[Entry] = if all { &results.items } else { scoped_results };
-        spec_rows(ui, palette, images, backend, stats, indices.len(), |i| {
-            crate::ui::entry_row_spec(&items[indices[i]], now, library, signed_in)
-        })
+        spec_rows(
+            ui,
+            palette,
+            images,
+            backend,
+            stats,
+            liked,
+            indices.len(),
+            |i| crate::ui::entry_row_spec(&items[indices[i]], now, library, signed_in),
+        )
     };
 
     // Forwarded before the click: a menu choice arrives with no row click, and the `None`

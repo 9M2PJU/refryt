@@ -171,9 +171,18 @@ impl Api {
             return Ok(false);
         };
         let http = self.http().await;
-        let token = BrowserToken::from_str(&cookie, &http)
-            .await
-            .context("the saved cookie is invalid or expired; sign in again")?;
+        let token = match BrowserToken::from_str(&cookie, &http).await {
+            Ok(token) => token,
+            // Building the token is a request of its own, so with no connection it fails too —
+            // and that is no reason to tell someone offline that their sign-in is gone.
+            Err(e) if looks_offline(&e.to_string()) => {
+                return Err(anyhow::Error::new(e).context("could not reach YouTube Music"));
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context("the saved cookie is invalid or expired; sign in again"));
+            }
+        };
         let yt = ytmapi_rs::builder::YtMusicBuilder::new_with_client(http)
             .with_auth_token(token)
             .build()
@@ -894,7 +903,20 @@ impl Api {
                 p.page.next,
             ),
             source: model::PlaylistSource::YouTube,
+            extras: p.extras,
         }
+    }
+
+    /// The Suggestions below one of your playlists, from its [`model::Playlist::extras`] token or
+    /// the shelf's own Refresh token. `None` when the response held no such shelf.
+    pub async fn playlist_suggestions(
+        &self,
+        token: String,
+    ) -> Result<Option<innertube::Suggestions>> {
+        let json = self
+            .run_browse_owned(BrowseQuery::next_page(token), "playlist suggestions")
+            .await?;
+        Ok(innertube::parse_playlist_suggestions(&json))
     }
 
     /// The next page of a playlist's tracks.
@@ -961,6 +983,7 @@ impl Api {
             saveable: false,
             tracks: model::Paged::new(tracks, None),
             source: model::PlaylistSource::YouTube,
+            extras: None,
         })
     }
 
@@ -1483,7 +1506,39 @@ impl Api {
     /// Add a video to one of your playlists, or remove it by its playlist item id. Signed in
     /// only. The edit endpoint wants the bare playlist id; the library hands out the `VL`
     /// browse form, so it is stripped here.
+    ///
+    /// A refusal in the reply's own status is an error here too — it used to pass as success,
+    /// which is how a song already in the playlist was toasted as saved. An add goes through
+    /// [`Self::add_to_playlist`] instead, which tells a duplicate apart.
     pub async fn edit_playlist(&self, playlist_id: &str, edit: PlaylistEdit) -> Result<()> {
+        match self.edit_playlist_reply(playlist_id, edit).await? {
+            innertube::EditReply::Done => Ok(()),
+            innertube::EditReply::Duplicate(m) | innertube::EditReply::Refused(m) => {
+                anyhow::bail!("YouTube refused the edit to {playlist_id}: {m}")
+            }
+        }
+    }
+
+    /// Add a song to one of your playlists. A song already there is not added, and the reply
+    /// says so — unless `allow_duplicate`, the dialog's "Add anyway", skips that check.
+    pub async fn add_to_playlist(
+        &self,
+        playlist_id: &str,
+        video_id: &str,
+        allow_duplicate: bool,
+    ) -> Result<innertube::EditReply> {
+        let edit = PlaylistEdit::AddVideo {
+            video_id: video_id.to_owned(),
+            allow_duplicate,
+        };
+        self.edit_playlist_reply(playlist_id, edit).await
+    }
+
+    async fn edit_playlist_reply(
+        &self,
+        playlist_id: &str,
+        edit: PlaylistEdit,
+    ) -> Result<innertube::EditReply> {
         let query = EditPlaylistQuery {
             playlist_id: playlist_id.to_owned(),
             edit,
@@ -1492,8 +1547,11 @@ impl Api {
             ClientRef::NoAuth(_) => anyhow::bail!("sign in to edit playlists"),
             ClientRef::Browser(yt) => yt.json_query(query).await,
         };
-        json.map(|_| ())
-            .with_context(|| format!("could not edit playlist {playlist_id}"))
+        let json = json
+            .map(ytmapi_rs::json::Json::into_inner)
+            .with_context(|| format!("could not edit playlist {playlist_id}"))?;
+        dump("REFRYT_DUMP_EDIT", &json);
+        Ok(innertube::parse_edit_reply(&json))
     }
 
     /// Delete one of your own playlists. Signed in only. The path wants the bare id.
@@ -1905,6 +1963,8 @@ impl ytmapi_rs::query::PostQuery for FeedbackQuery {
 pub enum PlaylistEdit {
     AddVideo {
         video_id: String,
+        /// Skip YouTube's already-in-the-playlist check: the dialog's "Add anyway".
+        allow_duplicate: bool,
     },
     RemoveVideo {
         video_id: String,
@@ -1950,10 +2010,19 @@ impl ytmapi_rs::query::PostQuery for EditPlaylistQuery {
             serde_json::json!(model::bare_playlist_id(&self.playlist_id)),
         );
         let action = match &self.edit {
-            PlaylistEdit::AddVideo { video_id } => serde_json::json!({
-                "action": "ACTION_ADD_VIDEO",
-                "addedVideoId": video_id,
-            }),
+            PlaylistEdit::AddVideo {
+                video_id,
+                allow_duplicate,
+            } => {
+                let mut add = serde_json::json!({
+                    "action": "ACTION_ADD_VIDEO",
+                    "addedVideoId": video_id,
+                });
+                if *allow_duplicate {
+                    add["dedupeOption"] = serde_json::json!("DEDUPE_OPTION_SKIP");
+                }
+                add
+            }
             PlaylistEdit::RemoveVideo {
                 video_id,
                 set_video_id,
@@ -2236,6 +2305,25 @@ fn dump(var: &str, json: &serde_json::Value) {
     if let Some(path) = std::env::var_os(var) {
         let _ = std::fs::write(path, serde_json::to_vec_pretty(json).unwrap_or_default());
     }
+}
+
+/// Whether an error reads as "no connection" rather than as YouTube refusing something: the
+/// request never got an answer. Read from the text because the errors arrive as strings in the
+/// app's events, and each layer — reqwest, `ytmapi-rs`, yt-dlp — words it its own way.
+pub fn looks_offline(error: &str) -> bool {
+    const SIGNS: &[&str] = &[
+        "error sending request",
+        "dns error",
+        "failed to lookup address",
+        "name resolution",
+        "connection refused",
+        "network is unreachable",
+        "no route to host",
+        "tcp connect error",
+        "could not reach youtube music",
+    ];
+    let error = error.to_ascii_lowercase();
+    SIGNS.iter().any(|sign| error.contains(sign))
 }
 
 /// Record a refused write, so the server's own words survive.

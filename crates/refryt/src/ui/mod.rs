@@ -286,6 +286,22 @@ pub(crate) struct RowSpec<'a> {
     pub quiet_like: bool,
     /// Your rating, for the hover thumbs. `Indifferent` where the source carries none.
     pub like: LikeStatus,
+    /// See `widgets::TrackRow::add_to` — the Suggestions under your own playlist.
+    pub add_to: Option<&'a str>,
+}
+
+/// A row's rating: its own when the source carried one, else the liked index's. Search results,
+/// Home shelves and most browse pages never say whether a song is liked, but the index knows every
+/// song the account has liked — asked at draw time, so a scan that lands after the page did still
+/// marks it.
+fn row_like(s: &RowSpec<'_>, liked: &crate::liked::Index) -> LikeStatus {
+    if s.like != LikeStatus::Indifferent {
+        return s.like;
+    }
+    s.menu
+        .as_ref()
+        .and_then(|m| liked.like_of(&m.track.video_id))
+        .unwrap_or(s.like)
 }
 
 /// The subtitle of a track row: its artist, then its album, each a link where we have the id.
@@ -475,6 +491,7 @@ pub(crate) fn spec_rows<'d>(
     images: &mut Images,
     backend: &Backend,
     stats: &mut crate::stats::Stats,
+    liked: &crate::liked::Index,
     count: usize,
     spec: impl Fn(usize) -> RowSpec<'d>,
 ) -> ListOutcome {
@@ -483,6 +500,7 @@ pub(crate) fn spec_rows<'d>(
     let mut reorder = None;
     let drawn = virtual_rows(ui, theme::ROW_HEIGHT, count, |ui, i| {
         let s = spec(i);
+        let like = row_like(&s, liked);
         // Only an editable playlist's own track list ever sets this — see `RowMenu::playlist_id`
         // and `ListOutcome::reorder`'s own doc comments.
         let draggable = s.menu.as_ref().and_then(|m| m.playlist_id).is_some();
@@ -522,9 +540,10 @@ pub(crate) fn spec_rows<'d>(
                 hide_art: s.hide_art,
                 id_salt: i,
                 menu: s.menu,
-                like: s.like,
+                like,
                 show_rating: s.show_rating,
                 quiet_like: s.quiet_like,
+                add_to: s.add_to,
             },
         );
         // A link wins over the row: clicking the artist name must not also start the track.
@@ -575,11 +594,13 @@ pub(crate) fn spec_rows<'d>(
 
 /// One cell of a track grid: its own child `Ui` at an explicit rect, the same split
 /// `page_header` uses for its control row. Used by the paged view (`track_shelf_pages`).
+#[allow(clippy::too_many_arguments)]
 fn paint_grid_cell<'d>(
     ui: &mut egui::Ui,
     palette: &theme::Palette,
     images: &mut Images,
     backend: &Backend,
+    liked: &crate::liked::Index,
     cell_rect: egui::Rect,
     i: usize,
     s: RowSpec<'d>,
@@ -590,6 +611,7 @@ fn paint_grid_cell<'d>(
             .max_rect(cell_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
+    let like = row_like(&s, liked);
     let art = if s.shape == crate::widgets::ArtShape::Wide {
         art_texture_wide(
             images,
@@ -624,9 +646,10 @@ fn paint_grid_cell<'d>(
             hide_art: false,
             id_salt: i,
             menu: s.menu,
-            like: s.like,
+            like,
             show_rating: s.show_rating,
             quiet_like: s.quiet_like,
+            add_to: s.add_to,
         },
     );
     // A link wins over the row: clicking the artist name must not also start the track.
@@ -668,6 +691,7 @@ fn spec_pages<'d>(
     images: &mut Images,
     backend: &Backend,
     stats: &mut crate::stats::Stats,
+    liked: &crate::liked::Index,
     heading: &str,
     strapline: Option<&str>,
     count: usize,
@@ -748,28 +772,34 @@ fn spec_pages<'d>(
     // column, 6-10 down the second, and so on. A row-major fill put 1,2,3 across the top, so
     // reading a column gave 1,4,7,10.
     let rows_here = (end - start).min(rows);
-    for r in 0..rows_here {
-        let top_left = ui.cursor().min;
-        for c in 0..cols {
-            let i = grid_index(start, c, r, rows);
-            if i >= end {
-                break;
+    // Under the shelf's own id: every cell's links are keyed by its index, and Home stacks
+    // several of these grids in one parent — the first song of each shelf shared one id, so a
+    // click on a title or an artist was claimed by whichever shelf registered it last.
+    ui.push_id(id, |ui| {
+        for r in 0..rows_here {
+            let top_left = ui.cursor().min;
+            for c in 0..cols {
+                let i = grid_index(start, c, r, rows);
+                if i >= end {
+                    break;
+                }
+                let x = top_left.x + c as f32 * (col_w + gap);
+                let cell_rect = egui::Rect::from_min_size(
+                    egui::pos2(x, top_left.y),
+                    egui::vec2(col_w, theme::ROW_HEIGHT),
+                );
+                let (click, act) =
+                    paint_grid_cell(ui, palette, images, backend, liked, cell_rect, i, spec(i));
+                if click.is_some() {
+                    clicked = click;
+                }
+                if action.is_none() {
+                    action = act;
+                }
             }
-            let x = top_left.x + c as f32 * (col_w + gap);
-            let cell_rect = egui::Rect::from_min_size(
-                egui::pos2(x, top_left.y),
-                egui::vec2(col_w, theme::ROW_HEIGHT),
-            );
-            let (click, act) = paint_grid_cell(ui, palette, images, backend, cell_rect, i, spec(i));
-            if click.is_some() {
-                clicked = click;
-            }
-            if action.is_none() {
-                action = act;
-            }
+            ui.add_space(theme::ROW_HEIGHT);
         }
-        ui.add_space(theme::ROW_HEIGHT);
-    }
+    });
     stats.rows(end - start, count);
     ListOutcome {
         click: clicked,
@@ -795,6 +825,7 @@ pub(crate) fn track_rows(
     images: &mut Images,
     backend: &Backend,
     stats: &mut crate::stats::Stats,
+    liked: &crate::liked::Index,
     now: &crate::player::NowPlaying,
     tracks: &[crate::model::Track],
     numbered: bool,
@@ -810,6 +841,7 @@ pub(crate) fn track_rows(
         images,
         backend,
         stats,
+        liked,
         now,
         tracks,
         numbered,
@@ -830,6 +862,7 @@ pub(crate) fn track_rows_quiet(
     images: &mut Images,
     backend: &Backend,
     stats: &mut crate::stats::Stats,
+    liked: &crate::liked::Index,
     now: &crate::player::NowPlaying,
     tracks: &[crate::model::Track],
     numbered: bool,
@@ -840,38 +873,48 @@ pub(crate) fn track_rows_quiet(
     hide_art: bool,
     quiet_like: bool,
 ) -> ListOutcome {
-    spec_rows(ui, palette, images, backend, stats, tracks.len(), |i| {
-        let t = &tracks[i];
-        RowSpec {
-            number: numbered.then_some(i + 1),
-            rank: t.rank.as_deref(),
-            trend: t.trend,
-            title: &t.title,
-            album_id: t.album_id.as_deref(),
-            subtitle: track_subtitle_inner(t, hide_album),
-            duration: t.duration,
-            plays: t.plays.as_deref(),
-            explicit: t.explicit,
-            active: is_active(now, &t.video_id),
-            playing: is_active(now, &t.video_id) && !now.paused,
-            badge: None,
-            // Square, always: `t.wide` marks a music video for playback, but the art in a
-            // track list is the album/playlist cover and a 16:9 slot only crops it.
-            shape: widgets::ArtShape::Square,
-            hide_art,
-            thumbnail: t.thumbnail.as_ref(),
-            menu: Some(widgets::RowMenu {
-                track: t,
-                playlist_id,
-                playlists,
-                signed_in,
-                queue_index: None,
-            }),
-            like: t.like,
-            show_rating: true,
-            quiet_like,
-        }
-    })
+    spec_rows(
+        ui,
+        palette,
+        images,
+        backend,
+        stats,
+        liked,
+        tracks.len(),
+        |i| {
+            let t = &tracks[i];
+            RowSpec {
+                number: numbered.then_some(i + 1),
+                rank: t.rank.as_deref(),
+                trend: t.trend,
+                title: &t.title,
+                album_id: t.album_id.as_deref(),
+                subtitle: track_subtitle_inner(t, hide_album),
+                duration: t.duration,
+                plays: t.plays.as_deref(),
+                explicit: t.explicit,
+                active: is_active(now, &t.video_id),
+                playing: is_active(now, &t.video_id) && !now.paused,
+                badge: None,
+                // Square, always: `t.wide` marks a music video for playback, but the art in a
+                // track list is the album/playlist cover and a 16:9 slot only crops it.
+                shape: widgets::ArtShape::Square,
+                hide_art,
+                thumbnail: t.thumbnail.as_ref(),
+                menu: Some(widgets::RowMenu {
+                    track: t,
+                    playlist_id,
+                    playlists,
+                    signed_in,
+                    queue_index: None,
+                }),
+                like: t.like,
+                show_rating: true,
+                quiet_like,
+                add_to: None,
+            }
+        },
+    )
 }
 
 /// Paged instead of wrapped — for a short, bounded list where growing indefinitely tall would be
@@ -893,6 +936,7 @@ pub(crate) fn track_shelf_pages(
     images: &mut Images,
     backend: &Backend,
     stats: &mut crate::stats::Stats,
+    liked: &crate::liked::Index,
     heading: &str,
     numbered: bool,
     now: &crate::player::NowPlaying,
@@ -908,6 +952,7 @@ pub(crate) fn track_shelf_pages(
         images,
         backend,
         stats,
+        liked,
         heading,
         None,
         tracks.len(),
@@ -968,6 +1013,7 @@ pub(crate) fn shelf_track_spec<'a>(
         like: t.like,
         show_rating: true,
         quiet_like: false,
+        add_to: None,
     }
 }
 
@@ -1252,7 +1298,7 @@ fn carousel_refit(off: f32, old_pitch: f32, new_pitch: f32, max: f32) -> f32 {
 /// them fills the row exactly — no card cut in half at the right edge. The count is the one
 /// nearest to cards of `base` width, so cards stay about their usual size and only stretch or
 /// shrink by the fraction it takes to fit.
-fn carousel_fit(view: f32, gap: f32, base: f32) -> (usize, f32) {
+pub(crate) fn carousel_fit(view: f32, gap: f32, base: f32) -> (usize, f32) {
     let n = ((view + gap) / (base + gap)).round().max(1.0);
     (n as usize, ((view - (n - 1.0) * gap) / n).max(1.0))
 }
@@ -1374,7 +1420,11 @@ pub(crate) fn carousel(
     // Setting `.scroll_offset` only on the click frame is what keeps hand drags working.
     let want: f32 = ui.ctx().data(|d| d.get_temp(id)).unwrap_or(0.0);
     let mut area = egui::ScrollArea::horizontal().id_salt(("ytm-carousel", salt));
-    if (want - off).abs() > f32::EPSILON {
+    // The scroll area's own offset is persisted with the rest of egui's memory, so a fresh
+    // launch would reopen the row wherever last session left it — other shelves, other card
+    // widths, usually partway into a card. The first frame this session sees the row, it
+    // starts at the beginning.
+    if last_card_w.is_none() || (want - off).abs() > f32::EPSILON {
         area = area.scroll_offset(egui::vec2(want, 0.0));
     }
     let out = area.show(ui, |ui| {
@@ -1864,6 +1914,8 @@ pub(crate) struct HeaderOutcome {
     pub link: Option<Route>,
     /// The art as it was actually drawn — shrunken from the request when the card is narrow.
     pub art_bottom: f32,
+    /// Where the art was drawn, for a page that paints its own cover over it.
+    pub art_rect: egui::Rect,
     /// The point just past the last button drawn (Play, Save or •••, whichever was last),
     /// vertically centred on the row — where a caller-specific extra control (the playlist
     /// page's sort icon) can paint itself on the same baseline. `None` when no control row was
@@ -2175,6 +2227,7 @@ pub(crate) fn page_header(
         dots: None,
         link,
         art_bottom: art_rect.bottom(),
+        art_rect,
         controls_end: None,
     };
     if h.play_size.is_none() && h.save_in_library.is_none() && !h.dots {
@@ -2439,6 +2492,7 @@ pub(crate) fn entry_row_spec<'a>(
         },
         show_rating: true,
         quiet_like: false,
+        add_to: None,
     }
 }
 
@@ -2453,13 +2507,21 @@ pub(crate) fn entry_rows(app: &mut crate::app::App, ui: &mut egui::Ui, items: &[
             images,
             backend,
             stats,
+            liked,
             now,
             library,
             ..
         } = app;
-        spec_rows(ui, palette, images, backend, stats, items.len(), |i| {
-            entry_row_spec(&items[i], now, library, signed_in)
-        })
+        spec_rows(
+            ui,
+            palette,
+            images,
+            backend,
+            stats,
+            liked,
+            items.len(),
+            |i| entry_row_spec(&items[i], now, library, signed_in),
+        )
     };
     if let Some(action) = clicked.action {
         app.row_action(action);
@@ -2618,13 +2680,12 @@ pub(crate) fn song_shelf(
             images,
             backend,
             stats,
+            liked,
             now,
             library,
             ..
         } = app;
-        // Narrower than Top songs' 400 pt columns: Home has the whole card to itself, and
-        // YouTube Music fits three columns of songs across it.
-        let cols = ((ui.available_width() / 250.0).floor() as usize).clamp(1, 3);
+        let cols = song_shelf_columns(ui.available_width());
         // Every item is a track here (the caller checks); a non-track, which cannot happen, is
         // skipped by drawing nothing rather than panicking mid-frame.
         let tracks: Vec<&crate::model::Track> =
@@ -2635,6 +2696,7 @@ pub(crate) fn song_shelf(
             images,
             backend,
             stats,
+            liked,
             &shelf.title,
             shelf.strapline.as_deref(),
             tracks.len(),
@@ -2652,6 +2714,12 @@ pub(crate) fn song_shelf(
     if let Some(action) = out.action {
         app.row_action(action);
     }
+}
+
+/// How many columns of songs a Home song shelf lays out at `width`. Narrower than Top songs' 400
+/// pt columns: Home has the whole card to itself, and YouTube Music fits three across it.
+pub(crate) fn song_shelf_columns(width: f32) -> usize {
+    ((width / 250.0).floor() as usize).clamp(1, 3)
 }
 
 pub(crate) fn section(ui: &mut egui::Ui, palette: &theme::Palette, name: &str) {
@@ -2697,19 +2765,76 @@ pub(crate) fn failed(
     message: String,
     retry: impl FnOnce(&mut crate::app::App),
 ) {
-    ui.centered_and_justified(|ui| {
-        ui.label(
-            egui::RichText::new(message)
-                .font(theme::regular(13.0))
-                .color(app.palette.danger),
-        );
-    });
-    ui.add_space(8.0);
-    ui.centered_and_justified(|ui| {
-        if crate::widgets::pill_button(ui, &app.palette, "Try again").clicked() {
-            retry(app);
+    // No connection is not an error to read out: the raw chain ("error sending request for url
+    // …") only says what the banner already does. Anything else keeps YouTube's own words.
+    let offline = crate::api::looks_offline(&message);
+    // A third of the way down rather than dead centre: centring the message in the whole page
+    // with `centered_and_justified` took every point of height, and the Try again button under
+    // it was pushed off the bottom of the card.
+    ui.add_space((ui.available_height() * 0.3).max(24.0));
+    let mut again = false;
+    ui.vertical_centered(|ui| {
+        ui.set_max_width(ui.available_width().min(460.0));
+        if offline {
+            ui.label(
+                egui::RichText::new("This page needs a connection")
+                    .font(theme::bold(16.0))
+                    .color(app.palette.text),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("It loads again by itself once you're back online.")
+                    .font(theme::regular(13.0))
+                    .color(app.palette.secondary),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(message)
+                    .font(theme::regular(13.0))
+                    .color(app.palette.danger),
+            );
         }
+        ui.add_space(14.0);
+        again = crate::widgets::pill_button(ui, &app.palette, "Try again").clicked();
     });
+    if again {
+        retry(app);
+    }
+}
+
+/// The strip across the top of the page while the app has no connection: what is going on, and
+/// the one place that still works without one.
+pub(crate) fn offline_banner(app: &mut crate::app::App, ui: &mut egui::Ui) {
+    let p = app.palette;
+    let mut open = false;
+    ui.add_space(12.0);
+    egui::Frame::NONE
+        .fill(p.surface)
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("You're offline")
+                        .font(theme::semibold(13.0))
+                        .color(p.text),
+                );
+                ui.label(
+                    egui::RichText::new("· Downloaded songs still play")
+                        .font(theme::regular(13.0))
+                        .color(p.secondary),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    open = crate::widgets::outline_button(ui, &p, "Downloads").clicked();
+                });
+            });
+        });
+    ui.add_space(10.0);
+    if open {
+        app.rail_filter = crate::app::RailFilter::Downloads;
+        app.navigate(Route::Library);
+    }
 }
 
 #[cfg(test)]

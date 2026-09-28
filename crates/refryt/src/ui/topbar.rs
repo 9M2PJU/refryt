@@ -19,10 +19,14 @@ use crate::theme;
 use crate::widgets;
 
 /// How wide the search pill is at most, and how small it is allowed to get before the bar is
-/// just too narrow to hold everything.
+/// just too narrow to hold everything — the magnifier and a few letters. Only a window at its
+/// minimum with the sidebar dragged wide gets near it; above that the gap always wins.
 const SEARCH_W: f32 = 360.0;
-const MIN_SEARCH_W: f32 = 140.0;
+const MIN_SEARCH_W: f32 = 96.0;
 const SEARCH_H: f32 = 36.0;
+
+/// The clear space between the search pill and the History clock, kept at every width.
+const RIGHT_GAP: f32 = 20.0;
 
 /// Back + Forward and the gaps around them, the fixed part left of the search pill.
 const LEFT_W: f32 = 32.0 + 4.0 + 32.0 + 12.0;
@@ -64,7 +68,7 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
         app.navigate(Route::History);
     }
     // Whatever the right group took, plus a gap so the search never touches it.
-    let reserved = (rect.right() - right.min_rect().left()).max(0.0) + 12.0;
+    let reserved = (rect.right() - right.min_rect().left()).max(0.0) + RIGHT_GAP;
 
     let mut bar = ui.new_child(
         egui::UiBuilder::new()
@@ -78,6 +82,8 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
     bar.add_space(4.0);
     let forward = history_button(&mut bar, &p, Icon::ChevronRight, can_forward);
     bar.add_space(12.0);
+    // The gap wins over the search's comfortable minimum: in a narrow window the pill keeps
+    // shrinking rather than running up against the History clock.
     let search_w = (rect.width() - LEFT_W - reserved).clamp(MIN_SEARCH_W, SEARCH_W);
     search_field(app, &mut bar, search_w);
 

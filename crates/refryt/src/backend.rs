@@ -131,6 +131,16 @@ pub enum Event {
         id: String,
         error: String,
     },
+    /// The answer to [`Backend::probe_connection`]: whether YouTube Music answered at all.
+    Connection {
+        online: bool,
+    },
+    /// The Suggestions under one of your playlists. `None` when there were none, or the fetch
+    /// failed — either way the page simply shows no Suggestions.
+    PlaylistSuggestions {
+        id: String,
+        suggestions: Option<crate::innertube::Suggestions>,
+    },
     /// An album/playlist card's own play button was pressed — its tracks, fetched just to
     /// start playing them, not to open the page. Deliberately its own event rather than
     /// reusing `AlbumLoaded`/`PlaylistLoaded`: those are guarded by `album_is_for`/
@@ -367,7 +377,16 @@ pub enum Event {
     PlaylistBulkSaved {
         playlist_id: String,
         added: usize,
+        /// Songs left out because the playlist already had them.
+        duplicates: usize,
         total: usize,
+    },
+    /// The song is already in that playlist, so it was not added. `message` is YouTube's own
+    /// sentence for it; the app asks whether to add it anyway.
+    PlaylistDuplicate {
+        playlist_id: String,
+        video_id: String,
+        message: String,
     },
     /// A playlist write landed. Saving needs no UI change — the song lives elsewhere now —
     /// while a removal drops the row from the open page.
@@ -423,6 +442,56 @@ pub enum Event {
     ImageReady(Box<images::Loaded>),
     /// The URL and the size that was asked for — the cache keys on both.
     ImageFailed(Arc<str>, u32, bool),
+}
+
+impl Event {
+    /// The error a failure carries, for the one question asked of all of them at once: does
+    /// this read as having no connection? See [`crate::api::looks_offline`]. A local folder scan
+    /// failing is left out — the disk has nothing to say about the network.
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Event::SearchFailed { error, .. }
+            | Event::ScopedSearchFailed { error, .. }
+            | Event::SuggestionsFailed { error, .. }
+            | Event::DownloadFailed { error, .. }
+            | Event::ArtistFailed { error, .. }
+            | Event::ArtistAlbumsFailed { error, .. }
+            | Event::AlbumFailed { error, .. }
+            | Event::PlaylistFailed { error, .. }
+            | Event::PlaylistMoreFailed { error, .. }
+            | Event::LibraryMoreFailed { error, .. }
+            | Event::SidebarPlaylistsFailed { error, .. }
+            | Event::LibraryFailed { error, .. }
+            | Event::SubscriptionFailed { error, .. }
+            | Event::ExploreFailed { error, .. }
+            | Event::ReleasesFailed { error, .. }
+            | Event::ChartsFailed { error, .. }
+            | Event::MoodsFailed { error, .. }
+            | Event::HistoryFailed { error, .. }
+            | Event::PlaylistCreateFailed { error, .. }
+            | Event::HomeFailed { error, .. }
+            | Event::HomeMoreFailed { error, .. }
+            | Event::HomeShelfFailed { error, .. }
+            | Event::MoodPlaylistsFailed { error, .. }
+            | Event::MixFailed { error, .. }
+            | Event::MixMoreFailed { error, .. }
+            | Event::MixSeedFailed { error, .. }
+            | Event::LyricsFailed { error, .. }
+            | Event::RatingFailed { error, .. }
+            | Event::LibraryToggleFailed { error, .. }
+            | Event::PageLibraryFailed { error, .. }
+            | Event::PlaylistEditFailed { error, .. }
+            | Event::PlaylistDeleteFailed { error, .. }
+            | Event::PlaylistLibraryFailed { error, .. }
+            | Event::PlaylistSaveFailed { error, .. }
+            | Event::PlaylistRemoveFailed { error, .. }
+            | Event::PlaylistMoveFailed { error, .. }
+            | Event::SignInFailed { error, .. }
+            | Event::PlaybackFailed { error, .. } => Some(error),
+            Event::AuthChanged(AuthState::Failed(error)) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// How a page header's library flip is written. Album headers carry no feedback token —
@@ -1216,6 +1285,41 @@ impl Backend {
         });
     }
 
+    /// The Suggestions under one of your playlists — the first batch, or a Refresh.
+    pub fn fetch_playlist_suggestions(&self, id: String, token: String) {
+        let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let suggestions = match api.playlist_suggestions(token).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(%id, error = %format!("{e:#}"), "could not load playlist suggestions");
+                    None
+                }
+            };
+            Self::emit(&tx, &ctx, Event::PlaylistSuggestions { id, suggestions });
+        });
+    }
+
+    /// Is YouTube Music reachable again? Asked every few seconds while the app believes it is
+    /// offline — one small request, answered by `Event::Connection`.
+    pub fn probe_connection(&self) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let online = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(client) => client
+                    .head("https://music.youtube.com/")
+                    .send()
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            Self::emit(&tx, &ctx, Event::Connection { online });
+        });
+    }
+
     /// The first page of your playlists, for the sidebar.
     pub fn fetch_library_playlists(&self, epoch: u64) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
@@ -1682,13 +1786,17 @@ impl Backend {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             let total = video_ids.len();
-            let mut added = 0;
+            let (mut added, mut duplicates) = (0, 0);
+            // A song the playlist already has is skipped, not asked about: a page saves dozens,
+            // and a dialog per song would be worse than the summary saying how many were there.
             for video_id in &video_ids {
-                let edit = crate::api::PlaylistEdit::AddVideo {
-                    video_id: video_id.clone(),
-                };
-                match api.edit_playlist(&playlist_id, edit).await {
-                    Ok(()) => added += 1,
+                match api.add_to_playlist(&playlist_id, video_id, false).await {
+                    Ok(crate::innertube::EditReply::Done) => added += 1,
+                    Ok(crate::innertube::EditReply::Duplicate(_)) => duplicates += 1,
+                    Ok(crate::innertube::EditReply::Refused(m)) => {
+                        tracing::warn!(%playlist_id, video_id = %video_id, message = %m,
+                            "bulk save refused a song");
+                    }
                     Err(e) => tracing::warn!(%playlist_id, video_id = %video_id,
                         error = %format!("{e:#}"), "bulk save refused a song"),
                 }
@@ -1699,6 +1807,7 @@ impl Backend {
                 Event::PlaylistBulkSaved {
                     playlist_id,
                     added,
+                    duplicates,
                     total,
                 },
             );
@@ -1725,17 +1834,28 @@ impl Backend {
         });
     }
 
-    /// Save a video to one of your playlists.
-    pub fn add_to_playlist(&self, playlist_id: String, video_id: String) {
+    /// Save a video to one of your playlists. A song already there comes back as
+    /// `PlaylistDuplicate` rather than being added twice, unless `allow_duplicate`.
+    pub fn add_to_playlist(&self, playlist_id: String, video_id: String, allow_duplicate: bool) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
-            let edit = crate::api::PlaylistEdit::AddVideo {
-                video_id: video_id.clone(),
-            };
-            let event = match api.edit_playlist(&playlist_id, edit).await {
-                Ok(()) => Event::PlaylistSaved {
+            let reply = api
+                .add_to_playlist(&playlist_id, &video_id, allow_duplicate)
+                .await;
+            let event = match reply {
+                Ok(crate::innertube::EditReply::Done) => Event::PlaylistSaved {
                     playlist_id,
                     video_id,
+                },
+                Ok(crate::innertube::EditReply::Duplicate(message)) => Event::PlaylistDuplicate {
+                    playlist_id,
+                    video_id,
+                    message,
+                },
+                Ok(crate::innertube::EditReply::Refused(m)) => Event::PlaylistSaveFailed {
+                    playlist_id,
+                    video_id,
+                    error: format!("refused: {m}"),
                 },
                 Err(e) => Event::PlaylistSaveFailed {
                     playlist_id,

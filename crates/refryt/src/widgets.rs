@@ -315,7 +315,7 @@ impl ArtShape {
     /// The corner radius that produces this shape for `rect`. A radius of half the side is a
     /// circle; `CornerRadius` is a `u8`, so very large art clamps (harmlessly — nothing we draw is
     /// anywhere near 510px across).
-    fn radius(self, rect: Rect) -> CornerRadius {
+    pub(crate) fn radius(self, rect: Rect) -> CornerRadius {
         match self {
             // The curve grows with the art — an eighth of the edge, floored at the general
             // radius so 40px row covers keep today's corner, capped so a big card's corners
@@ -604,6 +604,9 @@ pub struct TrackRow<'a> {
     /// Keep a like out of sight until the row is hovered. Liked Music sets it: every row there
     /// is liked by definition, so a filled thumb down the whole list says nothing.
     pub quiet_like: bool,
+    /// A playlist this song can be added to with one press: a round + at the row's end, left of
+    /// the duration. The Suggestions below your own playlist, as YouTube Music draws them.
+    pub add_to: Option<&'a str>,
 }
 
 /// Paint a subtitle left to right, each linked piece getting its own hit area, and report the
@@ -1348,6 +1351,18 @@ pub fn paint_spinner(ui: &Ui, center: egui::Pos2, radius: f32, width: f32, color
 /// a soft highlight gliding across it. The highlight's position comes from time and the shape's
 /// place on screen alone, so every skeleton on the page shimmers as one band, slanted by height.
 fn skeleton_fill(ui: &Ui, rect: Rect, radius: impl Into<CornerRadius>, palette: &Palette) {
+    skeleton_fill_in(ui, rect, radius, palette, ui.clip_rect());
+}
+
+/// [`skeleton_fill`] against a clip of the caller's own — the artist hero's placeholder reaches
+/// past the content column to the card's edges, as the hero itself does.
+pub fn skeleton_fill_in(
+    ui: &Ui,
+    rect: Rect,
+    radius: impl Into<CornerRadius>,
+    palette: &Palette,
+    clip: Rect,
+) {
     let ctx = ui.ctx();
     let now = ui.input(|i| i.time);
     if let Some(wait) = skeleton_wait(now, skeleton_since(ctx)) {
@@ -1355,6 +1370,7 @@ fn skeleton_fill(ui: &Ui, rect: Rect, radius: impl Into<CornerRadius>, palette: 
         return;
     }
     ui.painter()
+        .with_clip_rect(clip)
         .rect_filled(rect, radius, palette.surface_hover);
     // Reduced motion: the shapes alone, still, and no frames asked for.
     if reduced_motion() {
@@ -1386,9 +1402,7 @@ fn skeleton_fill(ui: &Ui, rect: Rect, radius: impl Into<CornerRadius>, palette: 
         mesh.add_triangle(i, i + 1, i + 2);
         mesh.add_triangle(i + 1, i + 3, i + 2);
     }
-    ui.painter()
-        .with_clip_rect(rect.intersect(ui.clip_rect()))
-        .add(mesh);
+    ui.painter().with_clip_rect(rect.intersect(clip)).add(mesh);
 }
 
 /// Grey placeholder lines of text, for a panel whose content is prose (the lyrics).
@@ -1416,8 +1430,36 @@ pub fn skeleton_rows(ui: &mut Ui, palette: &Palette, n: usize) {
             vec2(ui.available_width(), theme::ROW_HEIGHT),
             Sense::hover(),
         );
+        skeleton_row_at(ui, palette, rect);
+    }
+}
+
+/// A song shelf's placeholder in the shape Home draws it: rows filled down columns, as many
+/// columns as [`crate::ui::song_shelf`] would fit at this width.
+pub fn skeleton_song_grid(ui: &mut Ui, palette: &Palette, rows: usize) {
+    let width = ui.available_width();
+    let cols = crate::ui::song_shelf_columns(width);
+    // The real grid's own gutter (`spec_pages`).
+    let gap = 12.0;
+    let col_w = (width - gap * (cols - 1) as f32) / cols as f32;
+    let (area, _) =
+        ui.allocate_exact_size(vec2(width, theme::ROW_HEIGHT * rows as f32), Sense::hover());
+    for c in 0..cols {
+        for r in 0..rows {
+            let rect = Rect::from_min_size(
+                area.min + vec2(c as f32 * (col_w + gap), r as f32 * theme::ROW_HEIGHT),
+                vec2(col_w, theme::ROW_HEIGHT),
+            );
+            skeleton_row_at(ui, palette, rect);
+        }
+    }
+}
+
+/// One placeholder row — cover, title, credit — painted into `rect`.
+fn skeleton_row_at(ui: &Ui, palette: &Palette, rect: Rect) {
+    {
         if !ui.is_rect_visible(rect) {
-            continue;
+            return;
         }
         let art = Rect::from_min_size(
             egui::pos2(rect.left() + 8.0, rect.center().y - theme::ART_SIZE / 2.0),
@@ -1584,8 +1626,11 @@ pub fn skeleton_chart_grid(ui: &mut Ui, palette: &Palette, n: usize) {
 /// The shape a [`skeleton_shelf`] stands in for.
 #[derive(Clone, Copy)]
 pub enum SkeletonShelfShape {
+    /// One row of cards, fitted to the width as the carousel fits them.
     Cards(ArtShape),
     Rows,
+    /// Home's song shelves: rows down columns, four deep.
+    SongGrid,
 }
 
 /// A whole titled shelf's placeholder — a title-bar bar in [`crate::ui::section`]'s own spot,
@@ -1594,8 +1639,11 @@ pub enum SkeletonShelfShape {
 pub fn skeleton_shelf(ui: &mut Ui, palette: &Palette, shape: SkeletonShelfShape, n: usize) {
     skeleton_title(ui, palette);
     match shape {
-        SkeletonShelfShape::Cards(art_shape) => skeleton_cards(ui, palette, n, art_shape),
+        // Every card shelf is one row that scrolls sideways now, so its placeholder is the row
+        // it will be: as many cards as fit, each as wide as the carousel will make it.
+        SkeletonShelfShape::Cards(art_shape) => skeleton_card_row(ui, palette, art_shape),
         SkeletonShelfShape::Rows => skeleton_rows(ui, palette, n),
+        SkeletonShelfShape::SongGrid => skeleton_song_grid(ui, palette, n),
     }
 }
 
@@ -1614,38 +1662,50 @@ pub fn skeleton_title(ui: &mut Ui, palette: &Palette) {
 pub fn skeleton_cards(ui: &mut Ui, palette: &Palette, n: usize, shape: ArtShape) {
     ui.horizontal_wrapped(|ui| {
         for _ in 0..n {
-            let size = card_size(super::ui::CARD_W, shape);
-            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-            if !ui.is_rect_visible(rect) {
-                continue;
-            }
-            let art = Rect::from_min_size(
-                rect.min + vec2(8.0, 8.0),
-                vec2(
-                    super::ui::CARD_W - 16.0,
-                    card_art_height(super::ui::CARD_W, shape),
-                ),
-            );
-            let radius = match shape {
-                ArtShape::Circle => {
-                    CornerRadius::same((art.height() / 2.0).clamp(0.0, 255.0) as u8)
-                }
-                ArtShape::Square | ArtShape::Wide => CornerRadius::same(theme::RADIUS),
-            };
-            skeleton_fill(ui, art, radius, palette);
-            for (dy, w) in [(14.0, 0.7), (28.0, 0.45)] {
-                skeleton_fill(
-                    ui,
-                    Rect::from_min_size(
-                        art.left_bottom() + vec2(0.0, dy),
-                        vec2((super::ui::CARD_W - 16.0) * w, 9.0),
-                    ),
-                    CornerRadius::same(theme::RADIUS_SMALL),
-                    palette,
-                );
-            }
+            skeleton_card(ui, palette, super::ui::CARD_W, shape);
         }
     });
+}
+
+/// One row of placeholder cards, sized exactly as [`crate::ui::carousel`] sizes the real ones.
+pub fn skeleton_card_row(ui: &mut Ui, palette: &Palette, shape: ArtShape) {
+    let gap = 8.0;
+    let (n, card_w) = crate::ui::carousel_fit(ui.available_width(), gap, super::ui::CARD_W);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for _ in 0..n {
+            skeleton_card(ui, palette, card_w, shape);
+        }
+    });
+}
+
+/// One placeholder card: cover, then a title and a subtitle bar, in [`card_size`]'s footprint.
+fn skeleton_card(ui: &mut Ui, palette: &Palette, width: f32, shape: ArtShape) {
+    let size = card_size(width, shape);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let art = Rect::from_min_size(
+        rect.min + vec2(8.0, 8.0),
+        vec2(width - 16.0, card_art_height(width, shape)),
+    );
+    let radius = match shape {
+        ArtShape::Circle => CornerRadius::same((art.height() / 2.0).clamp(0.0, 255.0) as u8),
+        ArtShape::Square | ArtShape::Wide => CornerRadius::same(theme::RADIUS),
+    };
+    skeleton_fill(ui, art, radius, palette);
+    for (dy, w) in [(14.0, 0.7), (28.0, 0.45)] {
+        skeleton_fill(
+            ui,
+            Rect::from_min_size(
+                art.left_bottom() + vec2(0.0, dy),
+                vec2((width - 16.0) * w, 9.0),
+            ),
+            CornerRadius::same(theme::RADIUS_SMALL),
+            palette,
+        );
+    }
 }
 
 /// What kind of detail header [`skeleton_header`] is standing in for — controls how many text
@@ -1744,6 +1804,7 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         like,
         show_rating,
         quiet_like,
+        add_to,
     } = row;
     let mut link = None;
     // `click_and_drag`, not `click`: a row inside the open playlist's own editable track list
@@ -1791,7 +1852,9 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
     // and a readable title in a 300pt rail.
     // Wide enough for the pair: two 30pt buttons at offsets 50/18 span 62pt, and anything
     // narrower paints the Like button over the title's tail.
-    let thumb_w = if show_rating && !corner_thumbs {
+    let thumb_w = if add_to.is_some() {
+        ADD_W
+    } else if show_rating && !corner_thumbs {
         68.0
     } else {
         0.0
@@ -2079,6 +2142,7 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
     // The menu lives outside the visibility check: allocation and interaction happen whether
     // the row is painted or not, and a menu opened at the pointer must survive the row
     // scrolling out from under it.
+    let video_id = add_to.and(menu.as_ref()).map(|m| m.track.video_id.clone());
     let ratable = menu
         .as_ref()
         .filter(|_| show_rating)
@@ -2112,12 +2176,64 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
             action = Some(rate);
         }
     }
+    if let (Some(playlist_id), Some(video_id)) = (add_to, video_id) {
+        let hit_rect = Rect::from_center_size(
+            egui::pos2(
+                rect.right() - right_pad - duration_w - ADD_W / 2.0,
+                rect.center().y,
+            ),
+            vec2(30.0, 30.0),
+        );
+        if add_button(
+            ui,
+            palette,
+            hit_rect,
+            ui.id().with(("ytm-row-add", id_salt)),
+        )
+        .clicked()
+        {
+            action = Some(super::ui::RowAction::SaveToPlaylist {
+                playlist_id: playlist_id.to_owned(),
+                video_id,
+            });
+        }
+    }
     RowClick {
         response,
         link,
         activate,
         action,
     }
+}
+
+/// The room a row's + button takes, left of the duration.
+const ADD_W: f32 = 40.0;
+
+/// A row's round + button: always drawn, since adding is the whole point of the row it sits on.
+fn add_button(ui: &mut Ui, palette: &Palette, rect: Rect, id: egui::Id) -> egui::Response {
+    let response = ui.interact(rect, id, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let t = lit(ui, &response);
+        let backing = if held(&response) {
+            Some(palette.surface_active)
+        } else {
+            (t > 0.001).then(|| palette.surface_hover.gamma_multiply(t))
+        };
+        if let Some(fill) = backing {
+            ui.painter().circle_filled(rect.center(), 15.0, fill);
+        }
+        let size = 18.0;
+        Icon::Plus
+            .image(mix(palette.secondary, palette.text, t), size)
+            .paint_at(
+                ui,
+                Rect::from_center_size(rect.center() + press_offset(&response), vec2(size, size)),
+            );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.on_hover_text("Add to playlist")
 }
 
 /// A song's right-click menu, reporting the choice. Shared by every row and the player bar.
@@ -3431,7 +3547,9 @@ pub fn icon_dropdown(
     current: &str,
     options: &[&str],
 ) -> Option<usize> {
-    let response = icon_button(ui, palette, icon, 16.0, active);
+    // The size of the icons it stands beside — Shuffle, Mix — so the sort control never reads
+    // as the small one of the row.
+    let response = icon_button(ui, palette, icon, 20.0, active);
 
     let mut choice = None;
     let popup = egui::Popup::from_response(&response)
@@ -4577,6 +4695,7 @@ mod tests {
                         like: track.like,
                         show_rating: false,
                         quiet_like: false,
+                        add_to: None,
                     },
                 );
                 fired = hit.activate;
@@ -4804,6 +4923,7 @@ mod tests {
                         like: track.like,
                         show_rating: false,
                         quiet_like: false,
+                        add_to: None,
                     },
                 );
                 fired = hit.activate;
@@ -4936,6 +5056,7 @@ mod tests {
                         like: track.like,
                         show_rating: false,
                         quiet_like: false,
+                        add_to: None,
                     },
                 );
                 at = hit.response.rect.center();
