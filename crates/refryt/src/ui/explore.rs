@@ -26,21 +26,23 @@ fn link_target(link: &crate::model::ExploreLink) -> Option<(Icon, Route)> {
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.explore_loading && app.explore.is_none() {
         crate::ui::page_title(ui, &app.palette, "Explore");
-        // Same reasoning as `home.rs`: several titled carousels, mixing grids and row-lists,
-        // not one untitled block.
+        // The three buttons are known before the feed is (their static fallbacks), so they are
+        // real from the start; then the feed's usual shape: new albums, top songs, and the
+        // Moods & genres chips.
+        top_buttons(app, ui);
         widgets::skeleton_shelf(
             ui,
             &app.palette,
             widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
-            4,
+            1,
         );
         widgets::skeleton_shelf(
             ui,
             &app.palette,
             widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
-            4,
+            1,
         );
-        widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 4);
+        widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Chips, 3);
         return;
     }
     if let Some(err) = app.explore_error.clone() {

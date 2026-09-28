@@ -17,23 +17,37 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.home_loading && app.home.is_none() {
         // The first row's distance from the card's top, matching the sides.
         ui.add_space(theme::PAGE_INSET_X);
+        // The feed's own mood chips head it, as `filter_chips` draws them.
+        widgets::skeleton_pills(ui, &app.palette, 10);
+        ui.add_space(4.0);
         // The real feed is several titled shelves, mixing grids and row-lists — never one
         // untitled block. Which shelves are coming can't be known before they load, so this is
         // a reasonable approximation of the shape, not a prediction of the exact content.
         // In the order the feed usually opens with: Listen again's cards, Quick picks' song
-        // grid, then more cards.
+        // grid, then more cards. Each with the air `home_shelf` and `song_shelf` give theirs.
+        ui.add_space(20.0);
+        // Signed in, Listen again carries a line over its title — the account's name.
+        if app.signed_in() {
+            widgets::skeleton_strapline(ui, &app.palette);
+        }
         widgets::skeleton_shelf(
             ui,
             &app.palette,
             widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
-            4,
+            1,
         );
-        widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::SongGrid, 4);
+        widgets::skeleton_shelf(
+            ui,
+            &app.palette,
+            widgets::SkeletonShelfShape::SongGrid,
+            crate::ui::HOME_SONG_ROWS,
+        );
+        ui.add_space(20.0);
         widgets::skeleton_shelf(
             ui,
             &app.palette,
             widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
-            4,
+            1,
         );
         return;
     }
@@ -69,6 +83,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
                 app.load_home_more();
             }
             if app.home_more_loading {
+                ui.add_space(20.0);
                 widgets::skeleton_shelf(
                     ui,
                     &app.palette,
@@ -118,7 +133,7 @@ pub fn shelf_page(app: &mut App, ui: &mut egui::Ui, title: &str) {
         crate::ui::page_title(ui, &app.palette, title);
         let Some(shelf) = full.as_deref().or(from_home) else {
             if app.home_loading {
-                widgets::skeleton_cards(ui, &app.palette, 10, widgets::ArtShape::Square);
+                widgets::skeleton_grid(ui, &app.palette, 2, widgets::ArtShape::Square);
             } else {
                 crate::ui::centered(app, ui, "This shelf is no longer on Home.");
             }
@@ -157,7 +172,7 @@ pub fn shelf_page(app: &mut App, ui: &mut egui::Ui, title: &str) {
         // page reads as loading the rest rather than as all there is.
         if full.is_none() && app.home_shelf_loading(title) {
             ui.add_space(8.0);
-            widgets::skeleton_cards(ui, &app.palette, 10, widgets::ArtShape::Square);
+            widgets::skeleton_grid(ui, &app.palette, 2, widgets::ArtShape::Square);
         }
         ui.add_space(theme::PAGE_INSET_X);
     });

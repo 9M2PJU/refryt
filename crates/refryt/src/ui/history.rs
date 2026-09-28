@@ -23,7 +23,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         AuthState::SignedIn { .. } => content(app, ui),
         AuthState::Checking => {
             title(app, ui);
-            widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 4);
+            widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 8);
             widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 4);
         }
         AuthState::Failed(_) if app.offline => {
@@ -54,7 +54,7 @@ fn content(app: &mut App, ui: &mut egui::Ui) {
         // Dated shelves (Today, Yesterday, ...) are always track lists — several titled row
         // blocks, not one flat 8-row list with no shelf boundaries.
         title(app, ui);
-        widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 4);
+        widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 8);
         widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Rows, 4);
         return;
     }

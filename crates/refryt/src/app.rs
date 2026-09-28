@@ -1280,6 +1280,10 @@ pub struct App {
     /// guard `album_for`/`playlist_for` already give the page loaders, since two cards' play
     /// buttons clicked close together race each other's fetch exactly the same way.
     pending_card_play: Option<String>,
+    /// A sidebar or card menu item picked before that page's songs had loaded: the page's id
+    /// and what to do. Done when the fetch lands (`cache_album` / `cache_rail_playlist`); a newer
+    /// pick replaces an older one, as `pending_card_play` does.
+    pending_page_action: Option<(String, crate::ui::PageThen)>,
 
     /// The app's own icon, as a texture for the Settings page's branding and the startup splash.
     /// Loaded once, lazily (whichever of the two needs it first fills it in rather than doing it
@@ -1827,6 +1831,7 @@ impl App {
             album_for: None,
             account_epoch: 0,
             pending_card_play: None,
+            pending_page_action: None,
             logo: None,
             detected_browsers: None,
             auth,
@@ -3911,6 +3916,13 @@ impl App {
             self.forward();
         }
         for event in self.backend.drain() {
+            // A test aid for debug builds: pages never land, so each one stays on its skeleton
+            // while the session and the sidebar load as usual — the only way to see a signed-in
+            // page's placeholder for long enough to screenshot it.
+            #[cfg(debug_assertions)]
+            if std::env::var_os("REFRYT_HOLD_LOADING").is_some() && event.is_page_load() {
+                continue;
+            }
             if event.error().is_some_and(crate::api::looks_offline) {
                 self.note_offline();
             }
@@ -4059,10 +4071,11 @@ impl App {
                 Event::AlbumFailed { id, error } if self.album_is_for(&id) => {
                     self.album_loading = false;
                     self.album_error = Some(error);
+                    self.page_action_failed(&id, "album");
                 }
                 // A release card's right-click prefetch, not a page view.
                 Event::AlbumLoaded { id, album } => self.cache_album(&id, &album),
-                Event::AlbumFailed { .. } => {}
+                Event::AlbumFailed { id, .. } => self.page_action_failed(&id, "album"),
 
                 // An album/playlist card's play button, not a page view — see
                 // `Event::CardTracksReady`'s own doc comment for why this isn't folded into
@@ -4197,6 +4210,7 @@ impl App {
                 Event::PlaylistFailed { id, error } if self.playlist_is_for(&id) => {
                     self.playlist_loading = false;
                     self.playlist_error = Some(error);
+                    self.page_action_failed(&id, "playlist");
                 }
                 // The open artist's own top-songs prefetch, not the playlist page: replace the
                 // page's 5 embedded songs with up to 15 of the real list, so Top Songs shows the
@@ -4213,7 +4227,7 @@ impl App {
                 }
                 // A prefetch for the rail's context menu: keep it, do not touch the page.
                 Event::PlaylistLoaded { id, playlist } => self.cache_rail_playlist(&id, &playlist),
-                Event::PlaylistFailed { .. } => {}
+                Event::PlaylistFailed { id, .. } => self.page_action_failed(&id, "playlist"),
 
                 // See `App::account_epoch`'s own doc comment: a reply for an account already
                 // switched away from is dropped rather than repopulating cleared state.
@@ -5550,7 +5564,7 @@ impl App {
             }
             RowAction::GoToAlbum(id) => self.navigate(Route::Album(id)),
             RowAction::GoToArtist(id) => self.navigate(Route::Artist(id)),
-            RowAction::Share(id) => {
+            RowAction::CopyLink(id) => {
                 self.backend.copy_text(crate::model::track_url(&id));
                 self.toast("Link copied");
             }
@@ -5641,6 +5655,24 @@ impl App {
             RowAction::PageShuffle(tracks) => {
                 self.shuffle_play(tracks);
             }
+            RowAction::PageWhenLoaded {
+                page_id,
+                kind,
+                then,
+            } => {
+                if self.page_tracks(&page_id).is_some() {
+                    // The fetch landed while the menu was open.
+                    self.page_then(&page_id, then);
+                    return;
+                }
+                // The right-click asked for the songs already; asking again only matters when
+                // that fetch was lost, and a second answer finds nothing pending.
+                match kind {
+                    crate::ui::PageKind::Album => self.backend.fetch_album(page_id.clone()),
+                    crate::ui::PageKind::Playlist => self.backend.fetch_playlist(page_id.clone()),
+                }
+                self.pending_page_action = Some((page_id, then));
+            }
             RowAction::PagePlayNext(tracks) => {
                 let n = tracks.len();
                 match self.current {
@@ -5714,7 +5746,7 @@ impl App {
                 self.set_page_library(album, in_library);
                 self.backend.toggle_page_library(album, write, in_library);
             }
-            RowAction::PageShare(url) => {
+            RowAction::PageCopyLink(url) => {
                 self.backend.copy_text(url);
                 self.toast("Link copied");
             }
@@ -6134,6 +6166,7 @@ impl App {
             }
         }
         self.rail_cache.insert(id.to_owned(), playlist.clone());
+        self.run_pending_page_action(id);
     }
 
     /// Keep a fetched album for a release card's context menu, bounded like the rail cache.
@@ -6146,6 +6179,71 @@ impl App {
             }
         }
         self.album_cache.insert(id.to_owned(), album.clone());
+        self.run_pending_page_action(id);
+    }
+
+    /// A menu pick that was waiting on this page's songs, now that they are cached.
+    fn run_pending_page_action(&mut self, id: &str) {
+        if self.pending_page_action.as_ref().map(|(p, _)| p.as_str()) != Some(id) {
+            return;
+        }
+        if let Some((id, then)) = self.pending_page_action.take() {
+            self.page_then(&id, then);
+        }
+    }
+
+    /// The pick's page could not be loaded: say so, rather than let the click vanish.
+    fn page_action_failed(&mut self, id: &str, kind: &str) {
+        if self.pending_page_action.as_ref().map(|(p, _)| p.as_str()) == Some(id) {
+            self.pending_page_action = None;
+            self.toast_error(&format!("Couldn't load that {kind}"));
+        }
+    }
+
+    /// The songs and mix seed a menu pick acts on, if the page is loaded or cached.
+    fn page_tracks(&self, id: &str) -> Option<(Vec<Track>, Option<String>)> {
+        if let Some(album) = self.album_cache.get(id) {
+            return Some((album.tracks.clone(), album.like_id.clone()));
+        }
+        let playlist = self
+            .rail_cache
+            .get(id)
+            .or_else(|| self.playlist.as_ref().filter(|pl| pl.id == id))?;
+        Some((playlist.tracks.items.clone(), Some(playlist.id.clone())))
+    }
+
+    /// Do a page menu pick with the page's songs — at once when they are here, else once they
+    /// land.
+    fn page_then(&mut self, id: &str, then: crate::ui::PageThen) {
+        use crate::ui::{PageThen, RowAction};
+        let Some((tracks, radio)) = self.page_tracks(id) else {
+            return;
+        };
+        if tracks.is_empty() && radio.is_none() {
+            self.toast_error("Nothing to play here");
+            return;
+        }
+        let action = match then {
+            PageThen::StartMix => match (radio, tracks.first()) {
+                (Some(radio), _) => RowAction::StartMixPlaylist(radio),
+                (None, Some(first)) => RowAction::StartMix(first.video_id.clone()),
+                (None, None) => return,
+            },
+            _ if tracks.is_empty() => {
+                self.toast_error("Nothing to play here");
+                return;
+            }
+            PageThen::Shuffle => RowAction::PageShuffle(tracks),
+            PageThen::PlayNext => RowAction::PagePlayNext(tracks),
+            PageThen::Queue => RowAction::PageQueue(tracks),
+            PageThen::DownloadAll => RowAction::DownloadMany(tracks),
+            PageThen::SaveToPlaylist { playlist_id, title } => RowAction::PageSaveToPlaylist {
+                playlist_id,
+                title,
+                video_ids: tracks.into_iter().map(|t| t.video_id).collect(),
+            },
+        };
+        self.row_action(action);
     }
 
     /// Show a confirmation bubble above the player bar for a few seconds.
@@ -6571,6 +6669,52 @@ impl eframe::App for App {
             Err(e) => {
                 tracing::debug!(error = %format!("{e:#}"), "could not save the playback state");
             }
+        }
+    }
+
+    /// A test aid for debug builds: `REFRYT_CLICK="x,y,button@secs;…"` clicks at those window
+    /// points once each time comes, `button` being `primary` or `secondary` — how a screenshot
+    /// run opens a right-click menu, which nothing outside the app can do on Wayland.
+    #[cfg(debug_assertions)]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        use std::sync::Mutex;
+        /// A click still to come: where, which button, and when (seconds since start).
+        type Click = (f32, f32, egui::PointerButton, f64);
+        static CLICKS: Mutex<Option<Vec<Click>>> = Mutex::new(None);
+        let Ok(mut clicks) = CLICKS.lock() else {
+            return;
+        };
+        let clicks = clicks.get_or_insert_with(|| {
+            std::env::var("REFRYT_CLICK")
+                .unwrap_or_default()
+                .split(';')
+                .filter_map(|spec| {
+                    let (point, secs) = spec.split_once('@')?;
+                    let mut parts = point.split(',');
+                    let x = parts.next()?.trim().parse().ok()?;
+                    let y = parts.next()?.trim().parse().ok()?;
+                    let button = match parts.next().map(str::trim) {
+                        Some("secondary") => egui::PointerButton::Secondary,
+                        _ => egui::PointerButton::Primary,
+                    };
+                    Some((x, y, button, secs.trim().parse().ok()?))
+                })
+                .collect()
+        });
+        let now = crate::elapsed_since_start().as_secs_f64();
+        let Some(i) = clicks.iter().position(|c| c.3 <= now) else {
+            return;
+        };
+        let (x, y, button, _) = clicks.remove(i);
+        let pos = egui::pos2(x, y);
+        raw_input.events.push(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            raw_input.events.push(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
         }
     }
 

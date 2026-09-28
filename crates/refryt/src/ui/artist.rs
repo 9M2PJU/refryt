@@ -70,12 +70,14 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
     action_row(app, ui);
 }
 
-/// The page's placeholder, in the page's own shape: the hero band across the card, the control
-/// row under it, Popular's numbered rows beside a You Liked tile where the page will have one,
-/// then a shelf of cards. The old one — a small round header over a column of rows — looked like
-/// a different page until the real one replaced it.
+/// The page's placeholder, in the page's own shape: the hero band across the card with the same
+/// scrim and the name where the name goes, the control row under it, Top songs' numbered columns
+/// beside a You Liked tile where the page will have one, then a shelf of cards. Every piece
+/// takes the real one's size and spacing, so nothing moves when the page lands.
 fn skeleton(app: &App, ui: &mut egui::Ui) {
     let p = app.palette;
+    let round = |d: f32| egui::CornerRadius::same((d / 2.0) as u8);
+    let small = egui::CornerRadius::same(crate::theme::RADIUS_SMALL);
     let inset_x = crate::theme::PAGE_INSET_X;
     let top = ui.cursor().min;
     let width = ui.available_width() + inset_x * 2.0;
@@ -98,40 +100,68 @@ fn skeleton(app: &App, ui: &mut egui::Ui) {
         &p,
         card,
     );
-    ui.add_space(height);
-
-    // The controls: Play, Mix and Shuffle, then Subscribe.
-    ui.add_space(14.0);
-    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), egui::Sense::hover());
-    let mid = row.center().y;
-    let round = |d: f32| egui::CornerRadius::same((d / 2.0) as u8);
-    let mut x = row.left();
-    for d in [56.0, 34.0, 34.0] {
+    // The real hero's scrim over it: a flat grey band read as a bigger block than the same band
+    // of picture, whose lower half the scrim darkens into the card.
+    if widgets::skeleton_visible(ui) {
+        let scrim_top = hero_scrim_top(hero);
+        let mut scrim = egui::Mesh::default();
+        for y in [scrim_top, hero.bottom()] {
+            let colour = egui::Color32::from_black_alpha(hero_scrim_alpha(hero, scrim_top, y));
+            scrim.colored_vertex(pos2(hero.left(), y), colour);
+            scrim.colored_vertex(pos2(hero.right(), y), colour);
+        }
+        scrim.add_triangle(0, 2, 1);
+        scrim.add_triangle(1, 2, 3);
+        ui.painter().with_clip_rect(card).add(scrim);
+        // The name and the audience, on `hero_header`'s own lines.
+        let (name_y, meta_y, name_size) = hero_text_lines(hero, width);
+        let cap = name_size * 0.727;
         widgets::skeleton_fill_in(
             ui,
-            egui::Rect::from_min_size(pos2(x, mid - d / 2.0), vec2(d, d)),
-            round(d),
+            egui::Rect::from_min_size(
+                pos2(top.x, name_y - cap / 2.0 + 1.0),
+                vec2((width * 0.25).clamp(160.0, 420.0), cap),
+            ),
+            small,
             &p,
-            ui.clip_rect(),
+            card,
         );
-        x += d + 12.0;
+        widgets::skeleton_fill_in(
+            ui,
+            egui::Rect::from_min_size(pos2(top.x + 2.0, meta_y - 5.0), vec2(140.0, 10.0)),
+            small,
+            &p,
+            card,
+        );
     }
-    widgets::skeleton_fill_in(
-        ui,
-        egui::Rect::from_min_size(pos2(x + 6.0, mid - 16.0), vec2(110.0, 32.0)),
-        round(32.0),
-        &p,
-        ui.clip_rect(),
-    );
+    ui.add_space(height);
 
-    // Popular, beside You Liked when the page will show it — known before the page is, from the
-    // liked index — and the card is wide enough for both.
+    // The controls: Play, which the page has whenever it has songs. Mix, Shuffle, Subscribe and
+    // ••• depend on the artist and the account, so they arrive beside it instead of standing in
+    // as shapes that may not become anything.
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), egui::Sense::hover());
+        widgets::skeleton_play_button(ui, &p, rect);
+    });
+
+    // Top songs, beside You Liked when the page will show it — known before the page is, from
+    // the liked index — and the card is wide enough for both.
     let liked = app
         .artist_id()
         .map(|id| app.liked.count_for_artist(id))
         .unwrap_or(0);
+    let top_songs = |ui: &mut egui::Ui| {
+        // `track_shelf_pages`: a heading, then numbered rows down its columns.
+        ui.add_space(20.0);
+        widgets::skeleton_heading_text(ui, &p, "Top songs");
+        ui.add_space(4.0);
+        let cols = crate::ui::top_song_columns(ui.available_width());
+        widgets::skeleton_song_grid(ui, &p, 5, cols, true);
+    };
     if liked > 0 && ui.available_width() >= SIDE_COL_MIN {
         const GAP: f32 = 28.0;
+        let spacing = ui.spacing().item_spacing.x;
         let left_w = (ui.available_width() - SIDE_COL_W - GAP).max(0.0);
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
@@ -139,51 +169,67 @@ fn skeleton(app: &App, ui: &mut egui::Ui) {
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.set_min_width(left_w);
-                    widgets::skeleton_title(ui, &p);
-                    widgets::skeleton_track_rows(ui, &p, 5, false);
+                    ui.set_max_width(left_w);
+                    top_songs(ui);
                 },
             );
-            ui.add_space(GAP - ui.spacing().item_spacing.x);
+            ui.add_space((GAP - spacing).max(0.0));
             ui.allocate_ui_with_layout(
                 vec2(SIDE_COL_W, 0.0),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
-                    // The tile: a round cover with the count and the credit beside it.
-                    widgets::skeleton_title(ui, &p);
-                    let (tile, _) = ui.allocate_exact_size(
-                        vec2(SIDE_COL_W, LIKED_ART + 16.0),
-                        egui::Sense::hover(),
-                    );
-                    let art = egui::Rect::from_min_size(
-                        tile.min + vec2(0.0, 8.0),
-                        vec2(LIKED_ART, LIKED_ART),
-                    );
-                    widgets::skeleton_fill_in(ui, art, round(LIKED_ART), &p, ui.clip_rect());
-                    for (dy, w, h) in [(-10.0, 90.0, 12.0), (8.0, 60.0, 9.0)] {
-                        widgets::skeleton_fill_in(
+                    ui.set_min_width(SIDE_COL_W);
+                    // `you_liked`: its heading on Top songs' line, then the round cover with
+                    // the count and the credit beside it.
+                    ui.add_space(20.0);
+                    widgets::skeleton_heading_text(ui, &p, "You Liked");
+                    ui.add_space(8.0);
+                    let (tile, _) =
+                        ui.allocate_exact_size(vec2(SIDE_COL_W, LIKED_ART), egui::Sense::hover());
+                    let art = egui::Rect::from_min_size(tile.min, vec2(LIKED_ART, LIKED_ART));
+                    widgets::skeleton_fill(ui, art, round(LIKED_ART), &p);
+                    for (dy, w, h) in [(-12.0, 80.0, 11.0), (6.0, 90.0, 9.0)] {
+                        widgets::skeleton_fill(
                             ui,
                             egui::Rect::from_min_size(
                                 pos2(art.right() + 16.0, art.center().y + dy),
                                 vec2(w, h),
                             ),
-                            egui::CornerRadius::same(crate::theme::RADIUS_SMALL),
+                            small,
                             &p,
-                            ui.clip_rect(),
                         );
                     }
                 },
             );
         });
     } else {
-        widgets::skeleton_title(ui, &p);
-        widgets::skeleton_track_rows(ui, &p, 5, false);
+        top_songs(ui);
     }
-    widgets::skeleton_shelf(
-        ui,
-        &p,
-        widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
-        4,
-    );
+    // The first of the shelves (Albums, as a rule), as `artist_shelf` draws it.
+    ui.add_space(20.0);
+    widgets::skeleton_heading(ui, &p, false);
+    ui.add_space(4.0);
+    widgets::skeleton_grid(ui, &p, 1, widgets::ArtShape::Square);
+}
+
+/// Where the hero's scrim starts: its gradient covers the lower 60% of the band, and never less
+/// than 96 pt, so the name has something dark under it on a short band too.
+fn hero_scrim_top(rect: egui::Rect) -> f32 {
+    rect.bottom() - (rect.height() * 0.6).max(96.0)
+}
+
+/// The scrim's darkness at `y`: clear at its top, near-black at the band's bottom.
+fn hero_scrim_alpha(rect: egui::Rect, scrim_top: f32, y: f32) -> u8 {
+    let t = ((y - scrim_top) / (rect.bottom() - scrim_top)).clamp(0.0, 1.0);
+    (t * 205.0).round() as u8
+}
+
+/// The name's and the audience's line centres on a hero `rect` of card width `width`, and the
+/// name's size — bottom-left, up off the band's bottom edge, by eye.
+fn hero_text_lines(rect: egui::Rect, width: f32) -> (f32, f32, f32) {
+    let name_size = (width * 0.058).clamp(32.0, 62.0);
+    let meta_y = rect.bottom() - 25.0;
+    (meta_y - name_size * 0.85, meta_y, name_size)
 }
 
 /// The reference's hero: the banner painted across the card's own width, from its rounded top
@@ -277,11 +323,8 @@ fn hero_header(app: &mut App, ui: &mut egui::Ui) {
         // The scrim: transparent over the top of the banner, near-black at the bottom, so the
         // name is legible over any art — light channel art included — without per-image colour
         // work. Its rows follow the same edges, starting wherever its gradient does.
-        let scrim_top = rect.bottom() - (rect.height() * 0.6).max(96.0);
-        let alpha_at = |y: f32| {
-            let t = ((y - scrim_top) / (rect.bottom() - scrim_top)).clamp(0.0, 1.0);
-            (t * 205.0).round() as u8
-        };
+        let scrim_top = hero_scrim_top(rect);
+        let alpha_at = |y: f32| hero_scrim_alpha(rect, scrim_top, y);
         let mut scrim = egui::Mesh::default();
         add_rows(&mut scrim, &hero_rows(rect, slice, scrim_top), &mut |p| {
             (
@@ -294,12 +337,10 @@ fn hero_header(app: &mut App, ui: &mut egui::Ui) {
 
     // The name and the audience, bottom-left, on the content's own left edge so they line up
     // with every other page's header. White, because the scrim is dark whatever the theme is.
-    let name_font = crate::theme::bold((width * 0.058).clamp(32.0, 62.0));
+    let (name_y, meta_y, name_size) = hero_text_lines(rect, width);
+    let name_font = crate::theme::bold(name_size);
     let meta_font = crate::theme::medium(14.0);
     let text_w = (width - inset_x - 24.0).max(0.0);
-    // A hair right of the name and up off the banner's bottom edge, by eye.
-    let meta_y = rect.bottom() - 25.0;
-    let name_y = meta_y - name_font.size * 0.85;
     crate::emoji::paint_line(
         ui,
         pos2(content_left, name_y),
@@ -567,6 +608,7 @@ fn action_row(app: &mut App, ui: &mut egui::Ui) {
                 // The page has its own Mix button; a menu mix would be a second one.
                 radio_id: None,
                 save_as_new: None,
+                tracks_pending: None,
             },
         );
         let description =

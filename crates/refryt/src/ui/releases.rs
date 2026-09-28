@@ -15,7 +15,8 @@ fn title(app: &App, ui: &mut egui::Ui) {
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.releases_loading && app.releases.is_none() {
-        // Always albums & singles — card shelves, never a track-list one, unlike Home/Explore.
+        // Albums & singles, then the music videos' wide cards — card shelves, never a
+        // track-list one, unlike Home/Explore.
         title(app, ui);
         widgets::skeleton_shelf(
             ui,
@@ -26,7 +27,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
         widgets::skeleton_shelf(
             ui,
             &app.palette,
-            widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Square),
+            widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Wide),
             4,
         );
         return;

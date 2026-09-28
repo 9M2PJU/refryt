@@ -63,10 +63,10 @@ fn skeletons(app: &App, ui: &mut egui::Ui) {
         RailFilter::Songs => widgets::skeleton_rows(ui, &app.palette, 8),
         // Artists are round here, as their cards are.
         RailFilter::Artists => {
-            widgets::skeleton_cards(ui, &app.palette, 10, widgets::ArtShape::Circle)
+            widgets::skeleton_grid(ui, &app.palette, 3, widgets::ArtShape::Circle)
         }
         RailFilter::Playlists | RailFilter::Albums => {
-            widgets::skeleton_cards(ui, &app.palette, 10, widgets::ArtShape::Square)
+            widgets::skeleton_grid(ui, &app.palette, 3, widgets::ArtShape::Square)
         }
         // Local never shows this: it has its own loading state (`app.local_scanning`), since
         // it isn't gated by `library_loading`/`library_loaded` at all.
@@ -681,6 +681,7 @@ fn local_folder_grid(
                 // A folder of local files has no YouTube radio id.
                 radio_id: None,
                 save_as_new: Some(name.as_str()),
+                tracks_pending: None,
             };
             let click = widgets::folder_card(ui, &app.palette, card_w, name, tracks.len(), menu);
             if click.response.clicked() {

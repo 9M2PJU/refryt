@@ -404,7 +404,8 @@ pub(crate) enum RowAction {
     AddToQueue(Track),
     GoToAlbum(String),
     GoToArtist(String),
-    Share(String),
+    /// Copy a song's link.
+    CopyLink(String),
     Rate {
         video_id: String,
         status: LikeStatus,
@@ -440,8 +441,8 @@ pub(crate) enum RowAction {
         write: crate::backend::PageWrite,
         in_library: bool,
     },
-    /// Share a page (an album or playlist URL, not a `watch?v=` one).
-    PageShare(String),
+    /// Copy a page's link (an album, playlist or channel URL, not a `watch?v=` one).
+    PageCopyLink(String),
     /// Show the page's description in the Info popup. The text lives on the page, so the
     /// choice carries nothing.
     PageInfo,
@@ -460,6 +461,31 @@ pub(crate) enum RowAction {
     /// Drop a track from the queue by its position — only offered from the Queue panel, whose
     /// rows carry their own index.
     RemoveFromQueue(usize),
+    /// A page menu item picked before the page's songs had loaded (a sidebar playlist or a card
+    /// right-clicked a moment ago): done once they land.
+    PageWhenLoaded {
+        page_id: String,
+        kind: PageKind,
+        then: PageThen,
+    },
+}
+
+/// Which kind of page a menu stands for, where the songs still have to be fetched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageKind {
+    Album,
+    Playlist,
+}
+
+/// What a page menu item does with the page's songs, once there are songs to do it with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PageThen {
+    StartMix,
+    Shuffle,
+    PlayNext,
+    Queue,
+    DownloadAll,
+    SaveToPlaylist { playlist_id: String, title: String },
 }
 
 /// What a list did this frame.
@@ -917,6 +943,11 @@ pub(crate) fn track_rows_quiet(
     )
 }
 
+/// How many columns an artist's Top songs take at `width`: one per 400 pt, up to three.
+pub(crate) fn top_song_columns(width: f32) -> usize {
+    ((width / 400.0).floor() as usize).clamp(1, 3)
+}
+
 /// Paged instead of wrapped — for a short, bounded list where growing indefinitely tall would be
 /// worse than paging: an artist's Top Songs, expanded past the 5 the page embeds up to a cap of
 /// 15 (see `App`'s handling of `Event::PlaylistLoaded` for the artist's own auto-generated
@@ -945,7 +976,7 @@ pub(crate) fn track_shelf_pages(
     signed_in: bool,
     id_salt: impl std::hash::Hash + std::fmt::Debug,
 ) -> ListOutcome {
-    let cols = ((ui.available_width() / 400.0).floor() as usize).clamp(1, 3);
+    let cols = top_song_columns(ui.available_width());
     spec_pages(
         ui,
         palette,
@@ -1152,6 +1183,7 @@ fn grid_card(
                 share_url: crate::model::album_url(&a.id),
                 manage: false,
                 remove_from_library: false,
+                tracks_pending: cached.is_none().then_some(PageKind::Album),
             }))
         }
         Entry::Playlist(p) => {
@@ -1169,6 +1201,9 @@ fn grid_card(
                 share_url: crate::model::playlist_url(&p.id),
                 manage: p.editable,
                 remove_from_library: false,
+                tracks_pending: (cached.is_none()
+                    && matches!(p.source, crate::model::PlaylistSource::YouTube))
+                .then_some(PageKind::Playlist),
             }))
         }
         Entry::Mood(_) => None,
@@ -1476,6 +1511,17 @@ pub(crate) fn entry_route(item: &Entry) -> Option<Route> {
     }
 }
 
+/// The mood chip grid at `width`: columns, chip width, chip height and gutter. Six across on a
+/// wide window, fewer when narrow — the reference's grid, not a wrap. Each chip is a hair under
+/// its exact share, as [`grid_card_w`]'s cards are: at the exact share float rounding wrapped
+/// the sixth chip of every row onto a line of its own, and wide windows got five.
+pub(crate) fn mood_chip_grid(width: f32) -> (usize, f32, f32, f32) {
+    let cols = ((width / 180.0).floor() as usize).clamp(2, 6);
+    let gap = 8.0;
+    let chip_w = (width - (cols - 1) as f32 * gap) / cols as f32 - 0.5;
+    (cols, chip_w, 44.0, gap)
+}
+
 /// "Moods & genres" as a grid of coloured chips — the site's own shape, not cards and not
 /// default buttons. Each chip carries its stripe on the left; a chip whose source named no
 /// colour gets the dim outline instead of an invented one.
@@ -1488,11 +1534,7 @@ pub(crate) fn mood_chips<'a>(
     items: impl Iterator<Item = (&'a str, Option<[u8; 3]>)>,
 ) -> Option<usize> {
     let mut clicked = None;
-    // Six across on a wide window, fewer when narrow — the reference's grid, not a wrap.
-    let cols = ((ui.available_width() / 180.0).floor() as usize).clamp(2, 6);
-    let gap = 8.0;
-    let chip_w = (ui.available_width() - (cols - 1) as f32 * gap) / cols as f32;
-    let chip_h = 44.0;
+    let (_, chip_w, chip_h, gap) = mood_chip_grid(ui.available_width());
     ui.horizontal_wrapped(|ui| {
         // Wrapped, not a grid widget: every chip is identical, so wrapping lands on the
         // column count by itself.
@@ -1661,7 +1703,7 @@ pub(crate) fn artist_shelf(app: &mut crate::app::App, ui: &mut egui::Ui, shelf: 
     if expanding && app.artist_expand_loading {
         // `draw_shelf_grid` always renders through `entry_grid` — a card grid, never rows.
         ui.add_space(4.0);
-        widgets::skeleton_cards(ui, &app.palette, 4, widgets::ArtShape::Square);
+        widgets::skeleton_grid(ui, &app.palette, 1, widgets::ArtShape::Square);
     }
     if expanding && let Some(err) = app.artist_expand_error.clone() {
         ui.add_space(4.0);
@@ -1923,6 +1965,27 @@ pub(crate) struct HeaderOutcome {
     pub controls_end: Option<egui::Pos2>,
 }
 
+// The detail header's text metrics, shared by [`page_header`] and its placeholder
+// [`skeleton_page_header`] so the two lay their lines out on the same centres.
+//
+// `KIND_CENTRE`: where the label's own line sits, from the art's top. `KIND_BASELINE`:
+// that centre plus Inter's baseline, 0.364 of the size below it.
+const KIND_CENTRE: f32 = 9.0;
+const KIND_BASELINE: f32 = KIND_CENTRE + 12.0 * 0.364;
+const KIND_TO_TITLE_AIR: f32 = 8.0;
+// The base air under the title's ink, and half a 13pt Inter cap height: where the credit
+// line's capitals sit above its own centre.
+const CREDIT_AIR: f32 = 4.0;
+const CREDIT_CAP_HALF: f32 = 4.7;
+// A description is an aside, not the credit: at the credit's own air it read as a subtitle
+// glued to a 56pt name.
+const DESCRIPTION_AIR: f32 = 6.0;
+// Centre gap between the two 13pt lines below the title — the artist line and the stats
+// line on an album, a description and the credits on a playlist. A 13pt line's box carries
+// ~9.4pt of lead, so 19pt of centres reads as ~10pt of space between the ink: one block,
+// not two paragraphs.
+const LINE_GAP: f32 = 19.0;
+
 /// One header for the album, playlist and artist pages: wash, art, type line, title, artist
 /// line, meta, and — for the releases — the Play / Save / ••• row on its own baseline.
 ///
@@ -1989,23 +2052,6 @@ pub(crate) fn page_header(
     // to. (The old `8 + size * 1.08` kept the line *box* centred, so the visible air between
     // label and name grew with the size — worst at the 40pt ceiling.)
     //
-    // `KIND_CENTRE`: where the label's own line sits, from the art's top. `KIND_BASELINE`:
-    // that centre plus Inter's baseline, 0.364 of the size below it.
-    const KIND_CENTRE: f32 = 9.0;
-    const KIND_BASELINE: f32 = KIND_CENTRE + 12.0 * 0.364;
-    const KIND_TO_TITLE_AIR: f32 = 8.0;
-    // The base air under the title's ink, and half a 13pt Inter cap height: where the credit
-    // line's capitals sit above its own centre.
-    const CREDIT_AIR: f32 = 4.0;
-    const CREDIT_CAP_HALF: f32 = 4.7;
-    // A description is an aside, not the credit: at the credit's own air it read as a subtitle
-    // glued to a 56pt name.
-    const DESCRIPTION_AIR: f32 = 6.0;
-    // Centre gap between the two 13pt lines below the title — the artist line and the stats
-    // line on an album, a description and the credits on a playlist. A 13pt line's box carries
-    // ~9.4pt of lead, so 19pt of centres reads as ~10pt of space between the ink: one block,
-    // not two paragraphs.
-    const LINE_GAP: f32 = 19.0;
     let title_rel = if h.kind_label.is_empty() {
         title_size * 0.5
     } else {
@@ -2282,6 +2328,213 @@ pub(crate) fn page_header(
     outcome.dots = dots;
     outcome.art_bottom = outcome.art_bottom.max(controls_rect.bottom() + 6.0);
     outcome
+}
+
+/// What a detail page's header will hold, for its placeholder: which lines the real header
+/// paints and which controls follow Play. Whatever the route already settles is drawn for real —
+/// a playlist's "Playlist", the liked page's "Liked songs" — and only what has to be fetched is
+/// a grey shape.
+pub(crate) struct HeaderSkeleton {
+    /// The type line over the title.
+    pub kind: HeaderKind,
+    /// The title, where the page always has the same one. `None`: a bar, the name is coming.
+    pub title: Option<&'static str>,
+    /// The playlist's one-line description.
+    pub description: bool,
+    /// A credit line of its own under the title (the album's artists).
+    pub credit_line: bool,
+    /// [`PageHeader::credit_air`], so the lines land on the same centres.
+    pub credit_air: f32,
+    pub controls: HeaderControls,
+}
+
+/// The type line over a detail header's title, as far as the route knows it.
+#[derive(Clone, Copy)]
+pub(crate) enum HeaderKind {
+    /// No type line (the liked-by-artist page).
+    None,
+    /// There is one and it isn't known yet: an album may turn out a single or an EP.
+    Bar,
+    /// Always this.
+    Text(&'static str),
+}
+
+/// The controls after Play on a detail header's own row.
+#[derive(Clone, Copy)]
+pub(crate) enum HeaderControls {
+    /// Play alone. Save and ••• come or go with the account and the page, so they arrive beside
+    /// it rather than as grey shapes that may not turn into anything — an album or playlist.
+    PlayOnly,
+    /// Shuffle and sort, which the page always has, drawn for real but dimmed: the liked-by-artist
+    /// page.
+    ShuffleAndSort,
+}
+
+/// [`page_header`]'s placeholder: grey shapes on the same art, the same text centres (the block
+/// bottom-aligned to the art) and the same control row under the art, then the same space
+/// reserved, so the track rows below start where the real ones will.
+pub(crate) fn skeleton_page_header(ui: &mut egui::Ui, palette: &theme::Palette, h: HeaderSkeleton) {
+    let bar = |ui: &egui::Ui, rect: egui::Rect| {
+        widgets::skeleton_fill(
+            ui,
+            rect,
+            egui::CornerRadius::same(theme::RADIUS_SMALL),
+            palette,
+        );
+    };
+    let top = ui.cursor().min.y;
+    let available = ui.available_width();
+    let art_size = PAGE_ART_SIZE.min((available - 20.0 - 8.0 - 140.0).max(HEADER_ART_FLOOR_PT));
+    let art_rect = egui::Rect::from_min_size(
+        ui.cursor().min + egui::vec2(0.0, theme::HEADER_TOP_PAD),
+        egui::vec2(art_size, art_size),
+    );
+    widgets::skeleton_fill(
+        ui,
+        art_rect,
+        egui::CornerRadius::same(theme::RADIUS),
+        palette,
+    );
+
+    let tx = art_rect.right() + 20.0;
+    let text_w = (available - art_size - 20.0 - 8.0).max(0.0);
+    // A known title is sized as the real header sizes it; an unknown one is a short name at the
+    // largest size, as most are.
+    let title_size = match h.title {
+        Some(t) => widgets::fit_size(
+            ui,
+            t,
+            text_w,
+            DETAIL_TITLE_MAX,
+            DETAIL_TITLE_MIN,
+            theme::bold,
+        ),
+        None => DETAIL_TITLE_MAX,
+    };
+    let title_font = theme::bold(title_size);
+    let title_ink = widgets::ink_drop(ui, h.title.unwrap_or("Title"), &title_font);
+    let has_kind = !matches!(h.kind, HeaderKind::None);
+    // Text is drawn only once the placeholders are, so a load that finishes quickly shows
+    // nothing rather than a page of half its words.
+    let visible = widgets::skeleton_visible(ui);
+    let title_rel = if has_kind {
+        widgets::title_centre_under_label(KIND_BASELINE, KIND_TO_TITLE_AIR, title_size)
+    } else {
+        title_size * 0.5
+    };
+    // The lines under the title, as centres relative to the block's top — the same walk
+    // `page_header` takes.
+    let mut lines = Vec::new();
+    let mut y = title_rel;
+    if h.description {
+        let dy = y + title_ink + CREDIT_AIR + DESCRIPTION_AIR + CREDIT_CAP_HALF + h.credit_air;
+        lines.push((dy, 0.5));
+        y = dy + LINE_GAP;
+    } else {
+        y += title_ink + CREDIT_AIR + CREDIT_CAP_HALF + h.credit_air;
+    }
+    if h.credit_line {
+        lines.push((y, 0.22));
+        y += LINE_GAP;
+    }
+    lines.push((y, 0.36));
+    let last = lines.last().map_or(title_rel, |l| l.0);
+    let block_h = last + 7.0;
+    let text_top = art_rect.top() + (art_size - block_h).max(0.0);
+
+    match h.kind {
+        HeaderKind::None => {}
+        HeaderKind::Bar => bar(
+            ui,
+            egui::Rect::from_min_size(
+                egui::pos2(tx, text_top + KIND_CENTRE - 4.5),
+                egui::vec2(56.0_f32.min(text_w), 9.0),
+            ),
+        ),
+        HeaderKind::Text(label) if visible => {
+            ui.painter().text(
+                egui::pos2(tx, text_top + KIND_CENTRE),
+                egui::Align2::LEFT_CENTER,
+                label,
+                theme::semibold(12.0),
+                palette.dim,
+            );
+        }
+        HeaderKind::Text(_) => {}
+    }
+    match h.title {
+        Some(title) => {
+            if visible {
+                crate::emoji::paint_line(
+                    ui,
+                    egui::pos2(tx, text_top + title_rel),
+                    title,
+                    title_font.clone(),
+                    palette.text,
+                );
+            }
+        }
+        None => {
+            // The title's capitals: from its baseline (the ink's end, for a name with no
+            // descenders) up one cap height.
+            let baseline = text_top + title_rel + title_ink;
+            let cap = title_size * 0.727;
+            bar(
+                ui,
+                egui::Rect::from_min_max(
+                    egui::pos2(tx, baseline - cap),
+                    egui::pos2(tx + (text_w * 0.3).min(320.0), baseline),
+                ),
+            );
+        }
+    }
+    for (centre, w) in lines {
+        bar(
+            ui,
+            egui::Rect::from_min_size(
+                egui::pos2(tx, text_top + centre - 4.5),
+                egui::vec2((text_w * w).clamp(60.0_f32.min(text_w), 380.0), 9.0),
+            ),
+        );
+    }
+    let text_bottom = text_top + last + 10.0;
+
+    // The control row, where `page_header` puts it: its own row under the art.
+    let control_h = DETAIL_PLAY_PT + 2.0;
+    let row_top = art_rect.bottom().max(text_bottom) + 16.0;
+    let mid = row_top + control_h / 2.0;
+    let mut x = art_rect.left();
+    widgets::skeleton_play_button(
+        ui,
+        palette,
+        egui::Rect::from_center_size(
+            egui::pos2(x + DETAIL_PLAY_PT / 2.0, mid),
+            egui::vec2(DETAIL_PLAY_PT, DETAIL_PLAY_PT),
+        ),
+    );
+    x += DETAIL_PLAY_PT + 12.0;
+    match h.controls {
+        HeaderControls::PlayOnly => {}
+        HeaderControls::ShuffleAndSort => {
+            // The page's two icons ride just past Play's row end, 34 pt boxes (20 pt glyphs),
+            // as `artist_liked` places them.
+            x -= 8.0;
+            if visible {
+                for (i, icon) in [crate::icons::Icon::Shuffle, crate::icons::Icon::ArrowUpDown]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let centre = egui::pos2(x + 17.0 + i as f32 * (34.0 + 8.0), mid);
+                    icon.image(palette.dim, 20.0).paint_at(
+                        ui,
+                        egui::Rect::from_center_size(centre, egui::vec2(20.0, 20.0)),
+                    );
+                }
+            }
+        }
+    }
+    let bottom = art_rect.bottom().max(row_top + control_h + 6.0);
+    ui.add_space(bottom - top + 12.0);
 }
 
 /// The description behind a ••• menu's Info item. One copy: the album and playlist pages
@@ -3014,8 +3267,20 @@ mod tests {
         }
     }
 
-    /// Carousel paging never leaves its rails: a step past either end clamps, and a view
-    /// wider than the row never moves at all.
+    /// A full row of mood chips fits its row: at the exact share, rounding wrapped the last chip
+    /// onto a line of its own, and a wide window showed five across instead of six.
+    #[test]
+    fn mood_chip_rows_hold_their_columns() {
+        for width in [400.0, 777.0, 1080.0, 1333.3, 1600.0, 2400.0] {
+            let (cols, chip_w, _, gap) = mood_chip_grid(width);
+            assert!(
+                chip_w * cols as f32 + gap * (cols - 1) as f32 <= width,
+                "{width}"
+            );
+        }
+        assert_eq!(mood_chip_grid(1600.0).0, 6);
+    }
+
     /// A portrait screen's card gets two readable columns, not three cramped ones; a wide window
     /// still gets YouTube Music's three.
     #[test]
@@ -3027,6 +3292,8 @@ mod tests {
         assert_eq!(song_shelf_columns(2400.0), 3);
     }
 
+    /// Carousel paging never leaves its rails: a step past either end clamps, and a view
+    /// wider than the row never moves at all.
     #[test]
     fn carousel_paging_stays_on_its_rails() {
         // A 500-wide page (a whole number of cards plus their gaps) in a 492-wide view.

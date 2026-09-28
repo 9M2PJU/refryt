@@ -12,12 +12,19 @@ use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.album_loading {
-        widgets::skeleton_header(
+        crate::ui::skeleton_page_header(
             ui,
             &app.palette,
-            PAGE_ART_SIZE,
-            widgets::SkeletonHeaderKind::Detail { description: false },
+            crate::ui::HeaderSkeleton {
+                kind: crate::ui::HeaderKind::Bar,
+                title: None,
+                description: false,
+                credit_line: true,
+                credit_air: 0.0,
+                controls: crate::ui::HeaderControls::PlayOnly,
+            },
         );
+        ui.add_space(10.0);
         widgets::skeleton_track_rows(ui, &app.palette, 8, true);
         return;
     }
@@ -141,6 +148,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                             // The album's own radio seeds from its audio playlist id.
                             radio_id: a.like_id.as_deref(),
                             save_as_new: None,
+                            tracks_pending: None,
                         },
                     )
                 })

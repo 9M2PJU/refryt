@@ -250,6 +250,28 @@ pub fn play_button(ui: &mut Ui, palette: &Palette, playing: bool, diameter: f32)
     response
 }
 
+/// The Play button of a page that is still loading: the real one, with nothing behind it yet, so
+/// dimmed and inert. Play is on every one of these pages, so it needs no grey stand-in. Drawn
+/// with the other placeholders, at `rect`.
+pub fn skeleton_play_button(ui: &Ui, palette: &Palette, rect: Rect) {
+    if !skeleton_visible(ui) || !ui.is_rect_visible(rect) {
+        return;
+    }
+    let dim = 0.45;
+    ui.painter().circle_filled(
+        rect.center(),
+        rect.width() / 2.0,
+        palette.accent.gamma_multiply(dim),
+    );
+    let glyph = rect.width() * 0.44;
+    Icon::PlayFilled
+        .image(palette.on_accent.gamma_multiply(dim + 0.2), glyph)
+        .paint_at(
+            ui,
+            Rect::from_center_size(rect.center() + vec2(glyph * 0.06, 0.0), vec2(glyph, glyph)),
+        );
+}
+
 /// A sidebar navigation entry: Home, Search, Library.
 ///
 /// No pill behind the selected one — selection is carried by weight and colour alone, which is
@@ -1364,8 +1386,19 @@ pub fn paint_spinner(ui: &Ui, center: egui::Pos2, radius: f32, width: f32, color
 /// Fill one skeleton shape: nothing until [`SKELETON_DELAY`] into a load, then the grey shape with
 /// a soft highlight gliding across it. The highlight's position comes from time and the shape's
 /// place on screen alone, so every skeleton on the page shimmers as one band, slanted by height.
-fn skeleton_fill(ui: &Ui, rect: Rect, radius: impl Into<CornerRadius>, palette: &Palette) {
+pub(crate) fn skeleton_fill(
+    ui: &Ui,
+    rect: Rect,
+    radius: impl Into<CornerRadius>,
+    palette: &Palette,
+) {
     skeleton_fill_in(ui, rect, radius, palette, ui.clip_rect());
+}
+
+/// Whether skeletons are showing yet — past [`SKELETON_DELAY`] into the load — for a
+/// placeholder that paints something besides [`skeleton_fill`]'s own shapes.
+pub fn skeleton_visible(ui: &Ui) -> bool {
+    skeleton_wait(ui.input(|i| i.time), skeleton_since(ui.ctx())).is_none()
 }
 
 /// [`skeleton_fill`] against a clip of the caller's own — the artist hero's placeholder reaches
@@ -1437,22 +1470,22 @@ fn skeleton_bar(ui: &mut Ui, palette: &Palette, w: f32, h: f32) {
     skeleton_fill(ui, rect, CornerRadius::same(theme::RADIUS_SMALL), palette);
 }
 
-/// Grey placeholder rows while a track list loads, in the shape of the rows that replace them.
+/// Grey placeholder rows for an unnumbered list (search, history, library songs): the rows
+/// [`track_row`] paints there, cover at the left edge and a duration at the right.
 pub fn skeleton_rows(ui: &mut Ui, palette: &Palette, n: usize) {
-    for _ in 0..n {
-        let (rect, _) = ui.allocate_exact_size(
-            vec2(ui.available_width(), theme::ROW_HEIGHT),
-            Sense::hover(),
-        );
-        skeleton_row_at(ui, palette, rect);
-    }
+    skeleton_list(ui, palette, n, false, false);
 }
 
-/// A song shelf's placeholder in the shape Home draws it: rows filled down columns, as many
-/// columns as [`crate::ui::song_shelf`] would fit at this width.
-pub fn skeleton_song_grid(ui: &mut Ui, palette: &Palette, rows: usize) {
+/// A song shelf's placeholder in the shape [`crate::ui::song_shelf`] and the artist's Top songs
+/// draw it: rows filled down `cols` columns, `rows` deep, at the real grid's gutter.
+pub fn skeleton_song_grid(
+    ui: &mut Ui,
+    palette: &Palette,
+    rows: usize,
+    cols: usize,
+    numbered: bool,
+) {
     let width = ui.available_width();
-    let cols = crate::ui::song_shelf_columns(width);
     // The real grid's own gutter (`spec_pages`).
     let gap = 12.0;
     let col_w = (width - gap * (cols - 1) as f32) / cols as f32;
@@ -1464,128 +1497,131 @@ pub fn skeleton_song_grid(ui: &mut Ui, palette: &Palette, rows: usize) {
                 area.min + vec2(c as f32 * (col_w + gap), r as f32 * theme::ROW_HEIGHT),
                 vec2(col_w, theme::ROW_HEIGHT),
             );
-            skeleton_row_at(ui, palette, rect);
+            skeleton_row_at(ui, palette, rect, c * rows + r, numbered, false, false);
         }
     }
 }
 
-/// One placeholder row — cover, title, credit — painted into `rect`.
-fn skeleton_row_at(ui: &Ui, palette: &Palette, rect: Rect) {
-    {
-        if !ui.is_rect_visible(rect) {
-            return;
-        }
-        let art = Rect::from_min_size(
-            egui::pos2(rect.left() + 8.0, rect.center().y - theme::ART_SIZE / 2.0),
-            vec2(theme::ART_SIZE, theme::ART_SIZE),
-        );
-        skeleton_fill(ui, art, CornerRadius::same(theme::RADIUS_SMALL), palette);
-        let tx = art.right() + 12.0;
-        skeleton_fill(
-            ui,
-            Rect::from_min_size(
-                egui::pos2(tx, rect.center().y - 10.0),
-                vec2((rect.width() * 0.4).max(80.0), 10.0),
-            ),
-            CornerRadius::same(theme::RADIUS_SMALL),
-            palette,
-        );
-        skeleton_fill(
-            ui,
-            Rect::from_min_size(
-                egui::pos2(tx, rect.center().y + 4.0),
-                vec2((rect.width() * 0.25).max(60.0), 8.0),
-            ),
-            CornerRadius::same(theme::RADIUS_SMALL),
-            palette,
-        );
-    }
-}
+/// Title and credit bar widths, as fractions of a row's text room, taken in turn down a list:
+/// real titles are short and uneven, and one long identical bar per row read as a block rather
+/// than as songs.
+const SKELETON_TEXT_WIDTHS: [(f32, f32); 5] = [
+    (0.18, 0.3),
+    (0.12, 0.22),
+    (0.24, 0.34),
+    (0.15, 0.26),
+    (0.2, 0.2),
+];
 
-/// [`skeleton_rows`] for a numbered track list (Album/Playlist): adds the number column
-/// `skeleton_rows` leaves out and a right-aligned duration slot, matching what [`track_row`]
-/// actually paints for those pages rather than a generic row.
-/// Grey placeholder track rows while a list loads. `hide_art` mirrors the real rows' own flag
-/// (the album page, where every cover would be the header's), so the skeleton is the same shape
-/// the rows arrive in and the list does not shift when they do.
-pub fn skeleton_track_rows(ui: &mut Ui, palette: &Palette, n: usize, hide_art: bool) {
-    let duration_w = 44.0;
+/// One placeholder row painted into `rect`, where [`track_row`] paints its parts: the number
+/// (when `numbered`), the cover (unless `hide_art`), title and credit, and the duration (when
+/// `duration`). `i` picks the bars' widths.
+fn skeleton_row_at(
+    ui: &Ui,
+    palette: &Palette,
+    rect: Rect,
+    i: usize,
+    numbered: bool,
+    hide_art: bool,
+    duration: bool,
+) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let small = CornerRadius::same(theme::RADIUS_SMALL);
+    let duration_w = 34.0;
     let right_pad = 20.0;
-    for _ in 0..n {
+    let num_w = if numbered { theme::ROW_NUMBER_W } else { 0.0 };
+    // The row's number is known before its song is, so it is real — dim, as `track_row` sets it
+    // — and not a dot. Painted with the placeholders it belongs to, not ahead of them.
+    if numbered && skeleton_visible(ui) {
+        ui.painter().text(
+            egui::pos2(
+                rect.left() + theme::ROW_LEFT_INSET + num_w - theme::ROW_NUMBER_GAP,
+                rect.center().y,
+            ),
+            egui::Align2::RIGHT_CENTER,
+            (i + 1).to_string(),
+            theme::regular(12.0),
+            palette.dim,
+        );
+    }
+    let art = Rect::from_min_size(
+        egui::pos2(
+            rect.left() + theme::ROW_LEFT_INSET + num_w,
+            rect.center().y - theme::ART_SIZE / 2.0,
+        ),
+        vec2(theme::ART_SIZE, theme::ART_SIZE),
+    );
+    let tx = if hide_art {
+        art.left() + 12.0
+    } else {
+        skeleton_fill(ui, art, small, palette);
+        art.right() + 12.0
+    };
+    let right = if duration {
+        rect.right() - right_pad - duration_w - 8.0
+    } else {
+        rect.right() - 8.0
+    };
+    let text_w = (right - tx).max(40.0);
+    let (title_w, credit_w) = SKELETON_TEXT_WIDTHS[i % SKELETON_TEXT_WIDTHS.len()];
+    // On the title's and the credit's own centres (`track_row`: -9.5 and +9.5).
+    skeleton_fill(
+        ui,
+        Rect::from_min_size(
+            egui::pos2(tx, rect.center().y - 14.5),
+            vec2((text_w * title_w).clamp(70.0, 260.0).min(text_w), 10.0),
+        ),
+        small,
+        palette,
+    );
+    skeleton_fill(
+        ui,
+        Rect::from_min_size(
+            egui::pos2(tx, rect.center().y + 5.5),
+            vec2((text_w * credit_w).clamp(50.0, 380.0).min(text_w), 8.0),
+        ),
+        small,
+        palette,
+    );
+    if duration {
+        skeleton_fill(
+            ui,
+            Rect::from_min_size(
+                egui::pos2(rect.right() - right_pad - duration_w, rect.center().y - 4.5),
+                vec2(duration_w, 9.0),
+            ),
+            small,
+            palette,
+        );
+    }
+}
+
+/// Grey placeholder track rows for a numbered list (album, playlist). `hide_art` mirrors the
+/// real rows' own flag (the album page, where every cover would be the header's), so the
+/// skeleton is the same shape the rows arrive in and the list does not shift when they do.
+pub fn skeleton_track_rows(ui: &mut Ui, palette: &Palette, n: usize, hide_art: bool) {
+    skeleton_list(ui, palette, n, true, hide_art);
+}
+
+fn skeleton_list(ui: &mut Ui, palette: &Palette, n: usize, numbered: bool, hide_art: bool) {
+    for i in 0..n {
         let (rect, _) = ui.allocate_exact_size(
             vec2(ui.available_width(), theme::ROW_HEIGHT),
             Sense::hover(),
         );
-        if !ui.is_rect_visible(rect) {
-            continue;
-        }
-        let num_x =
-            rect.left() + theme::ROW_LEFT_INSET + theme::ROW_NUMBER_W - theme::ROW_NUMBER_GAP;
-        skeleton_fill(
-            ui,
-            Rect::from_min_size(
-                egui::pos2(num_x - 12.0, rect.center().y - 5.0),
-                vec2(12.0, 10.0),
-            ),
-            CornerRadius::same(theme::RADIUS_SMALL),
-            palette,
-        );
-        let art = Rect::from_min_size(
-            egui::pos2(
-                rect.left() + theme::ROW_LEFT_INSET + theme::ROW_NUMBER_W,
-                rect.center().y - theme::ART_SIZE / 2.0,
-            ),
-            vec2(theme::ART_SIZE, theme::ART_SIZE),
-        );
-        if !hide_art {
-            skeleton_fill(ui, art, CornerRadius::same(theme::RADIUS_SMALL), palette);
-        }
-        let tx = if hide_art {
-            rect.left() + theme::ROW_LEFT_INSET + theme::ROW_NUMBER_W + 12.0
-        } else {
-            art.right() + 12.0
-        };
-        let text_w = (rect.right() - right_pad - duration_w - 8.0 - tx).max(40.0);
-        skeleton_fill(
-            ui,
-            Rect::from_min_size(
-                egui::pos2(tx, rect.center().y - 10.0),
-                vec2((text_w * 0.6).max(80.0), 10.0),
-            ),
-            CornerRadius::same(theme::RADIUS_SMALL),
-            palette,
-        );
-        skeleton_fill(
-            ui,
-            Rect::from_min_size(
-                egui::pos2(tx, rect.center().y + 4.0),
-                vec2((text_w * 0.35).max(60.0), 8.0),
-            ),
-            CornerRadius::same(theme::RADIUS_SMALL),
-            palette,
-        );
-        skeleton_fill(
-            ui,
-            Rect::from_min_size(
-                egui::pos2(rect.right() - right_pad - duration_w, rect.center().y - 5.0),
-                vec2(duration_w, 9.0),
-            ),
-            CornerRadius::same(theme::RADIUS_SMALL),
-            palette,
-        );
+        skeleton_row_at(ui, palette, rect, i, numbered, hide_art, true);
     }
 }
 
-/// Grey placeholder stripe chips, the shape [`crate::ui::mood_chips`] actually lays out — flat
-/// bars with no art slot, for the Moods page (which has no cover art anywhere on it).
-pub fn skeleton_chips(ui: &mut Ui, palette: &Palette, n: usize) {
-    let cols = ((ui.available_width() / 180.0).floor() as usize).clamp(2, 6);
-    let gap = 8.0;
-    let chip_w = (ui.available_width() - (cols - 1) as f32 * gap) / cols as f32;
-    let chip_h = 44.0;
+/// Grey placeholder stripe chips in [`crate::ui::mood_chips`]' own grid: `rows` full rows of
+/// its column count, flat bars with no art slot.
+pub fn skeleton_chips(ui: &mut Ui, palette: &Palette, rows: usize) {
+    let (cols, chip_w, chip_h, gap) = crate::ui::mood_chip_grid(ui.available_width());
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
-        for _ in 0..n {
+        for _ in 0..cols * rows {
             let (rect, _) = ui.allocate_exact_size(vec2(chip_w, chip_h), Sense::hover());
             if !ui.is_rect_visible(rect) {
                 continue;
@@ -1595,88 +1631,158 @@ pub fn skeleton_chips(ui: &mut Ui, palette: &Palette, n: usize) {
     });
 }
 
-/// Grey placeholder cells for Charts' three-column ranked grid — [`ranked`]'s own cell shape,
-/// laid out three wide instead of `skeleton_rows`' single column.
-///
-/// [`ranked`]: crate::ui::charts::ranked
-pub fn skeleton_chart_grid(ui: &mut Ui, palette: &Palette, n: usize) {
-    let gap = 12.0;
-    let cols = 3;
-    let cell_w = (ui.available_width() - (cols - 1) as f32 * gap) / cols as f32;
-    let cell_h = 56.0;
+/// A row of placeholder filter chips — Home's mood bar and search's scope chips: pills at the
+/// chips' own 32 pt height, in a spread of label widths.
+pub fn skeleton_pills(ui: &mut Ui, palette: &Palette, n: usize) {
+    const WIDTHS: [f32; 6] = [74.0, 66.0, 58.0, 72.0, 80.0, 62.0];
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for _ in 0..n {
-            let (rect, _) = ui.allocate_exact_size(vec2(cell_w, cell_h), Sense::hover());
-            if !ui.is_rect_visible(rect) {
-                continue;
+        for i in 0..n {
+            let (rect, _) =
+                ui.allocate_exact_size(vec2(WIDTHS[i % WIDTHS.len()], 32.0), Sense::hover());
+            if ui.is_rect_visible(rect) {
+                skeleton_fill(ui, rect, CornerRadius::same(16), palette);
             }
-            let art = Rect::from_min_size(rect.left_center() + vec2(4.0, -20.0), vec2(40.0, 40.0));
-            skeleton_fill(ui, art, CornerRadius::same(theme::RADIUS_SMALL), palette);
-            let tx = art.right() + 8.0;
-            let text_w = (rect.right() - 4.0 - tx).max(30.0);
-            skeleton_fill(
-                ui,
-                Rect::from_min_size(
-                    egui::pos2(tx, rect.center().y - 9.0),
-                    vec2(text_w * 0.7, 9.0),
-                ),
-                CornerRadius::same(theme::RADIUS_SMALL),
-                palette,
-            );
-            skeleton_fill(
-                ui,
-                Rect::from_min_size(
-                    egui::pos2(tx, rect.center().y + 6.0),
-                    vec2(text_w * 0.45, 8.0),
-                ),
-                CornerRadius::same(theme::RADIUS_SMALL),
-                palette,
-            );
         }
     });
 }
 
-/// The shape a [`skeleton_shelf`] stands in for.
+/// The shape a [`skeleton_shelf`] stands in for. Each takes the spacing its real shelf takes,
+/// so a page of them lands on the real page's rows.
 #[derive(Clone, Copy)]
 pub enum SkeletonShelfShape {
-    /// One row of cards, fitted to the width as the carousel fits them.
+    /// A carousel (`crate::ui::carousel`): its heading row, arrows included, then one row of
+    /// cards fitted to the width. No air above — the caller adds what the page adds.
     Cards(ArtShape),
+    /// A `section` heading over unnumbered rows (History's dated shelves).
     Rows,
-    /// Home's song shelves: rows down columns, four deep.
+    /// Home's song shelves (`crate::ui::song_shelf`): air, heading with arrows, rows down
+    /// columns.
     SongGrid,
+    /// A `section` heading over mood chips, `n` rows of them.
+    Chips,
 }
 
-/// A whole titled shelf's placeholder — a title-bar bar in [`crate::ui::section`]'s own spot,
-/// followed by cards or rows. Covers every "titled shelf" page (Home, Explore, Releases,
-/// History, an artist's shelves): those load into several of these, not one untitled block.
+/// A whole titled shelf's placeholder: its heading where the real heading goes, then cards,
+/// rows or chips. `n` is the rows' or chip rows' count; a card shelf is always one row.
 pub fn skeleton_shelf(ui: &mut Ui, palette: &Palette, shape: SkeletonShelfShape, n: usize) {
-    skeleton_title(ui, palette);
     match shape {
-        // Every card shelf is one row that scrolls sideways now, so its placeholder is the row
-        // it will be: as many cards as fit, each as wide as the carousel will make it.
-        SkeletonShelfShape::Cards(art_shape) => skeleton_card_row(ui, palette, art_shape),
-        SkeletonShelfShape::Rows => skeleton_rows(ui, palette, n),
-        SkeletonShelfShape::SongGrid => skeleton_song_grid(ui, palette, n),
+        SkeletonShelfShape::Cards(art_shape) => {
+            skeleton_heading(ui, palette, true);
+            ui.add_space(4.0);
+            skeleton_card_row(ui, palette, art_shape);
+        }
+        SkeletonShelfShape::Rows => {
+            skeleton_title(ui, palette);
+            skeleton_rows(ui, palette, n);
+        }
+        SkeletonShelfShape::SongGrid => {
+            ui.add_space(20.0);
+            skeleton_heading(ui, palette, true);
+            ui.add_space(4.0);
+            let cols = crate::ui::song_shelf_columns(ui.available_width());
+            skeleton_song_grid(ui, palette, n, cols, false);
+        }
+        SkeletonShelfShape::Chips => {
+            skeleton_title(ui, palette);
+            skeleton_chips(ui, palette, n);
+        }
     }
 }
 
-/// A section-heading placeholder in [`crate::ui::section`]'s own spot — for a skeleton that
-/// needs a title bar of its own without a whole shelf under it (Moods' chip sections).
-pub fn skeleton_title(ui: &mut Ui, palette: &Palette) {
-    ui.add_space(12.0);
-    skeleton_bar(ui, palette, 130.0, 14.0);
-    ui.add_space(4.0);
+/// A heading the page always has, for real: [`skeleton_heading`]'s row with the words on it, drawn
+/// with the placeholders around it.
+pub fn skeleton_heading_text(ui: &mut Ui, palette: &Palette, text: &str) {
+    let font = theme::bold(theme::SECTION_PT);
+    let h = ui.fonts_mut(|f| f.row_height(&font));
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    if skeleton_visible(ui) && ui.is_rect_visible(rect) {
+        ui.painter().text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font,
+            palette.text,
+        );
+    }
 }
 
-/// Grey placeholder cards while a grid page loads. Same contract as the rows: static.
-///
-/// `shape` is the shape the real cards will have, so a grid of artists does not load as
-/// squares and land as circles.
-pub fn skeleton_cards(ui: &mut Ui, palette: &Palette, n: usize, shape: ArtShape) {
+/// A section heading's placeholder with [`crate::ui::section`]'s own spacing: 20 above, the
+/// heading line, 8 below.
+pub fn skeleton_title(ui: &mut Ui, palette: &Palette) {
+    ui.add_space(20.0);
+    skeleton_heading(ui, palette, false);
+    ui.add_space(8.0);
+}
+
+/// A shelf heading's line: a bar over where a `SECTION_PT` label's capitals sit, in a row as
+/// tall as the real one — a carousel's arrows make it an icon button tall.
+pub fn skeleton_heading(ui: &mut Ui, palette: &Palette, arrows: bool) {
+    let font = theme::bold(theme::SECTION_PT);
+    let label_h = ui.fonts_mut(|f| f.row_height(&font));
+    // `icon_button` at 14 pt is a 28 pt box.
+    let row_h = if arrows { label_h.max(28.0) } else { label_h };
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let cap = theme::SECTION_PT * 0.727;
+    skeleton_fill(
+        ui,
+        Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - cap / 2.0 + 1.0),
+            vec2(130.0_f32.min(rect.width()), cap),
+        ),
+        CornerRadius::same(theme::RADIUS_SMALL),
+        palette,
+    );
+}
+
+/// The small line over a shelf's title (`shelf_strapline`), at its own height and pull-up.
+pub fn skeleton_strapline(ui: &mut Ui, palette: &Palette) {
+    let h = ui.fonts_mut(|f| f.row_height(&theme::medium(11.0)));
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    skeleton_fill(
+        ui,
+        Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - 3.5),
+            vec2(40.0_f32.min(rect.width()), 7.0),
+        ),
+        CornerRadius::same(theme::RADIUS_SMALL),
+        palette,
+    );
+    ui.add_space(-4.0);
+}
+
+/// A page title's placeholder, in [`crate::ui::page_title`]'s own spot, for a page whose title
+/// arrives with its content (a mood's name, a Home shelf's).
+pub fn skeleton_page_title(ui: &mut Ui, palette: &Palette) {
+    let font = theme::bold(theme::PAGE_TITLE_PT);
+    ui.add_space((theme::PAGE_INSET_X - theme::PAGE_TITLE_PT * 0.18).max(0.0));
+    let h = ui.fonts_mut(|f| f.row_height(&font));
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    let cap = theme::PAGE_TITLE_PT * 0.727;
+    skeleton_fill(
+        ui,
+        Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - cap / 2.0 + 1.0),
+            vec2(220.0_f32.min(rect.width()), cap),
+        ),
+        CornerRadius::same(theme::RADIUS_SMALL),
+        palette,
+    );
+    ui.add_space(10.0);
+}
+
+/// Placeholder cards in a wrapped grid, `rows` rows of them, each as wide as
+/// [`crate::ui::grid_card_w`] makes the real cards — the library's grids, a mood's playlists, a
+/// Home shelf's "Show all".
+pub fn skeleton_grid(ui: &mut Ui, palette: &Palette, rows: usize, shape: ArtShape) {
     ui.horizontal_wrapped(|ui| {
-        for _ in 0..n {
-            skeleton_card(ui, palette, super::ui::CARD_W, shape);
+        let card_w = crate::ui::grid_card_w(ui);
+        let gap = ui.spacing().item_spacing.x;
+        let cols = (((ui.available_width() + gap) / (card_w + gap)).floor() as usize).max(1);
+        for _ in 0..cols * rows {
+            skeleton_card(ui, palette, card_w, shape);
         }
     });
 }
@@ -1720,63 +1826,6 @@ fn skeleton_card(ui: &mut Ui, palette: &Palette, width: f32, shape: ArtShape) {
             palette,
         );
     }
-}
-
-/// What kind of detail header [`skeleton_header`] is standing in for — controls how many text
-/// bars it draws and whether a button-row bar appears beneath them, so an album's placeholder
-/// stops looking like an artist's.
-#[derive(Clone, Copy)]
-pub enum SkeletonHeaderKind {
-    /// Round art, a name bar, one audience/subscriber-line bar — no kind label, no button row:
-    /// the artist page draws its own Shuffle/Mix/Subscribe row separately.
-    Artist,
-    /// Square art, a kind-label bar, a title bar, an optional description bar, a credit-line
-    /// bar, and a Play/Save/•••-shaped button-row bar — what the album and playlist headers
-    /// actually paint.
-    Detail { description: bool },
-}
-
-/// Grey placeholder header while a detail page loads — art plus however many text bars and
-/// whatever button row the real header for `kind` would paint, rather than always exactly two
-/// bars regardless of what's loading.
-pub fn skeleton_header(ui: &mut Ui, palette: &Palette, size: f32, kind: SkeletonHeaderKind) {
-    // The same top gap the real header takes, so the page does not jump when it arrives.
-    ui.add_space(theme::HEADER_TOP_PAD);
-    ui.horizontal(|ui| {
-        let circle = matches!(kind, SkeletonHeaderKind::Artist);
-        let (art_rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
-        let radius = if circle {
-            CornerRadius::same((size / 2.0).clamp(0.0, 255.0) as u8)
-        } else {
-            CornerRadius::same(theme::RADIUS)
-        };
-        skeleton_fill(ui, art_rect, radius, palette);
-        ui.vertical(|ui| match kind {
-            SkeletonHeaderKind::Artist => {
-                ui.add_space(size / 2.0 - 22.0);
-                for (w, h) in [(0.5, 14.0), (0.3, 10.0)] {
-                    let bar_w = (ui.available_width() * w).max(80.0);
-                    skeleton_bar(ui, palette, bar_w, h);
-                    ui.add_space(8.0);
-                }
-            }
-            SkeletonHeaderKind::Detail { description } => {
-                ui.add_space(8.0);
-                skeleton_bar(ui, palette, (ui.available_width() * 0.15).max(50.0), 11.0);
-                ui.add_space(10.0);
-                skeleton_bar(ui, palette, (ui.available_width() * 0.55).max(120.0), 32.0);
-                ui.add_space(10.0);
-                if description {
-                    skeleton_bar(ui, palette, (ui.available_width() * 0.4).max(100.0), 11.0);
-                    ui.add_space(8.0);
-                }
-                skeleton_bar(ui, palette, (ui.available_width() * 0.35).max(90.0), 11.0);
-                ui.add_space(14.0);
-                skeleton_bar(ui, palette, (ui.available_width() * 0.4).max(110.0), 40.0);
-            }
-        });
-    });
-    ui.add_space(12.0);
 }
 
 /// Whether a row's rating thumbs share the duration's corner, given the row's width and what it
@@ -2270,6 +2319,7 @@ pub(crate) fn row_menu(
         ui.layer_id(),
     )
     .kind(egui::PopupKind::Menu)
+    .frame(menu_frame(ui, palette))
     .layout(egui::Layout::top_down_justified(egui::Align::Min))
     .width(MENU_WIDTH)
     .gap(0.0)
@@ -2336,8 +2386,14 @@ pub(crate) fn row_menu(
                 .filter(|p| p.editable && p.source == wanted_source)
                 .collect();
             let removable = menu.playlist_id.zip(t.set_video_id.as_deref());
-            if token.is_some() || !targets.is_empty() || removable.is_some() {
-                mui.add_space(8.0);
+            // A download item shows for every YouTube song, so the block is there whenever the
+            // song is one, or has a library or playlist move to offer.
+            if token.is_some()
+                || t.local_path.is_none()
+                || !targets.is_empty()
+                || removable.is_some()
+            {
+                menu_divider(mui, palette);
             }
             if token.is_some()
                 && menu_item(
@@ -2435,7 +2491,9 @@ pub(crate) fn row_menu(
             }
 
             // Block three: where it came from, and sending it on.
-            mui.add_space(8.0);
+            if t.album_id.is_some() || t.primary_artist_id().is_some() || t.local_path.is_none() {
+                menu_divider(mui, palette);
+            }
             if let Some(id) = &t.album_id
                 && menu_item(mui, palette, Icon::Disc3, "Go to album", None).clicked()
             {
@@ -2448,11 +2506,11 @@ pub(crate) fn row_menu(
                 choice = Some(RowAction::GoToArtist(id.to_owned()));
                 mui.close();
             }
-            // There is no real YouTube URL for a local track to share.
+            // There is no real YouTube URL for a local track to copy.
             if t.local_path.is_none()
-                && menu_item(mui, palette, Icon::Share2, "Share", None).clicked()
+                && menu_item(mui, palette, Icon::Link, "Copy link", None).clicked()
             {
-                choice = Some(RowAction::Share(t.video_id.clone()));
+                choice = Some(RowAction::CopyLink(t.video_id.clone()));
                 mui.close();
             }
             choice
@@ -2496,14 +2554,18 @@ pub struct PageMenu<'a> {
     /// this is actually chosen. `None` everywhere else; the existing "Save to playlist"
     /// (`targets`, below) already covers saving into a playlist that exists.
     pub save_as_new: Option<&'a str>,
+    /// The page's songs are still being fetched (a sidebar playlist or a card, right-clicked a
+    /// moment ago), and this is what kind of page they belong to. The menu shows every item it
+    /// will have once they land, so it opens complete; an item picked before then is reported
+    /// as [`super::ui::RowAction::PageWhenLoaded`] and done when they arrive.
+    pub(crate) tracks_pending: Option<super::ui::PageKind>,
 }
 
 /// A page header's ••• menu, reporting the choice.
 ///
-/// Order: save-as-new (only where `save_as_new` is set), mix, shuffle, queueing, saving,
-/// navigation, share, info. Mix leads among the rest — starting a mix is the one worth
-/// reaching for first when both are on offer. No block separators — menus carry none anywhere
-/// since the divider cleanup.
+/// Four groups, divided: playing it (mix, shuffle, queueing), keeping it (save as playlist,
+/// download, save to playlist), about it (artist, link, info), and changing it (edit, delete,
+/// remove). Mix leads — starting a mix is the one worth reaching for first.
 pub(crate) fn page_menu(
     ui: &mut Ui,
     palette: &Palette,
@@ -2518,6 +2580,7 @@ pub(crate) fn page_menu(
         ui.layer_id(),
     )
     .kind(egui::PopupKind::Menu)
+    .frame(menu_frame(ui, palette))
     .layout(egui::Layout::top_down_justified(egui::Align::Min))
     .width(MENU_WIDTH)
     .gap(0.0);
@@ -2543,61 +2606,20 @@ pub(crate) fn page_menu(
             let mut choice = None;
             // Cloned on pick, not per frame: the menu borrows the page's tracks.
             let tracks = || menu.tracks.to_vec();
-
-            if let Some(title) = menu.save_as_new
-                && !menu.tracks.is_empty()
-                && menu_item(mui, palette, Icon::ListPlus, "Save as playlist", None).clicked()
-            {
-                choice = Some(RowAction::PageSaveAsNewPlaylist {
-                    title: title.to_owned(),
-                    video_ids: menu.tracks.iter().map(|t| t.video_id.clone()).collect(),
-                });
-                mui.close();
-            }
-            // A page with a playlist/album id starts a mix of the whole thing; only a page
-            // without one (a folder) falls back to seeding from the first song.
-            if let Some(radio) = menu.radio_id {
-                if menu_item(mui, palette, Icon::Radio, "Start mix", None).clicked() {
-                    choice = Some(RowAction::StartMixPlaylist(radio.to_owned()));
-                    mui.close();
-                }
-            } else if let Some(first) = menu.tracks.first()
-                && menu_item(mui, palette, Icon::Radio, "Start mix", None).clicked()
-            {
-                choice = Some(RowAction::StartMix(first.video_id.clone()));
-                mui.close();
-            }
-            if !menu.tracks.is_empty()
-                && menu_item(mui, palette, Icon::Shuffle, "Shuffle play", None).clicked()
-            {
-                choice = Some(RowAction::PageShuffle(tracks()));
-                mui.close();
-            }
-            if !menu.tracks.is_empty() {
-                if menu_item(mui, palette, Icon::ListStart, "Play next", None).clicked() {
-                    choice = Some(RowAction::PagePlayNext(tracks()));
-                    mui.close();
-                }
-                if menu_item(mui, palette, Icon::ListPlus, "Add to queue", None).clicked() {
-                    choice = Some(RowAction::PageQueue(tracks()));
-                    mui.close();
-                }
-                // Offline: save the whole page to disk. Only for YouTube tracks — a folder of
-                // local files is already on disk.
-                if menu.tracks.iter().all(|t| t.local_path.is_none()) {
-                    let allowed = premium(mui.ctx());
-                    let item = mui
-                        .add_enabled_ui(allowed, |mui| {
-                            menu_item(mui, palette, Icon::Download, "Download all", None)
-                        })
-                        .inner
-                        .on_disabled_hover_text(DOWNLOAD_NEEDS_PREMIUM);
-                    if item.clicked() {
-                        choice = Some(RowAction::DownloadMany(tracks()));
-                        mui.close();
-                    }
-                }
-            }
+            // Songs still on their way count as songs: the items show now and wait for them.
+            let pending = menu
+                .tracks
+                .is_empty()
+                .then_some(menu.tracks_pending)
+                .flatten();
+            let later = |then: super::ui::PageThen| {
+                pending.map(|kind| RowAction::PageWhenLoaded {
+                    page_id: menu.page_id.to_owned(),
+                    kind,
+                    then,
+                })
+            };
+            let has_tracks = !menu.tracks.is_empty() || pending.is_some();
             // Only the playlists you can actually add to, and only ones of the same source —
             // same rule as a row's picker, and for the same reason. Signed-out pages carry no
             // playlists, so the item hides itself with no auth check.
@@ -2611,8 +2633,82 @@ pub(crate) fn page_menu(
                 .iter()
                 .filter(|p| p.editable && p.source == wanted_source)
                 .collect();
+            // Offline: save the whole page to disk. Only for YouTube tracks — a folder of local
+            // files is already on disk.
+            let downloadable = has_tracks && menu.tracks.iter().all(|t| t.local_path.is_none());
+            let mut groups = MenuGroups::default();
+
+            // Playing it.
+            groups.start(mui, palette, menu.radio_id.is_some() || has_tracks);
+            // A page with a playlist/album id starts a mix of the whole thing; only a page
+            // without one (a folder) falls back to seeding from the first song.
+            if let Some(radio) = menu.radio_id {
+                if menu_item(mui, palette, Icon::Radio, "Start mix", None).clicked() {
+                    choice = Some(RowAction::StartMixPlaylist(radio.to_owned()));
+                    mui.close();
+                }
+            } else if let Some(first) = menu.tracks.first() {
+                if menu_item(mui, palette, Icon::Radio, "Start mix", None).clicked() {
+                    choice = Some(RowAction::StartMix(first.video_id.clone()));
+                    mui.close();
+                }
+            } else if pending.is_some()
+                && menu_item(mui, palette, Icon::Radio, "Start mix", None).clicked()
+            {
+                // An album card's radio id comes with the album itself.
+                choice = later(super::ui::PageThen::StartMix);
+                mui.close();
+            }
+            if has_tracks {
+                if menu_item(mui, palette, Icon::Shuffle, "Shuffle play", None).clicked() {
+                    choice = later(super::ui::PageThen::Shuffle)
+                        .or_else(|| Some(RowAction::PageShuffle(tracks())));
+                    mui.close();
+                }
+                if menu_item(mui, palette, Icon::ListStart, "Play next", None).clicked() {
+                    choice = later(super::ui::PageThen::PlayNext)
+                        .or_else(|| Some(RowAction::PagePlayNext(tracks())));
+                    mui.close();
+                }
+                if menu_item(mui, palette, Icon::ListPlus, "Add to queue", None).clicked() {
+                    choice = later(super::ui::PageThen::Queue)
+                        .or_else(|| Some(RowAction::PageQueue(tracks())));
+                    mui.close();
+                }
+            }
+
+            // Keeping it.
+            let save_as_new = menu.save_as_new.filter(|_| has_tracks);
+            groups.start(
+                mui,
+                palette,
+                save_as_new.is_some() || downloadable || (has_tracks && !targets.is_empty()),
+            );
+            if let Some(title) = save_as_new
+                && menu_item(mui, palette, Icon::ListPlus, "Save as playlist", None).clicked()
+            {
+                choice = Some(RowAction::PageSaveAsNewPlaylist {
+                    title: title.to_owned(),
+                    video_ids: menu.tracks.iter().map(|t| t.video_id.clone()).collect(),
+                });
+                mui.close();
+            }
+            if downloadable {
+                let allowed = premium(mui.ctx());
+                let item = mui
+                    .add_enabled_ui(allowed, |mui| {
+                        menu_item(mui, palette, Icon::Download, "Download all", None)
+                    })
+                    .inner
+                    .on_disabled_hover_text(DOWNLOAD_NEEDS_PREMIUM);
+                if item.clicked() {
+                    choice = later(super::ui::PageThen::DownloadAll)
+                        .or_else(|| Some(RowAction::DownloadMany(tracks())));
+                    mui.close();
+                }
+            }
             if !targets.is_empty()
-                && !menu.tracks.is_empty()
+                && has_tracks
                 && let Some((playlist_id, title)) = sub_menu(
                     mui,
                     palette,
@@ -2635,13 +2731,26 @@ pub(crate) fn page_menu(
                     },
                 )
             {
-                choice = Some(RowAction::PageSaveToPlaylist {
-                    playlist_id,
-                    title,
-                    video_ids: menu.tracks.iter().map(|t| t.video_id.clone()).collect(),
-                });
+                choice = match later(super::ui::PageThen::SaveToPlaylist {
+                    playlist_id: playlist_id.clone(),
+                    title: title.clone(),
+                }) {
+                    Some(deferred) => Some(deferred),
+                    None => Some(RowAction::PageSaveToPlaylist {
+                        playlist_id,
+                        title,
+                        video_ids: menu.tracks.iter().map(|t| t.video_id.clone()).collect(),
+                    }),
+                };
                 mui.close();
             }
+
+            // About it, and passing it on.
+            groups.start(
+                mui,
+                palette,
+                menu.artist_id.is_some() || !menu.share_url.is_empty() || menu.has_info,
+            );
             if let Some(id) = menu.artist_id
                 && menu_item(mui, palette, Icon::CircleUser, "Go to artist", None).clicked()
             {
@@ -2649,15 +2758,18 @@ pub(crate) fn page_menu(
                 mui.close();
             }
             if !menu.share_url.is_empty()
-                && menu_item(mui, palette, Icon::Share2, "Share", None).clicked()
+                && menu_item(mui, palette, Icon::Link, "Copy link", None).clicked()
             {
-                choice = Some(RowAction::PageShare(menu.share_url.clone()));
+                choice = Some(RowAction::PageCopyLink(menu.share_url.clone()));
                 mui.close();
             }
             if menu.has_info && menu_item(mui, palette, Icon::Info, "Info", None).clicked() {
                 choice = Some(RowAction::PageInfo);
                 mui.close();
             }
+
+            // Changing it.
+            groups.start(mui, palette, menu.manage || menu.remove_from_library);
             if menu.manage {
                 if menu_item(mui, palette, Icon::Pencil, "Edit playlist", None).clicked() {
                     choice = Some(RowAction::EditPlaylist(menu.page_id.to_owned()));
@@ -2709,6 +2821,7 @@ pub(crate) fn sub_menu<T>(
     let popup = egui::Popup::from_response(&row)
         .id(id)
         .kind(egui::PopupKind::Menu)
+        .frame(menu_frame(ui, palette))
         .layout(egui::Layout::top_down_justified(egui::Align::Min))
         .align(egui::RectAlign::RIGHT_START)
         .width(MENU_WIDTH)
@@ -3041,6 +3154,8 @@ pub struct ReleaseMenu<'a> {
     /// An owned playlist: enables Edit/Delete.
     pub manage: bool,
     pub remove_from_library: bool,
+    /// See [`PageMenu::tracks_pending`].
+    pub(crate) tracks_pending: Option<super::ui::PageKind>,
 }
 
 /// A card's right-click menu, dispatched by what the card is.
@@ -3057,7 +3172,12 @@ fn card_menu(
     match menu {
         CardMenu::Track(row) => row_menu(ui, palette, response, row),
         CardMenu::Artist(artist) => {
-            let popup = card_popup(ui, response, ("ytm-artist-menu", artist.id.as_str()));
+            let popup = card_popup(
+                ui,
+                palette,
+                response,
+                ("ytm-artist-menu", artist.id.as_str()),
+            );
             popup
                 .show(|mui| {
                     let mut choice = None;
@@ -3079,8 +3199,14 @@ fn card_menu(
                         });
                         mui.close();
                     }
+                    let mut groups = MenuGroups::default();
+                    groups.start(
+                        mui,
+                        palette,
+                        artist.actions.mix.is_some() || artist.actions.shuffle.is_some(),
+                    );
                     if let Some(subscribed) = artist.actions.subscribed {
-                        mui.add_space(8.0);
+                        groups.start(mui, palette, true);
                         let label = if subscribed {
                             "Unsubscribe"
                         } else {
@@ -3099,11 +3225,13 @@ fn card_menu(
                             mui.close();
                         }
                     }
-                    mui.add_space(8.0);
-                    if menu_item(mui, palette, Icon::Share2, "Share", None).clicked() {
-                        // Not `RowAction::Share`: that builds a `watch?v=` URL, right for a
+                    groups.start(mui, palette, true);
+                    if menu_item(mui, palette, Icon::Link, "Copy link", None).clicked() {
+                        // Not `RowAction::CopyLink`: that builds a `watch?v=` URL, right for a
                         // track's video id but wrong for a channel id.
-                        choice = Some(RowAction::PageShare(crate::model::artist_url(&artist.id)));
+                        choice = Some(RowAction::PageCopyLink(crate::model::artist_url(
+                            &artist.id,
+                        )));
                         mui.close();
                     }
                     if let Some(token) = &artist.actions.dont_recommend
@@ -3137,6 +3265,7 @@ fn card_menu(
                 context_only: true,
                 radio_id: menu.radio_id,
                 save_as_new: None,
+                tracks_pending: menu.tracks_pending,
             },
         ),
     }
@@ -3146,11 +3275,13 @@ fn card_menu(
 /// than its index, which shifts as a wrapped grid reflows.
 fn card_popup<'a>(
     ui: &Ui,
+    palette: &Palette,
     response: &'a egui::Response,
     id: impl std::hash::Hash + std::fmt::Debug,
 ) -> egui::Popup<'a> {
     egui::Popup::new(ui.id().with(id), ui.ctx().clone(), response, ui.layer_id())
         .kind(egui::PopupKind::Menu)
+        .frame(menu_frame(ui, palette))
         .layout(egui::Layout::top_down_justified(egui::Align::Min))
         .width(MENU_WIDTH)
         .gap(0.0)
@@ -3478,6 +3609,7 @@ pub fn dropdown(
     let popup = egui::Popup::from_response(&response)
         .id(id)
         .kind(egui::PopupKind::Menu)
+        .frame(menu_frame(ui, palette))
         .layout(egui::Layout::top_down_justified(egui::Align::Min))
         .align(egui::RectAlign::BOTTOM_START)
         .width(DROPDOWN_WIDTH)
@@ -3582,6 +3714,7 @@ pub fn icon_dropdown(
     let popup = egui::Popup::from_response(&response)
         .id(id)
         .kind(egui::PopupKind::Menu)
+        .frame(menu_frame(ui, palette))
         .layout(egui::Layout::top_down_justified(egui::Align::Min))
         .align(egui::RectAlign::BOTTOM_END)
         .width(DROPDOWN_WIDTH)
@@ -3874,6 +4007,30 @@ pub fn rate_button(
     response
 }
 
+/// The frame every menu and dropdown opens in. On a dark scheme it takes the chips' `surface`
+/// — a step lighter than the card it opens over, which is what reads as nearer on a dark page;
+/// the darker popup fill it used to have looked sunk into the page. A light scheme keeps its
+/// popup fill, already the lighter one there. A faint edge at the dividers' strength gives it a
+/// crisp outline, and a short, tight shadow grounds that edge instead of haloing the menu.
+/// Corners at 12, so the rows' 6 pt highlight sits evenly inside the 6 pt margin.
+pub(crate) fn menu_frame(ui: &Ui, palette: &Palette) -> egui::Frame {
+    egui::Frame::popup(ui.style())
+        .fill(if palette.dark {
+            palette.surface
+        } else {
+            palette.overlay
+        })
+        .stroke(egui::Stroke::new(1.0, palette.outline.gamma_multiply(0.55)))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(6))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 2],
+            blur: 10,
+            spread: 0,
+            color: palette.shadow.gamma_multiply(0.7),
+        })
+}
+
 /// One row of a context menu: a leading glyph, a label, and an optional trailing mark.
 ///
 /// Hand-drawn rather than `ui.button` so every row is the same height and the icon column lines
@@ -3897,6 +4054,43 @@ pub fn menu_item_plain(
     trailing: Option<&str>,
 ) -> egui::Response {
     menu_row(ui, palette, None, label, trailing)
+}
+
+/// A faint hairline between a menu's groups of items. The line is what separates them now, so
+/// it takes almost no room: the rows' own spacing, pulled in a little on each side, leaves the
+/// groups only a few points further apart than two rows. At half the outline's strength it
+/// separates without drawing the eye.
+pub fn menu_divider(ui: &mut Ui, palette: &Palette) {
+    ui.add_space(-2.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().hline(
+            (rect.left() + 12.0)..=(rect.right() - 12.0),
+            rect.center().y,
+            egui::Stroke::new(1.0, palette.outline.gamma_multiply(0.55)),
+        );
+    }
+    ui.add_space(-2.0);
+}
+
+/// Dividers for a menu whose groups come and go with the data: each group that has items says
+/// so as it starts, and gets a divider only when a group above it drew something — never one at
+/// the top, at the bottom, or two in a row.
+#[derive(Default)]
+struct MenuGroups {
+    drawn: bool,
+}
+
+impl MenuGroups {
+    fn start(&mut self, ui: &mut Ui, palette: &Palette, visible: bool) {
+        if !visible {
+            return;
+        }
+        if self.drawn {
+            menu_divider(ui, palette);
+        }
+        self.drawn = true;
+    }
 }
 
 fn menu_row(
@@ -4567,6 +4761,7 @@ mod tests {
                         context_only: false,
                         radio_id: None,
                         save_as_new: None,
+                        tracks_pending: None,
                     },
                 );
             })

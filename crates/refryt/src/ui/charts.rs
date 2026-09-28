@@ -21,9 +21,21 @@ fn title(app: &App, ui: &mut egui::Ui) {
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.charts_loading && app.charts.is_none() {
         title(app, ui);
-        // A ranked section is a 3-column grid, not a single column of rows.
-        widgets::skeleton_title(ui, &app.palette);
-        widgets::skeleton_chart_grid(ui, &app.palette, 9);
+        // Card shelves — the daily and weekly charts and the ones by language, too short to
+        // scroll so their headings carry no arrows, then the top artists' round cards. Where a
+        // region's charts open with ranked grids those arrive first, but the shelves are what
+        // every account gets.
+        for _ in 0..3 {
+            widgets::skeleton_heading(ui, &app.palette, false);
+            ui.add_space(4.0);
+            widgets::skeleton_card_row(ui, &app.palette, widgets::ArtShape::Square);
+        }
+        widgets::skeleton_shelf(
+            ui,
+            &app.palette,
+            widgets::SkeletonShelfShape::Cards(widgets::ArtShape::Circle),
+            1,
+        );
         return;
     }
     if let Some(err) = app.charts_error.clone() {

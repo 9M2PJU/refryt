@@ -17,12 +17,19 @@ use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.artist_loading {
-        widgets::skeleton_header(
+        crate::ui::skeleton_page_header(
             ui,
             &app.palette,
-            PAGE_ART_SIZE,
-            widgets::SkeletonHeaderKind::Detail { description: false },
+            crate::ui::HeaderSkeleton {
+                kind: crate::ui::HeaderKind::None,
+                title: Some("Liked songs"),
+                description: false,
+                credit_line: false,
+                credit_air: 4.0,
+                controls: crate::ui::HeaderControls::ShuffleAndSort,
+            },
         );
+        ui.add_space(10.0);
         widgets::skeleton_track_rows(ui, &app.palette, 8, false);
         return;
     }

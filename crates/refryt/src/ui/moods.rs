@@ -12,10 +12,10 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.moods_loading && app.moods.is_none() {
         // No cover art anywhere on this page — colour-stripe chips, not photo cards.
         crate::ui::page_title(ui, &app.palette, "Moods & genres");
-        widgets::skeleton_title(ui, &app.palette);
-        widgets::skeleton_chips(ui, &app.palette, 6);
-        widgets::skeleton_title(ui, &app.palette);
-        widgets::skeleton_chips(ui, &app.palette, 6);
+        // For you, Moods & moments, Genres: a row, two, and a longer block.
+        for rows in [1, 2, 4] {
+            widgets::skeleton_shelf(ui, &app.palette, widgets::SkeletonShelfShape::Chips, rows);
+        }
         return;
     }
     if let Some(err) = app.moods_error.clone() {

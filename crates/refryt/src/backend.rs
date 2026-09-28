@@ -451,6 +451,46 @@ pub enum Event {
 }
 
 impl Event {
+    /// Whether this event is a page's content arriving (or failing to), which is what swaps a
+    /// skeleton out — for the debug-only `REFRYT_HOLD_LOADING`.
+    #[cfg(debug_assertions)]
+    pub fn is_page_load(&self) -> bool {
+        matches!(
+            self,
+            Event::SearchDone { .. }
+                | Event::SearchFailed { .. }
+                | Event::ScopedSearchDone { .. }
+                | Event::ScopedSearchFailed { .. }
+                | Event::ArtistLoaded { .. }
+                | Event::ArtistFailed { .. }
+                | Event::AlbumLoaded { .. }
+                | Event::AlbumFailed { .. }
+                | Event::PlaylistLoaded { .. }
+                | Event::PlaylistFailed { .. }
+                | Event::PlaylistSuggestions { .. }
+                | Event::LibraryLoaded { .. }
+                | Event::LibraryFailed { .. }
+                | Event::ExploreLoaded { .. }
+                | Event::ExploreFailed { .. }
+                | Event::ReleasesLoaded { .. }
+                | Event::ReleasesFailed { .. }
+                | Event::ChartsLoaded { .. }
+                | Event::ChartsFailed { .. }
+                | Event::MoodsLoaded { .. }
+                | Event::MoodsFailed { .. }
+                | Event::HistoryLoaded { .. }
+                | Event::HistoryFailed { .. }
+                | Event::HomeLoaded { .. }
+                | Event::HomeFailed { .. }
+                | Event::HomeShelfLoaded { .. }
+                | Event::HomeShelfFailed { .. }
+                | Event::MoodPlaylistsLoaded { .. }
+                | Event::MoodPlaylistsFailed { .. }
+                | Event::LyricsLoaded { .. }
+                | Event::LyricsFailed { .. }
+        )
+    }
+
     /// The error a failure carries, for the one question asked of all of them at once: does
     /// this read as having no connection? See [`crate::api::looks_offline`]. A local folder scan
     /// failing is left out — the disk has nothing to say about the network.

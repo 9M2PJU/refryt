@@ -11,12 +11,19 @@ use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.playlist_loading {
-        widgets::skeleton_header(
+        crate::ui::skeleton_page_header(
             ui,
             &app.palette,
-            PAGE_ART_SIZE,
-            widgets::SkeletonHeaderKind::Detail { description: true },
+            crate::ui::HeaderSkeleton {
+                kind: crate::ui::HeaderKind::Text("Playlist"),
+                title: None,
+                description: true,
+                credit_line: false,
+                credit_air: 4.0,
+                controls: crate::ui::HeaderControls::PlayOnly,
+            },
         );
+        ui.add_space(10.0);
         widgets::skeleton_track_rows(ui, &app.palette, 8, false);
         return;
     }
@@ -355,6 +362,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                             radio_id: matches!(pl.source, crate::model::PlaylistSource::YouTube)
                                 .then_some(pl.id.as_str()),
                             save_as_new: None,
+                            tracks_pending: None,
                         },
                     )
                 })

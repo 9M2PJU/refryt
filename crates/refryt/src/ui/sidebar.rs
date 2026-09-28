@@ -319,8 +319,9 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui) {
                     clicked = Some(Route::Playlist(row.id.to_owned()));
                 }
                 // Right-click: the same ••• menu the playlist page offers. The track actions
-                // (shuffle, mix, queue, save) need the playlist's tracks, so a first right-click
-                // kicks off a fetch; once it lands the menu fills in without closing. A local
+                // (shuffle, queue, save) need the playlist's tracks, so a first right-click
+                // kicks off a fetch; the menu shows those items at once and an early pick waits
+                // for the songs (`tracks_pending`). A local
                 // playlist never needs this — it's already fully in memory, so `local_view`
                 // below is built fresh every time instead of going through `rail_cache` at all.
                 let is_local = p.source == crate::model::PlaylistSource::Local;
@@ -342,9 +343,6 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui) {
                 });
                 let tracks: &[crate::model::Track] =
                     cached.map(|pl| pl.tracks.items.as_slice()).unwrap_or(&[]);
-                let has_info = cached
-                    .and_then(|pl| pl.description.as_deref())
-                    .is_some_and(|d| !d.trim().is_empty());
                 if let Some(action) = widgets::page_menu(
                     ui,
                     palette,
@@ -361,13 +359,18 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui) {
                         } else {
                             crate::model::playlist_url(&p.id)
                         },
-                        has_info,
+                        // Not here: the description only arrives with the fetch, so Info would
+                        // pop into an open menu. The playlist page's own ••• offers it.
+                        has_info: false,
                         manage: p.editable,
                         remove_from_library: !p.editable && !crate::model::is_liked_auto(&p.id),
                         context_only: true,
                         // A local playlist has no YouTube radio to start.
                         radio_id: (!is_local).then_some(p.id.as_str()),
                         save_as_new: None,
+                        // The songs a right-click has only just asked for: the menu opens
+                        // complete, and an item picked before they land waits for them.
+                        tracks_pending: cached.is_none().then_some(crate::ui::PageKind::Playlist),
                     },
                 ) {
                     menu_action = Some(action);

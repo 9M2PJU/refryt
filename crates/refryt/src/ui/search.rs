@@ -33,14 +33,17 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
     }
     if app.results.is_empty() {
         if app.searching {
-            widgets::skeleton_rows(ui, &app.palette, 8);
+            // The chips are always these, so they show from the start and the rows below land
+            // where the results will; a click waits for the results.
+            scope_chips(app, ui, false);
+            widgets::skeleton_rows(ui, &app.palette, 12);
         } else {
             centered(app, ui, "Type in the search box above. No sign-in needed.");
         }
         return;
     }
 
-    scope_chips(app, ui);
+    scope_chips(app, ui, true);
 
     if app.search_scope == SearchScope::All {
         if !app
@@ -53,7 +56,7 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
             return;
         }
     } else if app.scoped_loading {
-        widgets::skeleton_rows(ui, &app.palette, 8);
+        widgets::skeleton_rows(ui, &app.palette, 12);
         return;
     } else if let Some(error) = app.scoped_error.clone() {
         centered(app, ui, &error);
@@ -73,7 +76,9 @@ pub fn page(app: &mut App, ui: &mut egui::Ui) {
 /// fetch — see [`SearchScope`]'s own doc comment for why. Chips rather than a dropdown, matching
 /// the rail's own filter row (`library.rs`) — a handful of mutually-exclusive choices read
 /// fastest as a row you can see all of at once.
-fn scope_chips(app: &mut App, ui: &mut egui::Ui) {
+/// The scope chips. `live` is false while the first results are still coming: the chips show,
+/// but a scope cannot be picked until there is a search to scope.
+fn scope_chips(app: &mut App, ui: &mut egui::Ui, live: bool) {
     let mut picked = None;
     ui.horizontal_wrapped(|ui| {
         for scope in SearchScope::ALL {
@@ -82,7 +87,7 @@ fn scope_chips(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
-    if let Some(scope) = picked {
+    if let Some(scope) = picked.filter(|_| live) {
         app.search_scope = scope;
         app.fetch_scoped_search(scope);
     }

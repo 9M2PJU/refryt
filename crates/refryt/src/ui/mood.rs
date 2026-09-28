@@ -6,8 +6,10 @@ use crate::widgets;
 
 pub fn page(app: &mut App, ui: &mut egui::Ui) {
     if app.mood_playlists_loading {
-        widgets::skeleton_title(ui, &app.palette);
-        widgets::skeleton_cards(ui, &app.palette, 8, widgets::ArtShape::Square);
+        // The mood's name arrives with its playlists; the section heading is always this one.
+        widgets::skeleton_page_title(ui, &app.palette);
+        section(ui, &app.palette, "Playlists");
+        widgets::skeleton_grid(ui, &app.palette, 2, widgets::ArtShape::Square);
         return;
     }
     if let Some(err) = app.mood_playlists_error.clone() {

@@ -212,6 +212,7 @@ fn search_field(app: &mut App, ui: &mut Ui, width: f32) {
     egui::Popup::from_response(&response)
         .id(ui.id().with("ytm-search-suggestions"))
         .kind(egui::PopupKind::Menu)
+        .frame(widgets::menu_frame(ui, &p))
         .layout(egui::Layout::top_down_justified(egui::Align::Min))
         .align(egui::RectAlign::BOTTOM_START)
         .width(width)
@@ -390,6 +391,7 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response, signed_in: bo
         ui.layer_id(),
     )
     .kind(egui::PopupKind::Menu)
+    .frame(widgets::menu_frame(ui, &app.palette))
     .layout(egui::Layout::top_down_justified(egui::Align::Min))
     .width(widgets::MENU_WIDTH)
     .gap(0.0)
