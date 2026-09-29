@@ -349,14 +349,7 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         0.0
     };
     if let Some(seek_to) = widgets::seek_bar(ui, &p, bar, fraction as f32, duration, position) {
-        if app.playback_started {
-            if let Some(pl) = &app.player {
-                pl.seek(seek_to);
-            }
-        } else if let Some(index) = app.current {
-            // Scrubbing before play just moves the restored position.
-            app.resume = Some((index, seek_to));
-        }
+        app.seek_to(seek_to);
     }
 
     // Volume. The child Ui spans the whole cluster, not just the slider: it packs from the

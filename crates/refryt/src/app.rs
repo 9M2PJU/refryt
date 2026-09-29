@@ -5423,6 +5423,19 @@ impl App {
         true
     }
 
+    /// Move playback to `seconds` into the current song: the seek bar and a synced lyric line
+    /// both land here. Before playback has started there is nothing to seek, so it moves the
+    /// restored position instead.
+    pub(crate) fn seek_to(&mut self, seconds: f64) {
+        if self.playback_started {
+            if let Some(pl) = &self.player {
+                pl.seek(seconds);
+            }
+        } else if let Some(index) = self.current {
+            self.resume = Some((index, seconds));
+        }
+    }
+
     /// Open or close the lyrics panel. Independent of the queue, which shares the same panel.
     pub(crate) fn toggle_lyrics(&mut self) {
         self.lyrics_open = !self.lyrics_open;

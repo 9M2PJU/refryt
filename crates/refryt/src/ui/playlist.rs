@@ -2,7 +2,7 @@
 //!
 //! Same header language as the album page — large cover, Play / Save / ••• — with a short
 //! description under the title and the owner linked into the meta line below it ("Owner •
-//! N songs • duration • year"). The ••• also carries Edit and Delete for your own lists.
+//! N songs • duration"). The ••• also carries Edit and Delete for your own lists.
 
 use crate::app::{App, PlaylistSort};
 use crate::model::Playlist;
@@ -252,7 +252,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         let Some(pl) = playlist.as_ref() else {
             return;
         };
-        // The type line is the kind only; the year joins the meta line below, like the album.
+        // The type line is the kind only; the meta line below is count and length.
         let kind_label = "Playlist".to_owned();
         let meta = meta_line(pl);
         // The owner, folded into the meta line below rather than a separate row: linked where
@@ -312,7 +312,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                 second_plain: None,
                 meta: Some(&meta),
                 // The owner folds into the meta line as a linked name, so the card reads
-                // "Owner • N songs • duration • year" on one line instead of a row each.
+                // "Owner • N songs • duration" on one line instead of a row each.
                 owner: owner.as_ref(),
                 credit_air: 4.0,
                 play_size: Some(crate::ui::DETAIL_PLAY_PT),
@@ -431,20 +431,26 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
         None => {}
     }
 }
-/// Count, length and year: the type line above the title already names the kind, and the owner
-/// now has a linked line of its own, so this is the stats alone.
+/// Count and length: the type line above the title already names the kind, and the owner now
+/// has a linked line of its own, so this is the stats alone. A playlist's year is left out: it
+/// says nothing about the songs.
 fn meta_line(playlist: &Playlist) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(n) = &playlist.track_count {
-        parts.push(n.clone());
-    } else {
-        parts.push(format!("{} songs", playlist.tracks.len()));
-    }
-    if let Some(d) = &playlist.duration_text {
-        parts.push(d.clone());
-    }
-    if let Some(y) = &playlist.year {
-        parts.push(y.clone());
+    meta_text(
+        playlist.track_count.as_deref(),
+        playlist.tracks.len(),
+        playlist.duration_text.as_deref(),
+    )
+}
+
+/// The count, then the length when YouTube gave an exact one. A length carrying a "+" ("4+
+/// hours") totals only the first batch of a long list, so it is dropped rather than shown wrong.
+fn meta_text(count: Option<&str>, loaded: usize, duration: Option<&str>) -> String {
+    let mut parts: Vec<String> = vec![match count {
+        Some(n) => n.to_owned(),
+        None => format!("{loaded} songs"),
+    }];
+    if let Some(d) = duration.filter(|d| !d.contains('+')) {
+        parts.push(d.to_owned());
     }
     parts.join(" • ")
 }
@@ -746,5 +752,31 @@ fn confirm_modal(
         Some(false)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meta_text;
+
+    #[test]
+    fn a_partial_length_is_not_shown() {
+        assert_eq!(
+            meta_text(Some("4,783 songs"), 100, Some("4+ hours")),
+            "4,783 songs"
+        );
+    }
+
+    #[test]
+    fn an_exact_length_is_kept() {
+        assert_eq!(
+            meta_text(Some("56 tracks"), 56, Some("2 hours, 52 minutes")),
+            "56 tracks • 2 hours, 52 minutes"
+        );
+    }
+
+    #[test]
+    fn a_missing_count_falls_back_to_the_loaded_songs() {
+        assert_eq!(meta_text(None, 7, None), "7 songs");
     }
 }
