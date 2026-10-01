@@ -128,16 +128,16 @@ fn main() -> eframe::Result {
     // Passed by the autostart entry (`autostart::ARG`): login launched this, so once the window
     // is up it should ask the compositor to bring it forward — Wayland starts it behind whatever
     // window already has focus, and nothing can raise a window that has not asked.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let autostart = args.iter().any(|a| a == refryt::autostart::ARG);
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     let autostart = false;
 
     // The child half of the in-app sign-in window: `webview_login::capture` starts this same
     // binary with `--sign-in-window <file>`, because tao's event loop cannot be created beside
     // eframe's winit one in the same process (it faults natively on Windows). Handled here —
     // before any of the app is set up — so the child is nothing but the sign-in window.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     if let Some(at) = args.iter().position(|a| a == refryt::webview_login::ARG) {
         let path = args.get(at + 1).cloned().unwrap_or_default();
         return match refryt::webview_login::capture_here(std::path::Path::new(&path)) {
@@ -154,7 +154,7 @@ fn main() -> eframe::Result {
     // player. A launch with any other argument is scripted (`--page`, `--search`, a test aid),
     // which is not a user clicking the app again, so it runs unguarded. See `instance`'s own
     // module doc.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     {
         let plain = args.iter().skip(1).all(|a| a == refryt::autostart::ARG);
         if plain
@@ -189,7 +189,24 @@ fn main() -> eframe::Result {
     }
 
     if !decorated {
-        viewport = viewport.with_decorations(false);
+        // macOS: a native window with its title bar hidden and the content running under it,
+        // rather than a borderless one. The system then owns the corner shape — rounded when
+        // windowed *and* when zoomed, with the shadow and the background blur clipped to it —
+        // where a borderless window is a plain rectangle that only looks rounded because the
+        // app paints it so (and so shows blur and shadow in the square corners behind that).
+        // The app's own window buttons stay; the system's are hidden.
+        #[cfg(target_os = "macos")]
+        {
+            viewport = viewport
+                .with_fullsize_content_view(true)
+                .with_titlebar_shown(false)
+                .with_title_shown(false)
+                .with_titlebar_buttons_shown(false);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            viewport = viewport.with_decorations(false);
+        }
         // Windows does not get asked at all: the shell is opaque there (see `app::App::new`),
         // and a transparent request there only ever put the window in front of DWM's flat
         // material. Every other compositor is asked for the see-through shell it can blend.
@@ -199,6 +216,8 @@ fn main() -> eframe::Result {
         }
     }
 
+    // On macOS the transparent request above only gives a see-through window. The blur is applied
+    // later, from `App::ui`, once the window exists (`blur.rs`).
     let result = eframe::run_native(
         "refryt",
         eframe::NativeOptions {

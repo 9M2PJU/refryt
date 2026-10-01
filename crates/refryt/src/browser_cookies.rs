@@ -118,6 +118,9 @@ fn home() -> Option<PathBuf> {
 /// what the user does — `yt-dlp` #10927. `webview_login` is the path that works there, and
 /// offering these browsers anyway would only produce the failure that window exists to avoid.
 /// Firefox has no such scheme, and is offered everywhere.
+///
+/// On macOS Chromium browsers keep their cookie key in the login Keychain. The first import makes
+/// macOS ask for permission to read it, so a password prompt there is expected, not a fault.
 fn readable_on_this_os(key: &str) -> bool {
     if cfg!(target_os = "windows") {
         !matches!(key, "brave" | "chrome" | "chromium" | "vivaldi" | "edge")

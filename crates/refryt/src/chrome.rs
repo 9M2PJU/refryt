@@ -5,6 +5,12 @@
 //! the look, and costs us the behaviour a titlebar normally provides for free — dragging,
 //! resizing from the edges, double-click to maximise. All of that lives here.
 //!
+//! macOS is the exception to "borderless". There the window is a normal native one whose title
+//! bar is hidden and whose content runs underneath it (`main.rs`), so the system draws the
+//! rounded corners, the shadow and the blur clipping, and keeps them correct when the window is
+//! zoomed. The app therefore paints a plain, square background on macOS; see `App::ui`. The
+//! custom buttons and drag area in this module still apply there.
+//!
 //! `--decorated` turns the whole thing off and hands the window back to the OS. That escape hatch
 //! is not optional: X11 without a compositor paints the rounded corners black, and tiling window
 //! managers have their own opinions.

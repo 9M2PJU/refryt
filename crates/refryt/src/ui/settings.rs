@@ -556,10 +556,10 @@ fn local_music(app: &mut App, ui: &mut egui::Ui) {
 fn system(app: &mut App, ui: &mut egui::Ui) {
     let p = app.palette;
 
-    // Both platforms this ships to have a mechanism — an XDG autostart entry on Linux, the
-    // per-user `Run` key on Windows (`autostart`'s own doc comment) — so the row exists
-    // wherever one does, and nowhere else.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    // Every platform this ships to has a mechanism — an XDG autostart entry on Linux, a
+    // LaunchAgent on macOS, the per-user `Run` key on Windows (`autostart`'s own doc comment) —
+    // so the row exists wherever one does, and nowhere else.
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let mut start_on_boot = app.settings.start_on_boot;
     let mut hide_tray = app.settings.hide_tray_on_close;
     // Wayland has no way to hide a window and show it again from code — only a real minimize,
@@ -572,7 +572,7 @@ fn system(app: &mut App, ui: &mut egui::Ui) {
         "Closing hides to the tray instead of quitting."
     };
     widgets::setting_group(ui, &p, Some("Desktop"), |ui, g| {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         toggle_row(
             g,
             ui,
@@ -610,7 +610,7 @@ fn system(app: &mut App, ui: &mut egui::Ui) {
 
     let ctx = ui.ctx().clone();
     app.update_settings(&ctx, |s| {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         {
             s.start_on_boot = start_on_boot;
         }
@@ -658,7 +658,7 @@ fn sign_in(app: &mut App, ui: &mut egui::Ui) {
                     .color(p.dim),
             );
         });
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         window_sign_in(app, ui, g);
         browser_import(app, ui, g);
     });
@@ -668,7 +668,7 @@ fn sign_in(app: &mut App, ui: &mut egui::Ui) {
 /// creates. On Windows that is also the only path that works at all — a modern Chromium's cookie
 /// store is sealed with App-Bound Encryption, so the only process that can read it is the browser
 /// itself, and this window is one. See [`crate::webview_login`].
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn window_sign_in(app: &mut App, ui: &mut egui::Ui, g: &mut widgets::Group) {
     let p = app.palette;
     let mut clicked = false;
@@ -690,7 +690,11 @@ fn window_sign_in(app: &mut App, ui: &mut egui::Ui, g: &mut widgets::Group) {
 /// The path that works: read the cookies out of a browser that is already signed in.
 fn browser_import(app: &mut App, ui: &mut egui::Ui, g: &mut widgets::Group) {
     let p = app.palette;
-    let title = if cfg!(any(target_os = "linux", target_os = "windows")) {
+    let title = if cfg!(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    )) {
         "Or Import from a Browser"
     } else {
         "Import from a Browser"

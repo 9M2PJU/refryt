@@ -283,8 +283,8 @@ pub struct Settings {
     /// The rail's playlist order, by id, as the user dragged it. Ids YouTube no longer returns
     /// are ignored; new ones keep YouTube's order after the ones that are named.
     pub playlist_order: Vec<String>,
-    /// Launch on login, via an XDG autostart entry (Linux only — no autostart mechanism is
-    /// wired up for any other target today).
+    /// Launch on login: an XDG autostart entry on Linux, a LaunchAgent on macOS and the per-user
+    /// `Run` key on Windows (see the `autostart` module).
     pub start_on_boot: bool,
     /// Closing the window hides it to a tray icon instead of quitting. Off by default: a tray
     /// icon that appears the first time someone closes the window, with no prior warning that
@@ -634,8 +634,8 @@ mod tests {
         assert!(s.painting_theme(true, &Themes::default()).is_none());
     }
 
-    /// Every quality must ask for something, and they must differ — a setting that changes no
-    /// request is a lie.
+    /// Every quality must ask for something, and they must differ — a quality setting that does
+    /// not change the request has no effect.
     #[test]
     fn each_quality_selects_a_different_format() {
         let formats: std::collections::HashSet<&str> =

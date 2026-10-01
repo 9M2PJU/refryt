@@ -284,7 +284,12 @@ fn texture(ctx: &egui::Context, ch: char) -> Option<egui::TextureHandle> {
 fn png_for(map: &memmap2::Mmap, ch: char) -> Option<Vec<u8>> {
     use skrifa::{MetadataProvider as _, prelude::Size};
 
-    let font = skrifa::FontRef::new(map).ok()?;
+    // macOS's `Apple Color Emoji.ttc` is a collection (a single face inside); `FontRef::new`
+    // only accepts a bare font, so go through `FileRef` and take the first face either way.
+    let font = match skrifa::raw::FileRef::new(map).ok()? {
+        skrifa::raw::FileRef::Font(font) => font,
+        skrifa::raw::FileRef::Collection(collection) => collection.get(0).ok()?,
+    };
     let glyph = font.charmap().map(ch)?;
     let strikes = skrifa::bitmap::BitmapStrikes::new(&font);
     let bitmap = strikes.glyph_for_size(Size::unscaled(), glyph)?;

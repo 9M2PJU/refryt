@@ -698,6 +698,13 @@ fn lrc_time_ms(stamp: &str) -> Option<u64> {
 /// share this instead of guessing again. A plain `cargo run` has no bundled copy next to the dev
 /// binary either, so local development falls back to whatever `yt-dlp` a real `PATH` lookup
 /// finds.
+///
+/// `scripts/build-macos.sh` puts a standalone `yt-dlp` beside the executable inside the app
+/// bundle, so a packaged macOS build takes the "beside the executable" path. On macOS there is one
+/// more fallback, after that: an app opened from Finder or a login item gets launchd's minimal
+/// `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), which does not include Homebrew, so the Homebrew
+/// prefixes (`/opt/homebrew/bin` on Apple Silicon, `/usr/local/bin` on Intel) are checked
+/// explicitly before giving up and trusting `PATH`.
 pub(crate) fn yt_dlp_program() -> String {
     if let Ok(appdir) = std::env::var("APPDIR") {
         return format!("{appdir}/usr/bin/yt-dlp");
@@ -711,9 +718,19 @@ pub(crate) fn yt_dlp_program() -> String {
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(exe_name)));
     match bundled {
-        Some(path) if path.is_file() => path.to_string_lossy().into_owned(),
-        _ => "yt-dlp".to_owned(),
+        Some(path) if path.is_file() => return path.to_string_lossy().into_owned(),
+        _ => {}
     }
+    // A bundle launched from Finder or a LaunchAgent gets launchd's minimal `PATH`
+    // (`/usr/bin:/bin:/usr/sbin:/sbin`), which has none of Homebrew's prefixes.
+    #[cfg(target_os = "macos")]
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let path = std::path::Path::new(dir).join(exe_name);
+        if path.is_file() {
+            return path.to_string_lossy().into_owned();
+        }
+    }
+    "yt-dlp".to_owned()
 }
 
 /// The URL mpv should load for `stream`: through the proxy when the stream has to be read in
@@ -2035,7 +2052,7 @@ impl Backend {
     ///
     /// The path for a machine whose only browser is a modern Chromium, and on Linux simply the
     /// one that needs no browser at all: the window owns the session it creates.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     pub fn sign_in_from_window(&self) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {

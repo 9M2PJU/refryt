@@ -4,3 +4,7 @@
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 rustflags = ["-L", ".windows-tools/mpv-dev"]
+
+# macOS (Apple Silicon): Homebrew's libmpv lives outside the default linker search path.
+[target.aarch64-apple-darwin]
+rustflags = ["-L", "/opt/homebrew/lib"]

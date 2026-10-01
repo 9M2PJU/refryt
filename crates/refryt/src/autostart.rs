@@ -1,8 +1,8 @@
 //! "Start on boot".
 //!
-//! Two very different mechanisms for one setting: an XDG autostart entry on Linux (matching the
-//! Linux-first install path in `scripts/appimage-install.sh`), and the per-user `Run` key on
-//! Windows — the registry location Task Manager's own Startup tab reads, so the switch can be
+//! Very different mechanisms for one setting: an XDG autostart entry on Linux (matching the
+//! Linux-first install path in `scripts/appimage-install.sh`), a per-user LaunchAgent on macOS,
+//! and the per-user `Run` key on Windows — the registry location Task Manager's own Startup tab reads, so the switch can be
 //! audited and turned off from outside the app the same way every other Windows app's is.
 //!
 //! Both entries pass [`ARG`], so a launch can tell it came from login and ask the compositor to
@@ -384,8 +384,207 @@ mod windows {
     }
 }
 
+/// macOS: a per-user LaunchAgent, which `launchd` loads at the next login. The same
+/// ownership rules as the Linux entry apply — only an entry pointing at this binary (or at
+/// nothing that still exists) is rewritten or removed.
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{Context, Result};
+
+    use super::ARG;
+
+    const LABEL: &str = "io.github.gridoe.refryt";
+
+    fn path() -> Result<PathBuf> {
+        let dirs = directories::BaseDirs::new().context("could not find the home directory")?;
+        Ok(dirs
+            .home_dir()
+            .join("Library/LaunchAgents")
+            .join(format!("{LABEL}.plist")))
+    }
+
+    /// The binary to launch on login: this executable, which inside an app bundle is
+    /// `Refryt.app/Contents/MacOS/refryt`.
+    fn exec_path() -> Option<String> {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+    }
+
+    fn escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
+    fn unescape(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    }
+
+    fn plist(exec: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n\
+<dict>\n\
+\t<key>Label</key>\n\
+\t<string>{LABEL}</string>\n\
+\t<key>ProgramArguments</key>\n\
+\t<array>\n\
+\t\t<string>{}</string>\n\
+\t\t<string>{ARG}</string>\n\
+\t</array>\n\
+\t<key>RunAtLoad</key>\n\
+\t<true/>\n\
+</dict>\n\
+</plist>\n",
+            escape(exec)
+        )
+    }
+
+    /// The executable a plist launches: the first `<string>` after `ProgramArguments`.
+    fn plist_exec(text: &str) -> Option<String> {
+        let rest = &text[text.find("<key>ProgramArguments</key>")?..];
+        let start = rest.find("<string>")? + "<string>".len();
+        let end = start + rest[start..].find("</string>")?;
+        Some(unescape(&rest[start..end]))
+    }
+
+    fn write_entry(path: &Path, exec: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        std::fs::write(path, plist(exec))
+            .with_context(|| format!("could not write {}", path.display()))
+    }
+
+    fn remove_entry(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("could not remove {}", path.display())),
+        }
+    }
+
+    /// Write the LaunchAgent. Called when "Start on boot" is turned on.
+    pub fn enable() -> Result<()> {
+        let Some(exec) = exec_path() else {
+            anyhow::bail!("could not determine this binary's own path");
+        };
+        write_entry(&path()?, &exec)
+    }
+
+    /// Remove the LaunchAgent. Called when "Start on boot" is turned off.
+    pub fn disable() -> Result<()> {
+        remove_entry(&path()?)
+    }
+
+    /// Keep the entry in step with the setting; see the Linux module's `sync`.
+    pub fn sync(enabled: bool) -> Result<()> {
+        let Some(exec) = exec_path() else {
+            return Ok(());
+        };
+        sync_at(&path()?, &exec, enabled)
+    }
+
+    fn sync_at(path: &Path, exec: &str, enabled: bool) -> Result<()> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return if enabled {
+                    write_entry(path, exec)
+                } else {
+                    Ok(())
+                };
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("could not read {}", path.display()));
+            }
+        };
+        let current = plist_exec(&text);
+        let points_here = current.as_deref() == Some(exec);
+        if !enabled {
+            return if points_here {
+                remove_entry(path)
+            } else {
+                Ok(())
+            };
+        }
+        if points_here && text.contains(ARG) {
+            return Ok(());
+        }
+        if !points_here && current.is_some_and(|p| Path::new(&p).exists()) {
+            return Ok(());
+        }
+        write_entry(path, exec)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn plist_round_trips_the_executable() {
+            let exec = "/Applications/Re & Fry <t>.app/Contents/MacOS/refryt";
+            let text = plist(exec);
+            assert!(text.contains(ARG));
+            assert!(text.contains("<key>RunAtLoad</key>"));
+            assert_eq!(plist_exec(&text).as_deref(), Some(exec));
+        }
+
+        #[test]
+        fn sync_creates_heals_and_removes() {
+            let dir = std::env::temp_dir()
+                .join(format!("refryt-autostart-test-mac-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let file = dir.join("a.plist");
+
+            sync_at(&file, "/x/refryt", false).unwrap();
+            assert!(!file.exists());
+
+            sync_at(&file, "/x/refryt", true).unwrap();
+            assert_eq!(
+                plist_exec(&std::fs::read_to_string(&file).unwrap()).as_deref(),
+                Some("/x/refryt")
+            );
+
+            // Another still-existing install's entry is left alone.
+            let other = std::env::current_exe().unwrap();
+            let other = other.to_str().unwrap();
+            write_entry(&file, other).unwrap();
+            sync_at(&file, "/x/refryt", true).unwrap();
+            assert_eq!(
+                plist_exec(&std::fs::read_to_string(&file).unwrap()).as_deref(),
+                Some(other)
+            );
+            sync_at(&file, "/x/refryt", false).unwrap();
+            assert!(file.exists());
+
+            // A stale entry pointing at nothing is healed, then removed by its owner.
+            write_entry(&file, "/gone/refryt").unwrap();
+            sync_at(&file, "/x/refryt", true).unwrap();
+            assert_eq!(
+                plist_exec(&std::fs::read_to_string(&file).unwrap()).as_deref(),
+                Some("/x/refryt")
+            );
+            sync_at(&file, "/x/refryt", false).unwrap();
+            assert!(!file.exists());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::{disable, enable, sync};
+
+#[cfg(target_os = "macos")]
+pub use macos::{disable, enable, sync};
 
 #[cfg(target_os = "windows")]
 pub use windows::{disable, enable, sync};

@@ -18,7 +18,12 @@
 //! backdrop would have nothing to show through — and the DWM material that used to be applied
 //! read as flat white rather than as blur.
 //!
-//! Silent by design. GNOME before 51, wlroots, X11, Windows, macOS: all take the same
+//! macOS asks the window server directly (`CGSSetWindowBackgroundBlurRadius`), see [`macos`].
+//! The blur follows the window's shape, which is why the macOS window is a native one that the
+//! system rounds (`main.rs`) rather than a borderless rectangle: with a borderless window the
+//! blur would show as a square behind the app's rounded corners.
+//!
+//! Silent by design. GNOME before 51, wlroots, X11, Windows: all take the same
 //! unavailable path — the window stays merely translucent, and Settings explains that rather
 //! than offering a switch that would do nothing (on Windows, where the shell is opaque, the
 //! switch does not exist at all).
@@ -63,13 +68,94 @@ pub fn rounded_region(w: u32, h: u32, radius: u32) -> Vec<(i32, i32, i32, i32)> 
 #[cfg(target_os = "linux")]
 pub use wayland::Blur;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub use macos::Blur;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use stub::Blur;
 
-/// Everywhere that is not Linux — Windows included, where the transparency feature itself is
-/// absent rather than merely blurless — plus macOS today and whatever else this ever compiles
-/// for: the same shape, doing nothing.
-#[cfg(not(target_os = "linux"))]
+/// macOS: the window server's own background blur, `CGSSetWindowBackgroundBlurRadius` — what
+/// Terminal, iTerm2, WezTerm and Alacritty use for a blurred translucent window. It blurs
+/// whatever is behind the window wherever the window is not opaque, so it needs nothing from how
+/// the window is drawn.
+///
+/// It is a private (but long-stable) CoreGraphics call. A native `NSVisualEffectView` placed
+/// behind the app's own view was tried first and never drew anything under the Metal layer.
+#[cfg(target_os = "macos")]
+mod macos {
+    use objc2::rc::Retained;
+    use objc2_app_kit::NSView;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    /// How strongly to blur. Matches what terminals use for a frosted look.
+    const RADIUS: i32 = 30;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSMainConnectionID() -> u32;
+        fn CGSSetWindowBackgroundBlurRadius(connection: u32, window: u32, radius: i32) -> i32;
+    }
+
+    #[derive(Default)]
+    pub struct Blur {
+        content: Option<Retained<NSView>>,
+        applied: Option<bool>,
+    }
+
+    impl Blur {
+        pub fn new(handles: &(impl HasWindowHandle + raw_window_handle::HasDisplayHandle)) -> Self {
+            let content = handles.window_handle().ok().and_then(|h| match h.as_raw() {
+                // SAFETY: eframe hands out the window's live content `NSView`, on the main
+                // thread, while the window exists.
+                RawWindowHandle::AppKit(handle) => unsafe {
+                    Retained::retain(handle.ns_view.as_ptr().cast::<NSView>())
+                },
+                _ => None,
+            });
+            Self {
+                content,
+                applied: None,
+            }
+        }
+
+        pub fn available(&self) -> bool {
+            self.content.is_some()
+        }
+
+        /// Cheap to call every frame: the window server is only asked when `on` changed. The
+        /// size and corner radius are ignored, because the blur follows the window's own shape.
+        pub fn set(&mut self, on: bool, _size: (u32, u32), _radius: u32) {
+            if self.applied == Some(on) {
+                return;
+            }
+            let Some(window) = self.content.as_ref().and_then(|c| c.window()) else {
+                return;
+            };
+            let number = window.windowNumber();
+            if number <= 0 {
+                return;
+            }
+            // SAFETY: plain calls into CoreGraphics with this process's own connection and one
+            // of its window numbers; a failure just means no blur.
+            let status = unsafe {
+                CGSSetWindowBackgroundBlurRadius(
+                    CGSMainConnectionID(),
+                    number as u32,
+                    if on { RADIUS } else { 0 },
+                )
+            };
+            if status != 0 {
+                tracing::warn!(status, "could not set the window's background blur");
+            }
+            self.applied = Some(on);
+        }
+    }
+}
+
+/// Everywhere that is not Linux or macOS — Windows included, where the transparency feature
+/// itself is absent rather than merely blurless — and whatever else this ever compiles for: the
+/// same shape, doing nothing.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod stub {
     #[derive(Default)]
     pub struct Blur;
@@ -375,8 +461,8 @@ mod tests {
         }
     }
 
-    /// A square window is one rectangle — the maximised and `--decorated` cases, where paying
-    /// for a staircase would be silly.
+    /// A square window is one rectangle — the maximised and `--decorated` cases, where a staircase
+    /// of rectangles would add cost for no visible gain.
     #[test]
     fn no_radius_is_a_single_rect() {
         assert_eq!(rounded_region(800, 600, 0), vec![(0, 0, 800, 600)]);

@@ -15,6 +15,12 @@
 //! over a channel into the GTK thread, so the thread and its `TrayIcon` live for the rest of
 //! the run regardless of how many times the setting changes.
 //!
+//! macOS adds one constraint of its own. While the window is hidden, winit stops delivering
+//! frames to it, and that includes the repaint requests that normally wake the UI. A click on
+//! "Show" would therefore sit in the queue and never be handled. [`inject`] avoids this by
+//! ordering the window back on screen through AppKit first (`bring_window_forward`), without
+//! waiting for a frame; the next frame then reads the queued action as usual.
+//!
 //! `TrayIconEvent`/`MenuEvent` arrive on whichever thread the crate's backend runs on — the GTK
 //! thread on Linux, the icon's own message pump on Windows — never the render thread, and the
 //! crate's own channels do not wake winit. So [`spawn`] installs the crate's process-wide event
@@ -55,10 +61,47 @@ static ACTIONS: Mutex<VecDeque<TrayAction>> = Mutex::new(VecDeque::new());
 /// `pub(crate)` for the `--tray-test` diagnostic, which has to reach the same queue a real
 /// click does — there is no way to click a tray icon from outside the process.
 pub(crate) fn inject(ctx: &egui::Context, action: TrayAction) {
+    // A hidden or minimized window gets no frames on macOS — not even the heartbeat's — so the
+    // frame that would act on this action never comes. Put the window back first; the next
+    // frame then runs `App::poll_tray` as usual.
+    #[cfg(target_os = "macos")]
+    bring_window_forward();
     if let Ok(mut queue) = ACTIONS.lock() {
         queue.push_back(action);
     }
     ctx.request_repaint();
+}
+
+/// Order the app's main window back on screen and activate the app, without needing a frame.
+///
+/// AppKit objects may only be touched from the main thread, which is where the tray's own event
+/// handlers already run; from any other thread (the `--tray-test` diagnostic) the work is handed
+/// to the main queue. Only normal-level windows are touched: the status item's own window sits
+/// above that level and is not ours to raise.
+#[cfg(target_os = "macos")]
+fn bring_window_forward() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+
+    fn raise(mtm: MainThreadMarker) {
+        let app = NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+        for window in app.windows() {
+            if window.level() == 0 {
+                window.makeKeyAndOrderFront(None);
+            }
+        }
+    }
+
+    match MainThreadMarker::new() {
+        Some(mtm) => raise(mtm),
+        None => dispatch2::DispatchQueue::main().exec_async(|| {
+            if let Some(mtm) = MainThreadMarker::new() {
+                raise(mtm);
+            }
+        }),
+    }
 }
 
 /// Install the process-wide handlers that turn the crate's events into [`TrayAction`]s.

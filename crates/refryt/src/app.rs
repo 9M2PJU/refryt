@@ -274,7 +274,7 @@ enum Load {
     Library,
     /// A Home shelf's full list, behind its "Show all".
     HomeShelf,
-    /// The radio topping the queue up. Nobody asked for it this moment.
+    /// The radio topping the queue up. The app starts this itself rather than the listener.
     Radio,
     /// The sidebar's playlists refreshing in the background.
     SidebarPlaylists,
@@ -1142,8 +1142,8 @@ pub(crate) fn request_foreground(ctx: &egui::Context) {
 /// The command that actually hides or shows the window, on whichever platform this is.
 ///
 /// `ViewportCommand::Visible` is a *documented no-op on Wayland* — winit's own Wayland backend
-/// says so outright ("Not possible on Wayland") — which is why "Hide tray on close" looked
-/// like a dead button there: the veto fired, `Visible(false)` was sent, and Wayland silently
+/// says so outright ("Not possible on Wayland") — which is why "Hide tray on close" appeared
+/// to do nothing there: the veto fired, `Visible(false)` was sent, and Wayland silently
 /// ignored it, leaving the window exactly as it was. `Minimized` is the closest real substitute
 /// Wayland's xdg-shell actually offers, but only in the hide direction — winit's own
 /// `set_minimized(false)` is *also* a documented no-op there ("You can't unminimize the window
@@ -1151,6 +1151,10 @@ pub(crate) fn request_foreground(ctx: &egui::Context) {
 /// the window again from the tray is a best-effort request only: the reliable way back is the
 /// user's own taskbar/pager entry for the minimized window, the same as any other Wayland app
 /// behind this exact protocol gap.
+///
+/// macOS uses `Visible(false)` like X11 and Windows. It stops the window receiving frames while
+/// hidden, which is why the tray handlers raise the window through AppKit themselves (see the
+/// `tray` module docs) instead of relying on the next frame.
 fn hide_command(hide: bool) -> egui::ViewportCommand {
     hide_command_for(is_wayland(), hide)
 }
@@ -1176,7 +1180,7 @@ pub struct App {
     pub(crate) decorated: bool,
     startup_timing: bool,
     /// The tray icon, while "Hide tray on close" is on — dropping it removes the icon. `None`
-    /// the rest of the time, so nobody who never touches the setting gets a tray icon at all.
+    /// the rest of the time, so a listener who never changes the setting never gets a tray icon.
     tray: Option<crate::tray::Tray>,
     /// We hid the window ourselves (tray-icon close, or the tray menu's own Show/Hide) rather
     /// than the OS reporting it occluded or minimized — the two are different questions, and
@@ -1550,7 +1554,7 @@ pub struct App {
     pub(crate) scroll_to_top: bool,
     /// Set for one frame after jumping to a track from the Queue panel, so the panel scrolls
     /// back to its own top. Not set by every way `current` can change — skip and autoplay
-    /// should not yank the list around under someone who is just watching it scroll by.
+    /// should not move the list while the listener is watching it scroll.
     pub(crate) queue_scroll_reset: bool,
     /// Set for one frame when the Lyrics panel opens or its song changes, so it starts at the
     /// top rather than wherever the previous song's lyrics happened to be left scrolled to.
@@ -1707,7 +1711,7 @@ impl App {
         } = options;
         theme::install(&cc.egui_ctx);
         // Let the single-instance listener thread wake this UI (`instance`'s own doc comment).
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         crate::instance::attach(&cc.egui_ctx);
         let mut settings = crate::settings::load();
         // The themes folder is written on the very first run, then read — before anything that
@@ -2006,7 +2010,7 @@ impl App {
         // the `--autostart` flag this version's startup request needs — and drop one the setting
         // no longer wants. The Settings toggle writes it directly; this is the once-a-launch
         // check, and it deliberately leaves a working entry that points at another install.
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         if let Err(e) = crate::autostart::sync(app.settings.start_on_boot) {
             tracing::warn!(error = %format!("{e:#}"), "could not update the autostart entry");
         }
@@ -2227,7 +2231,7 @@ impl App {
                 None => {}
             }
         }
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         if self.settings.start_on_boot != before.start_on_boot {
             let result = if self.settings.start_on_boot {
                 crate::autostart::enable()
@@ -2897,10 +2901,10 @@ impl App {
     /// Mark the route now on screen as entered, for the pages that must refresh per visit.
     ///
     /// History is the only one today: it is dated ("Today", "Yesterday"), so a list fetched an
-    /// hour ago is a lie. `ensure_route_loaded`'s per-frame safety net cannot do this by itself —
+    /// hour ago would show the wrong day labels. `ensure_route_loaded`'s per-frame safety net cannot do this by itself —
     /// its `load_*` guards are "already have it" tests — so entry is the one place that knows a
     /// new visit has begun. The shelves on screen are deliberately kept: a revisit refreshes
-    /// underneath the old list rather than flashing the skeleton.
+    /// underneath the old list rather than showing the loading skeleton again.
     fn note_route_entered(&mut self) {
         if matches!(self.current_route(), Route::Home) {
             self.refresh_home_if_stale();
@@ -4669,7 +4673,7 @@ impl App {
                             // frame, before this event ever fires (see its own doc comment), so
                             // a home feed fetched while still `Checking` already came back
                             // personalised; wiping and refetching it here regardless used to
-                            // show a pointless second load on every single launch: the feed
+                            // show an unnecessary second load on every launch: the feed
                             // flashing back to its skeleton and reappearing with, as far as the
                             // user can see, the same content.
                             if !was_checking {
@@ -5180,7 +5184,7 @@ impl App {
         // A brand new queue, so the panel should show its start — matching what the queue
         // panel's own row click already does for the in-queue case. Set here rather than in
         // `play_index_restore` itself, which is also what natural end-of-track auto-advance and
-        // Previous/Next share: neither of those should jerk the scroll position around on every
+        // Previous/Next share: neither of those should reset the scroll position on every
         // track change.
         self.queue_scroll_reset = true;
     }
@@ -5706,7 +5710,7 @@ impl App {
                     self.toast_error("Sign in to like songs");
                     return;
                 }
-                // Optimistic: a thumb that waits for a round trip feels broken. The refusal
+                // Optimistic: a thumb that waits for a round trip feels unresponsive. The refusal
                 // carries the previous state back.
                 let previous = self.like_of(&video_id);
                 self.set_like(&video_id, status);
@@ -6915,7 +6919,7 @@ impl eframe::App for App {
         self.reload_custom_themes(&ctx);
         self.player_state = self.read_player_state();
         // A second plain launch asked the running instance to show itself (see `instance`).
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         if crate::instance::poll() {
             tracing::info!("second launch: showing the window");
             self.show_window(&ctx);
@@ -6942,9 +6946,17 @@ impl eframe::App for App {
         let maximized = Self::is_maximized(&ctx) || self.fs.open;
         // Square on Windows, where the shell is opaque: the outer corner pixels of a rounded
         // rect are never painted, and with transparency off that shows the window's own
-        // backdrop as four light nicks. Linux keeps the rounded shell — and its real
+        // backdrop as small light marks in the four corners. Linux keeps the rounded shell — and its real
         // transparency — exactly as before.
-        let rounded = !self.decorated && !maximized && !cfg!(target_os = "windows");
+        //
+        // macOS never paints its own corners: the window is a native one with a hidden title bar
+        // (see `main`), so the system rounds it, windowed and zoomed alike, and clips the blur
+        // and shadow to that shape. Painting a second, app-drawn radius on top would only
+        // disagree with it.
+        let rounded = !self.decorated
+            && !maximized
+            && !cfg!(target_os = "windows")
+            && !cfg!(target_os = "macos");
         let p = self.palette;
 
         chrome::paint_background(ui, &p, rounded);
@@ -7085,7 +7097,7 @@ impl eframe::App for App {
 
             if self.upnext_open || self.lyrics_open {
                 // The queue is auxiliary, so it yields before the page does: a flat 300 is 40%
-                // of a 750pt window, and the card behind it fell to scraps — every name in the
+                // of a 750pt window, and the card behind it became too narrow to read — every name in the
                 // artist and playlist headers ellipsising while a third of the window sat in an
                 // empty queue. Down to a floor it keeps enough rail to be a queue.
                 //
@@ -7949,8 +7961,8 @@ mod tests {
     }
 
     /// The bug this fixes: `ViewportCommand::Visible` is a documented no-op on Wayland (winit's
-    /// own Wayland backend says so — "Not possible on Wayland"), so "Hide tray on close" looked
-    /// like a dead button there — the veto fired, `Visible(false)` went out, and nothing
+    /// own Wayland backend says so — "Not possible on Wayland"), so "Hide tray on close" appeared
+    /// to do nothing there — the veto fired, `Visible(false)` went out, and nothing
     /// happened. `Minimized` is the real substitute Wayland's xdg-shell offers, but only in the
     /// hide direction (`set_minimized(false)` is *also* a documented no-op there).
     #[test]

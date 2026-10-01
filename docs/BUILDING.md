@@ -33,6 +33,45 @@ This bundles the release binary, every shared library short of glibc (`libmpv` i
 freshly-fetched `yt-dlp`, and the app icon into a single `dist/refryt-<version>-x86_64.AppImage`.
 Needs `python3` with Pillow and `curl`; no root required anywhere.
 
+## macOS: the app bundle
+
+```sh
+brew install rustup just mpv dylibbundler
+just macos             # or: ./scripts/build-macos.sh
+```
+
+`cargo run` works too once Homebrew's libmpv is on the linker path, which `.cargo/config.toml`
+does for Apple Silicon (`/opt/homebrew/lib`). The script builds the release binary, makes an
+icon, copies libmpv and its whole dylib tail into `Contents/Frameworks` (`dylibbundler`), puts a
+standalone `yt-dlp` next to the executable, signs the bundle ad hoc, and writes a zip and a
+DMG. Output is `dist/Refryt.app`, `dist/refryt-<version>-macos-arm64.zip` and
+`dist/refryt-<version>-macos-arm64.dmg`. Nothing outside macOS itself is needed to run it.
+
+Things that are specific to macOS and easy to trip over:
+
+- **The icon.** `assets/icons/app/Refryt.icon` is an Icon Composer document, compiled by `actool`
+  (Xcode 26) into `Assets.car`. macOS only restyles an icon for Dark, Clear and Tinted
+  (monochrome) mode when it is built this way; a plain `.icns` gets a generic treatment. `actool`
+  also writes an `.icns` for older systems, and the script falls back to a `sips` and `iconutil`
+  one if `actool` is not available.
+- **The window.** On macOS the window is a native one with its title bar hidden and the content
+  running under it (`main.rs`), not a borderless rectangle. That lets the system round the
+  corners, clip the shadow and the blur to them, and keep them correct when the window is zoomed.
+  The app paints a square background there. In true fullscreen macOS squares the corners itself.
+- **The renderer.** macOS draws through wgpu (Metal), as Windows does. The OpenGL path ran on
+  Apple's OpenGL-on-Metal layer and held about 126 MB of window buffers, against about 52 MB
+  now, and OpenGL is deprecated on macOS.
+- **Blur.** `blur.rs` calls `CGSSetWindowBackgroundBlurRadius`, a private but long-stable
+  CoreGraphics function that Terminal, iTerm2 and WezTerm also use. It blurs whatever is behind
+  any non-opaque window. A native `NSVisualEffectView` behind the app's own view was tried first
+  and never drew.
+- **Sign-in.** The in-app window is a WKWebView with a Safari user agent and a non-persistent
+  store, so Google's session isn't kept between sign-ins. See the `webview_login` module docs.
+- **The tray.** A hidden window gets no frames on macOS, so `tray.rs` raises the window through
+  AppKit instead of waiting for the UI loop.
+- **Gatekeeper.** The app is ad-hoc signed and not notarized. On another Mac, clear the
+  quarantine flag with `xattr -cr Refryt.app`, or sign and notarize with a Developer ID.
+
 ## Windows: cross-compiled from Linux
 
 `./scripts/build-windows.sh` produces both a portable, no-install zip and a real installer, the

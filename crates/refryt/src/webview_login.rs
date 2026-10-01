@@ -28,6 +28,18 @@
 //! no console window — and it means a crash in the sign-in window cannot take the music down
 //! with it.
 //!
+//! macOS uses the same child-process design with WKWebView. Three details differ from Windows:
+//!
+//! - The page is shown with a Safari user agent. A bare WKWebView sends no `Version/x Safari/x`
+//!   token, and YouTube Music answers that with a "not optimised for your browser" dialog.
+//! - The cookie jar is read whole and filtered by domain (`session_cookie`). wry's
+//!   `cookies_for_url` on macOS only returns cookies whose domain exactly equals the page's host,
+//!   and the session cookies are set on `.youtube.com`, so it never found them and the window
+//!   waited forever.
+//! - The web view uses a non-persistent store, because WKWebView ignores a data directory. Google's
+//!   session therefore does not outlive the window, so a refresh asks for the password again,
+//!   and `forget` has no profile folder to delete.
+//!
 //! Both desktop platforms get it: on Windows it is the only path left (the browser import cannot
 //! read a modern Chromium store), and on Linux it is the one that needs no browser already signed
 //! in and no `yt-dlp` cookie plumbing, since the window owns the session it creates. WebKitGTK
@@ -35,23 +47,25 @@
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use tao::dpi::LogicalSize;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use tao::event::{Event, StartCause, WindowEvent};
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use tao::platform::run_return::EventLoopExtRunReturn;
 #[cfg(target_os = "windows")]
 use tao::platform::windows::EventLoopBuilderExtWindows;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use tao::window::WindowBuilder;
-use wry::{WebContext, WebViewBuilder};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use wry::WebContext;
+use wry::WebViewBuilder;
 
 /// The value stored as the session's `source` so a stale cookie can be refreshed by reopening
 /// this same window — see `Api::refresh_from_source`.
@@ -197,16 +211,24 @@ fn profile_dir() -> Result<PathBuf> {
 /// The window and its whole event loop. Blocks until the session is captured or the window is
 /// closed, and only returns a cookie once `auth::validate_cookie`'s names are all present.
 ///
-/// Windows: tao's loop and wry's WebView2 — see the module doc for why the window cannot share
-/// the app's own loop.
-#[cfg(target_os = "windows")]
+/// Windows and macOS: tao's loop with wry's WebView2 / WKWebView — see the module doc for why
+/// the window cannot share the app's own loop. On macOS the child process owns its main thread,
+/// which AppKit insists the event loop run on.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn run_window() -> Result<String> {
-    let dir = profile_dir()?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+    #[cfg(target_os = "windows")]
+    let dir = {
+        let dir = profile_dir()?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+        dir
+    };
 
     // This process is the one that exists for this window, so the loop may as well own its
     // thread — but tao still wants the opt-in when the loop is not on the process's first.
+    #[allow(unused_mut)]
     let mut builder = EventLoopBuilder::new();
+    #[cfg(target_os = "windows")]
     builder.with_any_thread(true);
     let mut event_loop = builder.build();
     let window = WindowBuilder::new()
@@ -216,15 +238,34 @@ fn run_window() -> Result<String> {
         .build(&event_loop)
         .context("could not create the sign-in window")?;
 
-    let mut context = WebContext::new(Some(dir));
-    let webview = WebViewBuilder::new_with_web_context(&mut context)
+    #[cfg(target_os = "windows")]
+    let webview = {
+        let mut context = WebContext::new(Some(dir));
+        WebViewBuilder::new_with_web_context(&mut context)
+            .with_url(SIGN_IN_URL)
+            .build(&window)
+            .context(
+                "could not open the sign-in window. It needs the Microsoft Edge WebView2 \
+                 runtime, which Windows 10 and 11 ship; if it was removed, install the \
+                 Evergreen runtime from Microsoft and try again",
+            )?
+    };
+    // WKWebView ignores a data directory, so the profile cannot live under the config folder
+    // where `forget` could delete it. A non-persistent store makes signing out forget the Google
+    // session by construction, at the price of typing the password again on a refresh.
+    #[cfg(target_os = "macos")]
+    let webview = WebViewBuilder::new()
+        .with_incognito(true)
+        // A bare WKWebView sends no `Version/x Safari/x` token, and YouTube Music answers that
+        // with its "not optimised for your browser" dialog over the page. Say Safari, as
+        // Safari does (the macOS token is frozen at 10_15_7 on purpose).
+        .with_user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+             (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+        )
         .with_url(SIGN_IN_URL)
         .build(&window)
-        .context(
-            "could not open the sign-in window. It needs the Microsoft Edge WebView2 runtime, \
-             which Windows 10 and 11 ship; if it was removed, install the Evergreen runtime \
-             from Microsoft and try again",
-        )?;
+        .context("could not open the sign-in window")?;
 
     let mut outcome: Option<Result<String>> = None;
     let mut deadline = Instant::now() + POLL;
@@ -341,9 +382,23 @@ fn run_window() -> Result<String> {
 /// `auth::validate_cookie` treats as the marker of a real session. Waiting for those names here
 /// keeps a half-finished login from being handed to `install_cookie` as if it were one.
 fn session_cookie(webview: &wry::WebView) -> Result<Option<String>> {
+    #[cfg(not(target_os = "macos"))]
     let cookies = webview
         .cookies_for_url("https://music.youtube.com")
         .context("could not read the sign-in window's cookies")?;
+    // wry's WKWebView `cookies_for_url` keeps only cookies whose domain *equals* the URL's host,
+    // and the session cookies live on `.youtube.com`, so it would never return one. Read the
+    // whole jar and keep what a request to music.youtube.com would send.
+    #[cfg(target_os = "macos")]
+    let cookies: Vec<_> = webview
+        .cookies()
+        .context("could not read the sign-in window's cookies")?
+        .into_iter()
+        .filter(|c| {
+            let domain = c.domain().unwrap_or_default().trim_start_matches('.');
+            domain == "youtube.com" || domain == "music.youtube.com"
+        })
+        .collect();
 
     let named = |name: &str| cookies.iter().any(|c| c.name() == name);
     if !named("SAPISID") || !(named("__Secure-1PSID") || named("__Secure-3PSID")) {

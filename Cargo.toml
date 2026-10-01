@@ -49,7 +49,7 @@ opt-level = 3
 opt-level = 3
 # Fat LTO and no unwinding: nothing in the workspace catches a panic (no `catch_unwind`,
 # `panic::set_hook` or `resume_unwind` anywhere in `crates/`), so the unwind tables and
-# landing pads are pure weight — `.eh_frame` + `.gcc_except_table` alone are ~1.7 MB.
+# landing pads add size and no behaviour — `.eh_frame` + `.gcc_except_table` alone are ~1.7 MB.
 lto = true
 codegen-units = 1
 strip = true

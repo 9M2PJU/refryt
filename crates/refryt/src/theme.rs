@@ -372,10 +372,33 @@ fn system_cjk_fonts() -> Vec<(&'static str, &'static [u8])> {
             ],
         ),
     ];
+    // macOS ships these with the system; PingFang lives in a private framework, so Hiragino Sans
+    // GB stands in for Simplified Chinese.
+    #[cfg(target_os = "macos")]
+    const GROUPS: &[(&str, &[&str])] = &[
+        (
+            "system-cjk-jp",
+            &[
+                "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+                "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
+            ],
+        ),
+        (
+            "system-cjk-kr",
+            &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
+        ),
+        (
+            "system-cjk-sc",
+            &[
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+            ],
+        ),
+    ];
     // Fedora and Arch keep Noto under `opentype/noto`, Debian and KDE under `noto-cjk`; the
     // Regular weight is preferred so titles match the UI's own voice, and the DemiLight
     // commonly-installed variant fills in where it does not exist.
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     const GROUPS: &[(&str, &[&str])] = &[(
         "system-cjk",
         &[
@@ -418,7 +441,7 @@ pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
     crate::icons::register(ctx);
     egui_extras::install_image_loaders(ctx);
-    // egui's native default is 40px per wheel line, which makes long lists feel sticky. It is
+    // egui's native default is 40px per wheel line, which makes long lists scroll slowly. It is
     // a constant — set it once here, not on every frame.
     ctx.options_mut(|o| o.input_options.line_scroll_speed = 120.0);
 }

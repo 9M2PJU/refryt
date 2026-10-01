@@ -69,7 +69,11 @@ impl Player {
         // prints "Non-C locale detected" to stderr, and playback can never start. The tray comes
         // up during startup, before any play, so this is the `setlocale(LC_NUMERIC, "C")` mpv
         // asks its embedders for, put back before the context is created.
-        #[cfg(target_os = "linux")]
+        //
+        // macOS makes the same call. mpv has the same requirement there, and the call is harmless
+        // when the locale is already "C", so it is made unconditionally rather than depending on
+        // which framework last touched the locale.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         restore_c_locale();
         Mpv::with_initializer(|init| {
             // Audio only: never spend bandwidth or decode time on video.
@@ -191,11 +195,15 @@ impl Player {
 
 /// Put `LC_NUMERIC` back to "C" — see `Player::init` for why. Declared here rather than through
 /// `libc` so this stays a single, dependency-free call.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn restore_c_locale() {
     use std::os::raw::{c_char, c_int};
     // glibc and musl number the locale categories identically; `LC_NUMERIC` is 1 in both.
+    // Darwin's libc orders them differently: `LC_NUMERIC` is 4.
+    #[cfg(target_os = "linux")]
     const LC_NUMERIC: c_int = 1;
+    #[cfg(target_os = "macos")]
+    const LC_NUMERIC: c_int = 4;
     unsafe extern "C" {
         fn setlocale(category: c_int, locale: *const c_char) -> *mut c_char;
     }

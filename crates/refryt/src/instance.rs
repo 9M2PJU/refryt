@@ -13,6 +13,10 @@
 //! (`--page`, `--search`, the test aids) is not a user clicking the app again; those bypass the
 //! claim entirely, which `main` decides, not this module.
 //!
+//! On macOS the lock and socket live in the per-user `$TMPDIR`, since macOS has no
+//! `$XDG_RUNTIME_DIR`. `$TMPDIR` is private to the user and short enough for a socket path, which
+//! has a length limit of about 100 bytes.
+//!
 //! Failure to set any of this up is never fatal: the app then runs without a guard rather than
 //! refusing to start.
 
@@ -24,8 +28,10 @@ pub enum Claim {
     Secondary,
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+/// Linux and macOS share one implementation: both are Unix systems with `flock`-style file locks
+/// and Unix domain sockets. Only where the two files live differs (see `paths`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix {
     use std::collections::hash_map::DefaultHasher;
     use std::fs::{File, TryLockError};
     use std::hash::{Hash, Hasher};
@@ -50,11 +56,16 @@ mod linux {
     /// How many `accept()` errors in a row before the listener stops trying.
     const MAX_ACCEPT_ERRORS: u32 = 5;
 
-    /// The lock and socket paths: `$XDG_RUNTIME_DIR`, with the profile's config directory hashed
-    /// into both names so isolated profiles do not share one.
+    /// The lock and socket paths: `$XDG_RUNTIME_DIR` on Linux, the per-user `$TMPDIR` on macOS
+    /// (which has no runtime dir; `TMPDIR` is private to the user and short enough for a socket
+    /// path). The profile's config directory is hashed into both names so isolated profiles do
+    /// not share one.
     fn paths() -> Option<(PathBuf, PathBuf)> {
         let config = directories::BaseDirs::new()?.config_dir().to_path_buf();
+        #[cfg(target_os = "linux")]
         let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+        #[cfg(target_os = "macos")]
+        let runtime = std::env::temp_dir();
         Some((
             runtime.join(lock_name(&config)),
             runtime.join(socket_name(&config)),
@@ -361,8 +372,8 @@ mod windows {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub use linux::{attach, claim, poll};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use unix::{attach, claim, poll};
 
 #[cfg(target_os = "windows")]
 pub use windows::{attach, claim, poll};

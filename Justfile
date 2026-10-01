@@ -68,6 +68,10 @@ canary-install:
 canary-uninstall:
     ./scripts/canary-install.sh uninstall
 
+# Build dist/Refryt.app and a zip of it: release binary, icns icon, libmpv and its dylibs, yt-dlp.
+macos:
+    ./scripts/build-macos.sh
+
 # Build dist/refryt-<version>-x86_64.AppImage: release binary, the logo as the icon, and every
 # library short of glibc (libmpv and its tail) bundled inside.
 appimage:

@@ -8,9 +8,10 @@
 pub mod api;
 pub mod app;
 pub mod auth;
-/// "Start on boot" — an XDG autostart entry on Linux, the per-user `Run` key on Windows; see the
+/// "Start on boot" — an XDG autostart entry on Linux, a LaunchAgent on macOS, the per-user `Run`
+/// key on Windows; see the
 /// module's own doc comment.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod autostart;
 pub mod backend;
 pub mod blur;
@@ -25,7 +26,7 @@ pub mod images;
 pub mod innertube;
 /// One instance per profile — a second launch shows the running one's window instead of starting
 /// a second player; see the module's own doc comment.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod instance;
 pub mod liked;
 pub mod local;
@@ -41,9 +42,10 @@ pub mod theme;
 pub mod tray;
 pub mod ui;
 pub mod video;
-/// The in-app sign-in window — WebView2 on Windows, WebKitGTK on Linux; see the module's own
+/// The in-app sign-in window — WebView2 on Windows, WebKitGTK on Linux, WKWebView on macOS; see
+/// the module's own
 /// doc comment.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod webview_login;
 pub mod widgets;
 
@@ -65,9 +67,9 @@ pub fn mark_start() {
 /// AppImage on Linux has its stdout and stderr pointed at `/dev/null` by the launcher — so
 /// without a file the one warning that explains a failed playback (the resolver error, yt-dlp's
 /// own stderr) is invisible. Next to the credential and the crash record, in the config
-/// directory. macOS keeps the console: a bundle launched from Finder has its output captured by
-/// the system log, and nothing here has been tested against it.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// directory. macOS needs it for the same reason: a bundle launched from Finder has no terminal
+/// to print to.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn log_path() -> Option<std::path::PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "refryt")?;
     Some(dirs.config_dir().join("refryt.log"))
@@ -77,10 +79,10 @@ fn log_path() -> Option<std::path::PathBuf> {
 ///
 /// Opened per event rather than held: a stale handle after a crash or an external rotation is
 /// worse than the tiny cost, and a file that cannot be opened silences only the file layer.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 struct LogFile(std::path::PathBuf);
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogFile {
     type Writer = Box<dyn std::io::Write + Send + Sync>;
 
@@ -120,7 +122,7 @@ pub fn init_tracing(default: &str) {
     // AppImage (Linux) is diagnosable. Kept to a couple of megabytes: the previous run is
     // dropped rather than the disk growing without bound, and there is nothing in here worth
     // archiving.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     if let Some(path) = log_path() {
         // A first run has no config directory yet — the credential and the settings file make
         // it later — and the writer opens per event, so without this every event would fall
@@ -158,7 +160,8 @@ pub fn elapsed_since_start() -> std::time::Duration {
 /// eframe opens links through its `links` feature, which is part of its default set — and this
 /// build turns the defaults off to keep the dependency tree small, so hyperlinks silently did
 /// nothing. Spawning the platform opener is the same thing that feature does on Linux, costs no
-/// dependency, and matches how the app already shells out to `yt-dlp`.
+/// dependency, and matches how the app already shells out to `yt-dlp`. macOS uses `open`, which
+/// hands the URL to the default browser.
 pub fn open_url(url: &str) {
     // Windows goes through `ShellExecuteW` rather than spawning `cmd /C start`: the shell parses
     // the URL itself, so an `&` or `^` in a watch link cannot be mangled by cmd's own parser,

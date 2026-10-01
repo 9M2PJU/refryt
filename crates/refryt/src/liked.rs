@@ -76,7 +76,7 @@ impl Index {
     /// uses, so a like made on the phone shows up here without waiting for the next full scan.
     ///
     /// The refreshed page is the playlist's newest slice, in served order, so it goes to the
-    /// front: appending would make "Default" order a lie after the first refresh. A refreshed
+    /// front: appending would leave "Default" order wrong after the first refresh. A refreshed
     /// copy replaces the old one; everything the page does not mention keeps its relative order
     /// behind it.
     pub fn merge(&mut self, fresh: Vec<Track>) {

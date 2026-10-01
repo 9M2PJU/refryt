@@ -64,7 +64,7 @@ are there on purpose:
 - **Brand accounts.** If your Google account has more than one channel, the account menu at the
   top lets you browse as whichever one.
 - **Desktop things.** Tray icon, start on boot, media keys, the OS media controls (MPRIS on
-  Linux, SMTC on Windows) and Discord Rich Presence, which is off until you turn it on.
+  Linux, SMTC on Windows, Now Playing on macOS) and Discord Rich Presence, which is off until you turn it on.
 - **Sidebars you can drag.** Both sides resize within sensible limits and remember where you
   left them.
 
@@ -94,12 +94,12 @@ turns up in the list. Headers can also take their colour from the album art, whi
 default.
 
 The window can be see-through with real compositor blur behind it. That only works where the
-compositor offers blur, which today means KDE on Wayland. Windows hides both settings,
+system offers blur, which today means KDE on Wayland and macOS. Windows hides both settings,
 because what shows through there is a washed-out grey, not your desktop.
 
 ## Signing in
 
-Either sign in from the app's own window (Linux and Windows), or let it borrow the session
+Either sign in from the app's own window (Linux, Windows and macOS), or let it borrow the session
 from a browser you're already signed into: Chrome, Firefox, Brave, Vivaldi or Edge. There are
 no cookies to paste and no codes to type on another device.
 
@@ -109,7 +109,7 @@ Signed out works too, as it does on the website. You just don't get a library.
 
 Everything stays on your machine:
 
-- `~/.config/refryt` has settings, themes, the saved session and a cache of your liked songs.
+- `~/.config/refryt` (`~/Library/Application Support/refryt` on macOS) has settings, themes, the saved session and a cache of your liked songs.
   The session is a cookie, stored with owner-only permissions, because it's a password in
   all but name.
 - `~/Music/refryt` has downloads.
@@ -129,7 +129,9 @@ Pre-1.0, and it moves quickly. Worth knowing:
 - **YouTube breaks it now and then.** They don't send notice when something changes. Fixes
   usually land within a few days.
 - **No podcasts.** Episodes aren't supported at all.
-- **No macOS build.** Most of it would carry over, but nobody's done it yet.
+- **macOS is new.** It runs on Apple Silicon. Home, playback, the tray, the in-app sign-in window,
+  transparency and blur have been tried by hand. Media keys, Now Playing and the browser cookie
+  import are untested there, and it hasn't had the use Linux has. There's no Intel build yet.
 
 ## Install
 
@@ -144,6 +146,15 @@ build it:
 
 Uninstalling leaves `~/.config/refryt` and your downloads alone. Delete those yourself if
 you want everything gone.
+
+**macOS.** Build the app bundle yourself (needs Homebrew's `mpv` and `dylibbundler`):
+
+```sh
+./scripts/build-macos.sh    # dist/Refryt.app, plus a zip of it
+```
+
+It's ad-hoc signed, so on another Mac macOS will refuse it until you clear the quarantine flag
+with `xattr -cr Refryt.app`. libmpv and yt-dlp are bundled inside.
 
 **Windows.** There's an installer and a portable zip on the same releases page. Both come out
 of `./scripts/build-windows.sh`, which cross-builds from Linux.

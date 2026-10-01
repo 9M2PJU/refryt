@@ -534,7 +534,7 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response, signed_in: bo
     });
     match choice {
         Some(Choice::LogIn) => {
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             {
                 // Deliberately not `auth = Checking`: that state means "verifying a stored
                 // session at startup", which is what tells `AuthChanged` whether the loaded home
@@ -542,7 +542,7 @@ fn account_menu(app: &mut App, ui: &mut Ui, chip: &egui::Response, signed_in: bo
                 // invalidated. Same reason as the Settings buttons.
                 app.backend.sign_in_from_window();
             }
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             app.navigate(Route::Settings);
         }
         Some(Choice::Profile(id)) => app.navigate(Route::Artist(id)),

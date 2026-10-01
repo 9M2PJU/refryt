@@ -19,7 +19,7 @@ image.workspace = true
 memmap2 = "0.9"
 skrifa = "0.44"
 # No `charset`: YouTube's InnerTube responses are UTF-8 JSON and the code never calls
-# `text_with_charset`, so `encoding_rs` (1.6 MB) + `mime` are dead weight.
+# `text_with_charset`, so `encoding_rs` (1.6 MB) + `mime` would add size for no use.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "cookies", "http2"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -35,8 +35,8 @@ libmpv2.workspace = true
 # OpenGL render params, so the video view drives mpv's `sw` render context directly through these
 # bindings instead: one code path under any egui renderer, at the cost of a copy per frame.
 libmpv2-sys = "=4.0.1"
-# `blur.rs`'s backends (KDE and the do-nothing stub for everything else, Windows included) read
-# the raw window/display handles eframe exposes, so this is unconditional rather than behind any
+# `blur.rs`'s backends (KDE, macOS, and the do-nothing stub for everything else, Windows included)
+# read the raw window/display handles eframe exposes, so this is unconditional rather than behind any
 # one target's `cfg`.
 raw-window-handle = "0.6"
 # The system tray icon (`tray.rs`). Genuinely cross-platform — its own internal `cfg`s pick
@@ -117,6 +117,25 @@ windows-sys = { version = "=0.52.0", features = [
 # `Renderer::default()` picks wgpu automatically the moment both backends are compiled in, so no
 # code change selects it; Linux keeps glow, chosen there for its much smaller dependency tree.
 eframe = { workspace = true, features = ["wgpu"] }
+
+# The in-app sign-in window (`webview_login.rs`) on macOS: WKWebView through wry, with tao's event
+# loop in the child process that exists for the window.
+[target.'cfg(target_os = "macos")'.dependencies]
+wry = "0.57"
+tao = "0.37"
+# `tray.rs` brings the window back through AppKit directly: a hidden or minimized window gets no
+# frames from winit on macOS, so the frame loop cannot be what notices a tray click. Same
+# versions winit already resolves to, so these are edges onto crates already compiled.
+# macOS renders through wgpu (Metal), like Windows: eframe's glow path runs on Apple's
+# OpenGL-on-Metal translation layer, which holds ~126 MB of IOSurface buffers for a transparent
+# Retina window (measured), and OpenGL is deprecated there. `Renderer::default()` picks wgpu as
+# soon as both backends are compiled in.
+eframe = { workspace = true, features = ["wgpu"] }
+objc2 = "0.6"
+dispatch2 = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWindow", "NSView",
+] }
 
 # Embeds refryt.ico as the .exe's own icon resource (build.rs) — unconditional, not under a
 # `cfg(target_os = "windows")` table: build scripts always compile for the *host*, so a

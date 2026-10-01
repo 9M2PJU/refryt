@@ -245,7 +245,7 @@ impl Api {
     /// On Linux it is simply the path that needs no browser already signed in. The window lives
     /// in a child process of this same binary — see `webview_login`'s module doc — so this only
     /// awaits it.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     pub async fn sign_in_from_window(&self) -> Result<String> {
         let cookie = crate::webview_login::capture().await?;
         self.install_cookie(cookie, Some(crate::webview_login::SOURCE))
@@ -348,7 +348,7 @@ impl Api {
         // of asking who is signing in. Both platforms: the window runs on Linux too (WebKitGTK),
         // and gating this on Windows alone is why Log in right after Sign out there signed the
         // same account straight back in.
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         crate::webview_login::forget();
     }
 
@@ -413,7 +413,7 @@ impl Api {
         let refreshed = match source.as_str() {
             // Not a browser `--cookies-from-browser` knows about: reopening the sign-in window
             // finds Google's session still in its profile, so this is normally a plain capture.
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             crate::webview_login::SOURCE => self.sign_in_from_window().await,
             _ => self.sign_in_from_browser(&source).await,
         };
