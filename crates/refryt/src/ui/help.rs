@@ -12,6 +12,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Space", "Play / pause"),
     ("↑ / ↓", "Previous / next track"),
     ("M", "Mute"),
+    ("F", "Fullscreen player"),
+    ("Esc", "Leave fullscreen player"),
     ("⌘/Ctrl + S", "Shuffle"),
     ("⌘/Ctrl + R", "Repeat"),
     ("⌘/Ctrl + K", "Focus search"),

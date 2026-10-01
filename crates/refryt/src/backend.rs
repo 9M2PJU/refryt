@@ -451,8 +451,8 @@ pub enum Event {
 }
 
 impl Event {
-    /// Whether this event is a page's content arriving (or failing to), which is what swaps a
-    /// skeleton out — for the debug-only `REFRYT_HOLD_LOADING`.
+    /// Whether this event is a page's content (or a song's lyrics) arriving or failing to, which
+    /// is what swaps a skeleton out — for the debug-only `REFRYT_HOLD_LOADING`.
     #[cfg(debug_assertions)]
     pub fn is_page_load(&self) -> bool {
         matches!(

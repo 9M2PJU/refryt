@@ -377,15 +377,7 @@ fn artist_link_segments(segs: &[Segment]) -> impl Iterator<Item = &Segment> {
 /// `"Gorillaz & Del The Funky Homosapien"` sometimes arrives as plain text, and a name with no
 /// page is still the right thing to show.
 fn artist_links(segs: &[Segment]) -> Vec<crate::model::ArtistLink> {
-    let linked: Vec<crate::model::ArtistLink> = artist_link_segments(segs)
-        .map(|s| crate::model::ArtistLink {
-            name: s.text.clone(),
-            id: match &s.target {
-                Some(Target::Browse { id, .. }) => Some(id.clone()),
-                _ => None,
-            },
-        })
-        .collect();
+    let linked = linked_artists(segs);
     if !linked.is_empty() {
         return linked;
     }
@@ -393,6 +385,20 @@ fn artist_links(segs: &[Segment]) -> Vec<crate::model::ArtistLink> {
         .find(|s| s.target.is_none() && !s.text.trim().is_empty())
         .map(|s| vec![crate::model::ArtistLink::plain(s.text.clone())])
         .unwrap_or_default()
+}
+
+/// The artists a row links to, and nothing else: unlike [`artist_links`] there is no fallback to
+/// the first plain text, which in a row with no artist column would be the title or a play count.
+fn linked_artists(segs: &[Segment]) -> Vec<crate::model::ArtistLink> {
+    artist_link_segments(segs)
+        .map(|s| crate::model::ArtistLink {
+            name: s.text.clone(),
+            id: match &s.target {
+                Some(Target::Browse { id, .. }) => Some(id.clone()),
+                _ => None,
+            },
+        })
+        .collect()
 }
 
 /// The browse id behind an album segment, so the album name in a row can be a link.
@@ -535,6 +541,7 @@ pub fn track_states(root: &Value) -> std::collections::HashMap<String, TrackStat
                                 .filter(|s| !s.is_empty())
                                 .map(Arc::from),
                             wide,
+                            artists: linked_artists(&row_segments(row)),
                         });
                     }
                     return;
@@ -561,6 +568,9 @@ pub struct TrackState {
     /// album parser has no field for this at all (it reads only the play button's video id), so
     /// this is the only place that ever learns it for an album/single track.
     pub wide: bool,
+    /// The artists the row itself links to. An album's rows carry them only where a track's
+    /// credit differs from the album's (a compilation, a feature); empty otherwise.
+    pub artists: Vec<crate::model::ArtistLink>,
 }
 
 /// Your rating, from the row menu's like button.
@@ -2527,6 +2537,7 @@ fn parse_card(item: &Value) -> Option<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn json(name: &str) -> Value {
         let raw = match name {
@@ -2710,6 +2721,46 @@ mod tests {
             ["UCsoloartist", "vid123"],
             "nothing in the ranked list disagrees about who the top artist is, so the card \
              should lead rather than trail"
+        );
+    }
+
+    /// An album row names its own artists only where they differ from the album's, and each one
+    /// keeps its own id. A row with no artist column must come back with none, not with its
+    /// title or play count standing in for one.
+    #[test]
+    fn an_album_row_keeps_each_of_its_artists_linked() {
+        let artist = |name: &str, id: &str| {
+            json!({"text": name, "navigationEndpoint": {"browseEndpoint": {
+                "browseId": id,
+                "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig":
+                    {"pageType": "MUSIC_PAGE_TYPE_ARTIST"}}}}})
+        };
+        let row = |video: &str, byline: Value| {
+            json!({"musicResponsiveListItemRenderer": {
+            "playlistItemData": {"videoId": video},
+            "flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "A song"}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": byline}}},
+            ]}})
+        };
+        let root = json!([
+            row(
+                "two",
+                json!([artist("Ann", "UC_ann"), {"text": " & "}, artist("Bo", "UC_bo")])
+            ),
+            row("none", json!([{"text": "1.2M plays"}])),
+        ]);
+        let states = track_states(&root);
+        let two = &states["two"].artists;
+        assert_eq!(
+            two.iter()
+                .map(|a| (a.name.as_str(), a.id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("Ann", Some("UC_ann")), ("Bo", Some("UC_bo"))]
+        );
+        assert!(
+            states["none"].artists.is_empty(),
+            "a play count is not an artist"
         );
     }
 

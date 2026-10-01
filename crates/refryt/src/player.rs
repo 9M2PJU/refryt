@@ -204,6 +204,16 @@ fn restore_c_locale() {
     }
 }
 
+/// The correction, in dB, that brings a song to YouTube's loudness target: its figure is how far
+/// above the target it sits, so the gain is the negative of it. Held to −12…+6 dB so a bad figure
+/// can never mute a song or blow one out; zero when the normaliser is off or there is no figure.
+fn gain_db(normalise: bool, loudness_db: Option<f32>) -> f64 {
+    match (normalise, loudness_db) {
+        (true, Some(db)) => (-f64::from(db)).clamp(-12.0, 6.0),
+        _ => 0.0,
+    }
+}
+
 /// Hand a resolved URL to mpv and start playing it.
 ///
 /// Separate from `Player` so it can be called from a background task that owns only a handle.
@@ -215,13 +225,17 @@ pub fn load(
     normalise: bool,
     start_at: Option<f64>,
 ) -> Result<()> {
-    // Apply YouTube's own loudness measurement so tracks don't jump in level. mpv's `volume`
-    // is a percentage, so the correction is folded into it rather than set as a filter.
-    let gain = match (normalise, loudness_db) {
-        (true, Some(db)) => 10f64.powf(-f64::from(db) / 20.0).clamp(0.25, 2.0),
-        _ => 1.0,
-    };
-    let _ = mpv.set_property("volume", (volume * gain).clamp(0.0, 130.0));
+    // Apply YouTube's own loudness measurement so tracks don't jump in level. It rides mpv's
+    // `volume-gain` (dB, on top of `volume`), so the slider, mute and media keys can set `volume`
+    // later without dropping this song's correction.
+    let gain = gain_db(normalise, loudness_db);
+    if mpv.set_property("volume-gain", gain).is_ok() {
+        let _ = mpv.set_property("volume", volume.clamp(0.0, 130.0));
+    } else {
+        // An mpv too old to have `volume-gain`: fold the correction into the percentage instead.
+        let folded = volume * 10f64.powf(gain / 20.0);
+        let _ = mpv.set_property("volume", folded.clamp(0.0, 130.0));
+    }
     let _ = mpv.set_property("pause", false);
     // Audio-only again, in case the video view just handed playback back. `vo` stays `libmpv`
     // from the video path, but with `vid=no` there is no video for it to initialise.
@@ -263,6 +277,8 @@ pub fn load_video(
     let _ = mpv.set_property("vo", "libmpv");
     let _ = mpv.set_property("vid", "auto");
     let _ = mpv.set_property("audio-display", "no");
+    // A video carries no loudness figure, and the song before it may have set a gain.
+    let _ = mpv.set_property("volume-gain", 0.0);
     let _ = mpv.set_property("volume", volume.clamp(0.0, 130.0));
     let _ = mpv.set_property("pause", false);
     // Decode on the GPU when the platform can, copying frames back into the software surface;
@@ -317,21 +333,30 @@ pub struct NowPlaying {
 
 #[cfg(test)]
 mod tests {
+    use super::gain_db;
+
     /// Loudness normalisation must never mute a track or blow one out, whatever YouTube reports.
     #[test]
     fn loudness_gain_stays_within_sane_bounds() {
         for db in [-40.0f32, -12.0, -3.0, 0.0, 6.0, 40.0] {
-            let gain = 10f64.powf(-f64::from(db) / 20.0).clamp(0.25, 2.0);
-            assert!((0.25..=2.0).contains(&gain), "db {db} produced gain {gain}");
+            let gain = gain_db(true, Some(db));
+            assert!(
+                (-12.0..=6.0).contains(&gain),
+                "db {db} produced gain {gain}"
+            );
         }
     }
 
     #[test]
     fn a_quiet_track_is_boosted_and_a_loud_one_cut() {
-        let quiet = 10f64.powf(6.0 / 20.0).clamp(0.25, 2.0); // loudness_db = -6
-        let loud = 10f64.powf(-6.0 / 20.0).clamp(0.25, 2.0); // loudness_db = +6
-        assert!(quiet > 1.0);
-        assert!(loud < 1.0);
+        assert!(gain_db(true, Some(-6.0)) > 0.0);
+        assert!(gain_db(true, Some(6.0)) < 0.0);
+    }
+
+    #[test]
+    fn no_gain_without_the_setting_or_a_figure() {
+        assert_eq!(gain_db(false, Some(6.0)), 0.0);
+        assert_eq!(gain_db(true, None), 0.0);
     }
 
     /// The tray's GTK init calls `setlocale(LC_ALL, "")` in-process, which is exactly how

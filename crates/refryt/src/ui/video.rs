@@ -14,12 +14,34 @@ const MAX_PX: f32 = 1280.0;
 
 pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     let rect = ui.available_rect_before_wrap();
-    ui.painter().rect_filled(
-        rect,
-        egui::CornerRadius::same(theme::PANEL_RADIUS),
-        egui::Color32::BLACK,
-    );
+    let radius = egui::CornerRadius::same(theme::PANEL_RADIUS);
+    ui.painter().rect_filled(rect, radius, egui::Color32::BLACK);
+    paint_frame(app, ui, rect, radius);
 
+    // The surface is a transport control, like the player bar's play button: click to pause,
+    // double-click for fullscreen, Escape back out of it.
+    let response = ui.interact(rect, ui.id().with("video-surface"), egui::Sense::click());
+    let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+    if response.double_clicked() {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+    } else if response.clicked() {
+        app.toggle_playback();
+    } else if fullscreen && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    }
+}
+
+/// The video frame (or the track's still while it loads) fitted inside `rect`, rounded to
+/// `radius` where it reaches the corners, with the loading caption. Paints no backdrop: the
+/// caller owns what is behind it.
+pub(crate) fn paint_frame(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    radius: egui::CornerRadius,
+) {
     // The track's wide still: the placeholder while the video resolves, and the backdrop if no
     // frame ever arrives. Cloned out of the cache so the surface below can borrow `app`.
     let url = app.now.track.as_ref().and_then(|t| t.thumbnail.clone());
@@ -62,30 +84,12 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
             .fit_to_exact_size(fitted.size())
             // The card is already rounded; the video only rounds where it reaches the card's
             // corners. Letterboxed, with black above and below, its own corners are square.
-            .corner_radius(crate::widgets::inner_radius(
-                egui::CornerRadius::same(theme::PANEL_RADIUS),
-                rect,
-                fitted,
-            ))
+            .corner_radius(crate::widgets::inner_radius(radius, rect, fitted))
             .paint_at(ui, fitted);
     }
 
     if app.now.resolving {
         loading_caption(app, ui, rect);
-    }
-
-    // The surface is a transport control, like the player bar's play button: click to pause,
-    // double-click for fullscreen, Escape back out of it.
-    let response = ui.interact(rect, ui.id().with("video-surface"), egui::Sense::click());
-    let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
-    if response.double_clicked() {
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
-    } else if response.clicked() {
-        app.toggle_playback();
-    } else if fullscreen && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
     }
 }
 

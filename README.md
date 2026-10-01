@@ -61,8 +61,8 @@ are there on purpose:
   downloads. When the connection comes back, the page reloads by itself.
 - **Playback.** mpv underneath, with an audio quality setting, volume normalisation from
   YouTube's own loudness figures, and autoplay that keeps going when your queue runs out.
-- **Brand accounts.** If your Google account has more than one channel, Settings lets you
-  browse as whichever one.
+- **Brand accounts.** If your Google account has more than one channel, the account menu at the
+  top lets you browse as whichever one.
 - **Desktop things.** Tray icon, start on boot, media keys, the OS media controls (MPRIS on
   Linux, SMTC on Windows) and Discord Rich Presence, which is off until you turn it on.
 - **Sidebars you can drag.** Both sides resize within sensible limits and remember where you

@@ -55,6 +55,7 @@ fn main() -> eframe::Result {
     let autoscroll = autoscroll_max.is_some() || args.iter().any(|a| a == "--autoscroll");
     let queue = args.iter().any(|a| a == "--queue");
     let lyrics = args.iter().any(|a| a == "--lyrics");
+    let now_playing = args.iter().any(|a| a == "--now-playing");
 
     // Open at a given desktop coordinate, without taking focus. For testing on a second screen
     // while someone is working on the first.
@@ -221,6 +222,7 @@ fn main() -> eframe::Result {
                         autoscroll_max,
                         queue,
                         lyrics,
+                        now_playing,
                         scheme,
                         opacity,
                         no_blur,

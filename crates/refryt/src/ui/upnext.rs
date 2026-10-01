@@ -28,7 +28,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         area = area.vertical_scroll_offset(0.0);
         app.queue_scroll_reset = false;
     }
-    area.show(ui, |ui| {
+    let out = area.show(ui, |ui| {
         // The list runs to the card's top edge now; this is the header's own breathing room,
         // and it scrolls away with it — the same distance the content has from the sides.
         ui.add_space(8.0);
@@ -128,9 +128,20 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
             app.queue_scroll_reset = true;
         }
     });
+    // Where the list is scrolled to, for the fullscreen view's edge fades: they only belong where
+    // there is more to scroll to.
+    app.fs.queue_scroll = (
+        out.state.offset.y,
+        out.content_size.y,
+        out.inner_rect.height(),
+    );
     // The card's rounded corners, over everything the queue drew: the list runs to the card's
     // top and bottom edges now.
-    widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, &app.palette);
+    // Not in the fullscreen drawer: it is a card on a tinted background, held in from its own
+    // rounded ends, and the gutter colour would show as a notch at each corner.
+    if !app.fs.open {
+        widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, &app.palette);
+    }
 }
 
 /// A small caps-ish section label, as the reference uses above each block. `gap` is the space

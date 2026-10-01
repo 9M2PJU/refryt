@@ -766,6 +766,9 @@ pub struct Options {
     pub queue: bool,
     /// Open the lyrics panel at startup, the same kind of test aid as `queue`.
     pub lyrics: bool,
+    /// Open the fullscreen now-playing view at startup (without changing the window), the same
+    /// kind of test aid. With `lyrics`, it opens with the lyrics showing.
+    pub now_playing: bool,
     /// Override the saved theme for this run, by name as typed (`catppuccin-frappe`), without
     /// touching `settings.json`. Also forces that theme's own mode. A test aid, for
     /// screenshotting the whole matrix without clicking through Settings.
@@ -1445,6 +1448,8 @@ pub struct App {
     pub(crate) upnext_open: bool,
     /// The lyrics panel is open. Mutually exclusive with the queue: they share the right panel.
     pub(crate) lyrics_open: bool,
+    /// The fullscreen now-playing view: whether it is open, and what it remembers.
+    pub(crate) fs: ui::fullscreen::State,
     /// The loaded lyrics for [`Self::lyrics_for`], if any.
     pub(crate) lyrics: Option<crate::model::Lyrics>,
     pub(crate) lyrics_loading: bool,
@@ -1560,6 +1565,10 @@ pub struct App {
     /// The keyboard-shortcut cheatsheet is open. Opened by `?`/F1 and the account menu, closed by
     /// the modal itself.
     pub(crate) help_open: bool,
+    /// The open tab of the Settings page. Kept for the session, not saved.
+    pub(crate) settings_tab: ui::settings::SettingsTab,
+    /// The "Order of homepage" window is open.
+    pub(crate) home_order_open: bool,
     /// A crash the previous run left behind, offered once on this launch and then cleared.
     pub(crate) crash_report: Option<crate::crash::Crash>,
     /// What is downloaded to `~/Music/refryt`, indexed by video id. Pushed into the backend so a
@@ -1688,6 +1697,7 @@ impl App {
             autoscroll_max,
             queue,
             lyrics,
+            now_playing,
             scheme,
             opacity,
             no_blur,
@@ -1892,6 +1902,11 @@ impl App {
             radio_loading: false,
             upnext_open: queue,
             lyrics_open: lyrics,
+            fs: if now_playing {
+                ui::fullscreen::State::opened(lyrics || settings.fullscreen_lyrics)
+            } else {
+                ui::fullscreen::State::default()
+            },
             lyrics: None,
             lyrics_loading: false,
             lyrics_error: None,
@@ -1945,6 +1960,8 @@ impl App {
             lyrics_active: None,
             page_info: None,
             help_open: false,
+            settings_tab: ui::settings::SettingsTab::default(),
+            home_order_open: false,
             crash_report: crate::crash::last(),
             downloads: crate::downloads::Index::default(),
             downloaded_ids: Default::default(),
@@ -2041,6 +2058,22 @@ impl App {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::M)) {
             self.toggle_mute();
+        }
+        // The fullscreen view: F opens and closes it, Escape closes the queue drawer and then
+        // the view.
+        if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(egui::Key::F)) {
+            if self.fs.open {
+                self.fs_exit(ctx);
+            } else {
+                self.fs_enter(ctx);
+            }
+        }
+        if self.fs.open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.fs.queue {
+                self.fs.queue = false;
+            } else {
+                self.fs_exit(ctx);
+            }
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.toggle_shuffle();
@@ -2167,6 +2200,16 @@ impl App {
         if self.settings.quality != before.quality {
             self.backend
                 .set_audio_quality(self.settings.quality.format());
+        }
+        // A new order re-arranges the feed already loaded. Settings is not Home, so nothing is
+        // being read while it moves, and late pages fold into their proper places too.
+        if self.settings.home_order != before.home_order
+            && self.home_filter.is_none()
+            && let Some(home) = &mut self.home
+        {
+            let order = crate::model::normalise_order(&self.settings.home_order);
+            let shelves: &mut Vec<crate::model::Shelf> = Arc::make_mut(home);
+            crate::model::order_home(shelves, &order);
         }
         if self.settings.account_page_id != before.account_page_id {
             self.backend
@@ -2658,8 +2701,13 @@ impl App {
         self.backend.set_downloads(map);
     }
 
+    /// Whether downloads are on offer: the account holds Premium.
+    pub(crate) fn can_download(&self) -> bool {
+        self.premium
+    }
+
     fn start_download(&mut self, track: Track) {
-        if !self.premium {
+        if !self.can_download() {
             self.toast_error("Downloads need YouTube Premium");
             return;
         }
@@ -2677,7 +2725,7 @@ impl App {
     }
 
     fn start_download_many(&mut self, tracks: Vec<Track>) {
-        if !self.premium {
+        if !self.can_download() {
             self.toast_error("Downloads need YouTube Premium");
             return;
         }
@@ -4476,6 +4524,12 @@ impl App {
                     if self.home_filter == filter && epoch == self.account_epoch {
                         self.home_loading = false;
                         self.home_refreshing = false;
+                        let mut shelves = shelves;
+                        tracing::debug!(
+                            shelves = ?shelves.iter().map(|s| (s.strapline.as_deref(), s.title.as_str())).collect::<Vec<_>>(),
+                            "home: first page"
+                        );
+                        self.order_home_shelves(&mut shelves);
                         self.home = Some(Arc::new(shelves));
                         self.home_chips = chips;
                         self.home_next = next;
@@ -4513,6 +4567,14 @@ impl App {
                             "home: next page landed"
                         );
                         self.home_next = next;
+                        // Arranged among themselves and appended: what is already loaded may be
+                        // on screen, and must not move.
+                        let mut shelves = shelves;
+                        tracing::debug!(
+                            shelves = ?shelves.iter().map(|s| (s.strapline.as_deref(), s.title.as_str())).collect::<Vec<_>>(),
+                            "home: later page"
+                        );
+                        self.order_home_shelves(&mut shelves);
                         if let Some(home) = &mut self.home {
                             Arc::make_mut(home).extend(shelves);
                         }
@@ -4576,6 +4638,8 @@ impl App {
 
                 Event::SignInFailed { error } => {
                     self.sign_in_error = Some(error);
+                    // The reason is shown on the Account tab, so that is where Settings opens.
+                    self.settings_tab = ui::settings::SettingsTab::Account;
                 }
 
                 Event::AuthChanged(state) => {
@@ -4698,7 +4762,7 @@ impl App {
                     self.prefetch_next();
                     // Lyrics follow the track while the panel is open; a song change starts a
                     // fresh request, and the guard drops it if the track changes again.
-                    if self.lyrics_open
+                    if self.lyrics_wanted()
                         && self.lyrics_for.as_deref() != Some(video_id.as_str())
                         && let Some(track) = self.now.track.clone()
                     {
@@ -5436,6 +5500,60 @@ impl App {
         }
     }
 
+    /// Whether anything on screen shows lyrics: the side panel, or the fullscreen view's column.
+    fn lyrics_wanted(&self) -> bool {
+        self.lyrics_open || (self.fs.open && self.fs.lyrics)
+    }
+
+    /// Whether the current song is known to have no lyrics: the request for it has finished and
+    /// found none. See [`ui::fullscreen::lyrics_missing`].
+    pub(crate) fn lyrics_missing(&self) -> bool {
+        let current = self.now.track.as_ref().map(|t| t.video_id.as_str());
+        ui::fullscreen::lyrics_missing(
+            current.is_some() && self.lyrics_for.as_deref() == current,
+            self.lyrics_loading,
+            self.lyrics.as_ref().map(|l| l.lines.len()),
+        )
+    }
+
+    /// Arrange shelves by the listener's Home order — for the default feed only: with a mood chip
+    /// selected the shelves are that mood's own and keep the order they came in.
+    fn order_home_shelves(&self, shelves: &mut [crate::model::Shelf]) {
+        if self.home_filter.is_none() {
+            crate::model::order_home(
+                shelves,
+                &crate::model::normalise_order(&self.settings.home_order),
+            );
+        }
+    }
+
+    /// Open the fullscreen now-playing view and take the window fullscreen with it. Does
+    /// nothing with no song loaded: there is nothing to show.
+    pub(crate) fn fs_enter(&mut self, ctx: &egui::Context) {
+        if self.now.track.is_none() || self.fs.open {
+            return;
+        }
+        let was_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        tracing::debug!(was_fullscreen, "fullscreen view: entering");
+        self.fs = ui::fullscreen::State::entering(self.settings.fullscreen_lyrics, was_fullscreen);
+        if !self.fs.window_was_fullscreen {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
+    }
+
+    /// Close the fullscreen view, and leave window fullscreen unless something else had it on
+    /// first (the video view's own).
+    pub(crate) fn fs_exit(&mut self, ctx: &egui::Context) {
+        if !self.fs.open {
+            return;
+        }
+        if self.fs.manages_window && !self.fs.window_was_fullscreen {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        self.fs.open = false;
+        self.fs.queue = false;
+    }
+
     /// Open or close the lyrics panel. Independent of the queue, which shares the same panel.
     pub(crate) fn toggle_lyrics(&mut self) {
         self.lyrics_open = !self.lyrics_open;
@@ -5452,7 +5570,7 @@ impl App {
     /// song" over a song sitting right there in the bar. Once per track: `lyrics_for` is set
     /// by the request, so a failed fetch is not retried every frame.
     fn sync_lyrics(&mut self) {
-        if self.lyrics_open
+        if self.lyrics_wanted()
             && !self.lyrics_loading
             && let Some(track) = self.now.track.as_ref()
             && self.lyrics_for.as_deref() != Some(track.video_id.as_str())
@@ -6687,47 +6805,94 @@ impl eframe::App for App {
 
     /// A test aid for debug builds: `REFRYT_CLICK="x,y,button@secs;…"` clicks at those window
     /// points once each time comes, `button` being `primary` or `secondary` — how a screenshot
-    /// run opens a right-click menu, which nothing outside the app can do on Wayland.
+    /// run opens a right-click menu, which nothing outside the app can do on Wayland. A `button`
+    /// of `scroll:<dy>` scrolls the wheel by that many points there instead (negative is down),
+    /// and `drag:<x2>:<y2>` presses at the point, moves to the second one and releases there,
+    /// spread over a few frames the way a real drag is.
     #[cfg(debug_assertions)]
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         use std::sync::Mutex;
-        /// A click still to come: where, which button, and when (seconds since start).
-        type Click = (f32, f32, egui::PointerButton, f64);
-        static CLICKS: Mutex<Option<Vec<Click>>> = Mutex::new(None);
-        let Ok(mut clicks) = CLICKS.lock() else {
+        /// What one scripted input does.
+        #[derive(Clone, Copy)]
+        enum Act {
+            Click,
+            Scroll(f32),
+            Press,
+            Move,
+            Release,
+        }
+        /// An input still to come: where, which button, what, and when (seconds since start).
+        type Step = (f32, f32, egui::PointerButton, Act, f64);
+        static STEPS: Mutex<Option<Vec<Step>>> = Mutex::new(None);
+        let Ok(mut steps) = STEPS.lock() else {
             return;
         };
-        let clicks = clicks.get_or_insert_with(|| {
-            std::env::var("REFRYT_CLICK")
-                .unwrap_or_default()
-                .split(';')
-                .filter_map(|spec| {
-                    let (point, secs) = spec.split_once('@')?;
-                    let mut parts = point.split(',');
-                    let x = parts.next()?.trim().parse().ok()?;
-                    let y = parts.next()?.trim().parse().ok()?;
-                    let button = match parts.next().map(str::trim) {
-                        Some("secondary") => egui::PointerButton::Secondary,
-                        _ => egui::PointerButton::Primary,
-                    };
-                    Some((x, y, button, secs.trim().parse().ok()?))
-                })
-                .collect()
+        let steps = steps.get_or_insert_with(|| {
+            let mut out: Vec<Step> = Vec::new();
+            for spec in std::env::var("REFRYT_CLICK").unwrap_or_default().split(';') {
+                let Some((point, secs)) = spec.split_once('@') else {
+                    continue;
+                };
+                let mut parts = point.split(',');
+                let (Some(x), Some(y), Some(at)) = (
+                    parts.next().and_then(|v| v.trim().parse::<f32>().ok()),
+                    parts.next().and_then(|v| v.trim().parse::<f32>().ok()),
+                    secs.trim().parse::<f64>().ok(),
+                ) else {
+                    continue;
+                };
+                let kind = parts.next().map(str::trim);
+                let primary = egui::PointerButton::Primary;
+                if let Some(to) = kind.and_then(|k| k.strip_prefix("drag:")) {
+                    if let Some((x2, y2)) = to
+                        .split_once(':')
+                        .and_then(|(a, b)| Some((a.parse::<f32>().ok()?, b.parse::<f32>().ok()?)))
+                    {
+                        out.push((x, y, primary, Act::Press, at));
+                        out.push((x2, y2, primary, Act::Move, at + 0.25));
+                        out.push((x2, y2, primary, Act::Release, at + 0.5));
+                    }
+                    continue;
+                }
+                let button = match kind {
+                    Some("secondary") => egui::PointerButton::Secondary,
+                    _ => primary,
+                };
+                let act = kind
+                    .and_then(|k| k.strip_prefix("scroll:"))
+                    .and_then(|dy| dy.parse().ok())
+                    .map_or(Act::Click, Act::Scroll);
+                out.push((x, y, button, act, at));
+            }
+            out
         });
         let now = crate::elapsed_since_start().as_secs_f64();
-        let Some(i) = clicks.iter().position(|c| c.3 <= now) else {
+        let Some(i) = steps.iter().position(|c| c.4 <= now) else {
             return;
         };
-        let (x, y, button, _) = clicks.remove(i);
+        let (x, y, button, act, _) = steps.remove(i);
         let pos = egui::pos2(x, y);
         raw_input.events.push(egui::Event::PointerMoved(pos));
-        for pressed in [true, false] {
-            raw_input.events.push(egui::Event::PointerButton {
-                pos,
-                button,
-                pressed,
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        match act {
+            Act::Scroll(dy) => raw_input.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                phase: egui::TouchPhase::Move,
                 modifiers: egui::Modifiers::NONE,
-            });
+            }),
+            Act::Click => {
+                raw_input.events.push(press(true));
+                raw_input.events.push(press(false));
+            }
+            Act::Press => raw_input.events.push(press(true)),
+            Act::Move => {}
+            Act::Release => raw_input.events.push(press(false)),
         }
     }
 
@@ -6772,9 +6937,9 @@ impl eframe::App for App {
         crate::widgets::set_double_click_play(&ctx, self.settings.double_click_to_play);
         self.publish_loading(&ctx);
         crate::widgets::set_downloaded(&ctx, std::sync::Arc::clone(&self.downloaded_ids));
-        crate::widgets::set_premium(&ctx, self.premium);
+        crate::widgets::set_premium(&ctx, self.can_download());
 
-        let maximized = Self::is_maximized(&ctx);
+        let maximized = Self::is_maximized(&ctx) || self.fs.open;
         // Square on Windows, where the shell is opaque: the outer corner pixels of a rounded
         // rect are never painted, and with transparency off that shows the window's own
         // backdrop as four light nicks. Linux keeps the rounded shell — and its real
@@ -6826,228 +6991,252 @@ impl eframe::App for App {
             return;
         }
 
-        let route = self.current_route();
-
-        // Claim order is the shell. The player bar goes first so it spans the whole window;
-        // the sidebar second so it runs from the top edge down to the player; the top bar
-        // third so it covers everything to the right of the rail and its window buttons stay
-        // in the window's corner; the queue after that; the content takes what is left.
-        let card = |fill: Color32, margin: egui::Margin| {
-            egui::Frame::NONE
-                .fill(fill)
-                .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
-                .inner_margin(margin)
-        };
-        let g = theme::GUTTER as i8;
-
-        egui::Panel::bottom("player")
-            .exact_size(theme::PLAYER_BAR_HEIGHT)
-            .resizable(false)
-            // No separator line: the gap is the edge, and egui draws one by default.
-            .show_separator_line(false)
-            // No card: the player bar sits directly on the gutter, as the reference does —
-            // and transparent rather than window-coloured, because the gutter is already
-            // painted underneath. Filling it again would stack two alphas and leave the bar
-            // more opaque than the gutter it is supposed to sit on.
-            .frame(
-                egui::Frame::NONE
-                    .fill(Color32::TRANSPARENT)
-                    .inner_margin(egui::Margin::symmetric(g + 6, 0)),
-            )
-            .show(ui, |ui| ui::player_bar::player_bar(self, ui));
-
-        // Resizable by its inner edge, within limits: narrower cuts playlist names to nothing,
-        // wider takes the page's room for no gain. egui keeps the dragged width in its own
-        // persisted memory, so it survives a restart.
-        // egui marks a resizable edge with a full-height line in the hover/active text colour
-        // while the pointer is on it — a bright seam through the gutter. The resize cursor is
-        // the cue here; the line is switched off for the panels' edges and the panels' own
-        // contents get the ordinary style back.
-        self.seed_panel_widths(&ctx);
-        let widgets = ui.visuals().widgets.clone();
-        quiet_panel_edges(ui);
-        egui::Panel::left("sidebar")
-            .default_size(self.settings.sidebar_width.unwrap_or(theme::SIDEBAR_WIDTH))
-            .size_range(theme::SIDEBAR_MIN..=theme::SIDEBAR_MAX)
-            .resizable(true)
-            .show_separator_line(false)
-            .frame(
-                card(p.card_fill(), theme::CARD_INSET).outer_margin(egui::Margin {
-                    left: g,
-                    right: 0,
-                    top: g,
-                    bottom: 0,
-                }),
-            )
-            .show(ui, |ui| {
-                ui.visuals_mut().widgets = widgets.clone();
-                self.remember_panel_width(&ctx, PanelEdge::Sidebar);
-                ui::sidebar::sidebar(self, ui)
-            });
-        ui.visuals_mut().widgets = widgets.clone();
-
-        egui::Panel::top("topbar")
-            .exact_size(theme::TITLEBAR_HEIGHT)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::NONE
-                    .fill(Color32::TRANSPARENT)
-                    .inner_margin(egui::Margin::symmetric(g + 6, 0)),
-            )
-            .show(ui, |ui| ui::topbar::top_bar(self, ui));
-
-        if self.upnext_open || self.lyrics_open {
-            // The queue is auxiliary, so it yields before the page does: a flat 300 is 40%
-            // of a 750pt window, and the card behind it fell to scraps — every name in the
-            // artist and playlist headers ellipsising while a third of the window sat in an
-            // empty queue. Down to a floor it keeps enough rail to be a queue.
-            //
-            // Dragged by its inner edge, it keeps to a range: never under what the lyrics need
-            // to set a line without breaking every other word, and never more than 40% of the
-            // window, so a wide panel dragged on a big screen still yields on a small one.
-            let screen_w = ui
-                .ctx()
-                .input(|i| i.raw.screen_rect.map_or(0.0, |r| r.width()));
-            let queue_w = self
-                .settings
-                .panel_width
-                .unwrap_or(theme::UPNEXT_WIDTH.min(screen_w * 0.30))
-                .max(theme::UPNEXT_MIN);
-            let queue_max = (screen_w * 0.40).clamp(theme::UPNEXT_MIN, theme::UPNEXT_MAX);
-            let show_queue = self.upnext_open;
-            let show_lyrics = self.lyrics_open;
-            // The card insets: a small side padding, and none top or bottom — content runs to
-            // the card's own top and bottom edges.
-            let margins = theme::CARD_INSET;
-            quiet_panel_edges(ui);
-            if show_queue && show_lyrics {
-                // Two *cards* sharing the column, not one card split by a hairline: the right
-                // panel itself is transparent, and each half is rounded with the shell's gutter
-                // between them, exactly like the sidebar and the page card.
-                egui::Panel::right("right-panel")
-                    .default_size(queue_w)
-                    .size_range(theme::UPNEXT_MIN..=queue_max)
-                    .resizable(true)
-                    .show_separator_line(false)
-                    .frame(egui::Frame::NONE.outer_margin(egui::Margin {
-                        left: 0,
-                        right: g,
-                        top: 0,
-                        bottom: 0,
-                    }))
-                    .show(ui, |ui| {
-                        ui.visuals_mut().widgets = widgets.clone();
-                        let half = ((ui.available_height() - f32::from(g)) / 2.0).max(80.0);
-                        egui::Panel::top("queue-card")
-                            .exact_size(half + f32::from(g))
-                            .resizable(false)
-                            .show_separator_line(false)
-                            .frame(card(p.card_fill(), margins).outer_margin(egui::Margin {
-                                left: 0,
-                                right: 0,
-                                top: 0,
-                                bottom: g,
-                            }))
-                            .show(ui, |ui| ui::upnext::panel(self, ui));
-                        egui::Panel::top("lyrics-card")
-                            .exact_size(half)
-                            .resizable(false)
-                            .show_separator_line(false)
-                            .frame(card(p.card_fill(), margins))
-                            .show(ui, |ui| ui::lyrics::panel(self, ui));
-                    });
-            } else if show_queue || show_lyrics {
-                egui::Panel::right("right-panel")
-                    .default_size(queue_w)
-                    .size_range(theme::UPNEXT_MIN..=queue_max)
-                    .resizable(true)
-                    .show_separator_line(false)
-                    .frame(card(p.card_fill(), margins).outer_margin(egui::Margin {
-                        left: 0,
-                        right: g,
-                        top: 0,
-                        bottom: 0,
-                    }))
-                    .show(ui, |ui| {
-                        ui.visuals_mut().widgets = widgets.clone();
-                        if show_queue {
-                            ui::upnext::panel(self, ui);
-                        } else {
-                            ui::lyrics::panel(self, ui);
-                        }
-                    });
+        // The fullscreen view is closed from outside it too: the window leaving fullscreen
+        // (F11, the compositor) or the song going away.
+        if self.fs.open {
+            if self.fs.manages_window {
+                if Instant::now() < self.fs.grace_until {
+                    // Still waiting for the window to take fullscreen.
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                } else if !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+                    tracing::debug!("fullscreen view: the window left fullscreen");
+                    self.fs.open = false;
+                    self.fs.queue = false;
+                }
             }
-            ui.visuals_mut().widgets = widgets;
-            self.remember_panel_width(&ctx, PanelEdge::Queue);
+            if self.now.track.is_none() {
+                self.fs_exit(&ctx);
+            }
         }
 
-        // The video view takes the whole card: no inner margin, so its frame meets the card's
-        // own rounded edge instead of sitting inset behind a black border.
-        let content = if self.video_open {
-            egui::Frame::NONE
-                .fill(Color32::BLACK)
-                .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
+        if self.fs.open {
+            ui::fullscreen::view(self, ui);
         } else {
-            card(p.card_fill(), theme::PAGE_INSET)
-        };
-        egui::CentralPanel::default()
-            .frame(content.outer_margin(egui::Margin {
-                left: g,
-                right: g,
-                top: 0,
-                bottom: 0,
-            }))
-            .show(ui, |ui| {
-                // Captured first: `available_rect_before_wrap` only means "the top" before
-                // the page allocates. It is the card's *content* rect — the panel less its
-                // inner margin — which is the only honest source for where the card's own
-                // edges are. A scroll area's clip rect is not it: egui builds that from the
-                // viewport and the parent's clip, and it lands a few points out on every side,
-                // which is how the header wash ended up short at the top and over the edge on
-                // the right.
-                let top = ui.available_rect_before_wrap();
-                self.content_rect = top;
-                // The video view takes the content card; the page it was opened from is still
-                // behind it, one toggle away.
-                if self.video_open {
-                    ui::video::panel(self, ui);
-                    return;
+            let route = self.current_route();
+
+            // Claim order is the shell. The player bar goes first so it spans the whole window;
+            // the sidebar second so it runs from the top edge down to the player; the top bar
+            // third so it covers everything to the right of the rail and its window buttons stay
+            // in the window's corner; the queue after that; the content takes what is left.
+            let card = |fill: Color32, margin: egui::Margin| {
+                egui::Frame::NONE
+                    .fill(fill)
+                    .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
+                    .inner_margin(margin)
+            };
+            let g = theme::GUTTER as i8;
+
+            egui::Panel::bottom("player")
+                .exact_size(theme::PLAYER_BAR_HEIGHT)
+                .resizable(false)
+                // No separator line: the gap is the edge, and egui draws one by default.
+                .show_separator_line(false)
+                // No card: the player bar sits directly on the gutter, as the reference does —
+                // and transparent rather than window-coloured, because the gutter is already
+                // painted underneath. Filling it again would stack two alphas and leave the bar
+                // more opaque than the gutter it is supposed to sit on.
+                .frame(
+                    egui::Frame::NONE
+                        .fill(Color32::TRANSPARENT)
+                        .inner_margin(egui::Margin::symmetric(g + 6, 0)),
+                )
+                .show(ui, |ui| ui::player_bar::player_bar(self, ui));
+
+            // Resizable by its inner edge, within limits: narrower cuts playlist names to nothing,
+            // wider takes the page's room for no gain. egui keeps the dragged width in its own
+            // persisted memory, so it survives a restart.
+            // egui marks a resizable edge with a full-height line in the hover/active text colour
+            // while the pointer is on it — a bright seam through the gutter. The resize cursor is
+            // the cue here; the line is switched off for the panels' edges and the panels' own
+            // contents get the ordinary style back.
+            self.seed_panel_widths(&ctx);
+            let widgets = ui.visuals().widgets.clone();
+            quiet_panel_edges(ui);
+            egui::Panel::left("sidebar")
+                .default_size(self.settings.sidebar_width.unwrap_or(theme::SIDEBAR_WIDTH))
+                .size_range(theme::SIDEBAR_MIN..=theme::SIDEBAR_MAX)
+                .resizable(true)
+                .show_separator_line(false)
+                .frame(
+                    card(p.card_fill(), theme::CARD_INSET).outer_margin(egui::Margin {
+                        left: g,
+                        right: 0,
+                        top: g,
+                        bottom: 0,
+                    }),
+                )
+                .show(ui, |ui| {
+                    ui.visuals_mut().widgets = widgets.clone();
+                    self.remember_panel_width(&ctx, PanelEdge::Sidebar);
+                    ui::sidebar::sidebar(self, ui)
+                });
+            ui.visuals_mut().widgets = widgets.clone();
+
+            egui::Panel::top("topbar")
+                .exact_size(theme::TITLEBAR_HEIGHT)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(Color32::TRANSPARENT)
+                        .inner_margin(egui::Margin::symmetric(g + 6, 0)),
+                )
+                .show(ui, |ui| ui::topbar::top_bar(self, ui));
+
+            if self.upnext_open || self.lyrics_open {
+                // The queue is auxiliary, so it yields before the page does: a flat 300 is 40%
+                // of a 750pt window, and the card behind it fell to scraps — every name in the
+                // artist and playlist headers ellipsising while a third of the window sat in an
+                // empty queue. Down to a floor it keeps enough rail to be a queue.
+                //
+                // Dragged by its inner edge, it keeps to a range: never under what the lyrics need
+                // to set a line without breaking every other word, and never more than 40% of the
+                // window, so a wide panel dragged on a big screen still yields on a small one.
+                let screen_w = ui
+                    .ctx()
+                    .input(|i| i.raw.screen_rect.map_or(0.0, |r| r.width()));
+                let queue_w = self
+                    .settings
+                    .panel_width
+                    .unwrap_or(theme::UPNEXT_WIDTH.min(screen_w * 0.30))
+                    .max(theme::UPNEXT_MIN);
+                let queue_max = (screen_w * 0.40).clamp(theme::UPNEXT_MIN, theme::UPNEXT_MAX);
+                let show_queue = self.upnext_open;
+                let show_lyrics = self.lyrics_open;
+                // The card insets: a small side padding, and none top or bottom — content runs to
+                // the card's own top and bottom edges.
+                let margins = theme::CARD_INSET;
+                quiet_panel_edges(ui);
+                if show_queue && show_lyrics {
+                    // Two *cards* sharing the column, not one card split by a hairline: the right
+                    // panel itself is transparent, and each half is rounded with the shell's gutter
+                    // between them, exactly like the sidebar and the page card.
+                    egui::Panel::right("right-panel")
+                        .default_size(queue_w)
+                        .size_range(theme::UPNEXT_MIN..=queue_max)
+                        .resizable(true)
+                        .show_separator_line(false)
+                        .frame(egui::Frame::NONE.outer_margin(egui::Margin {
+                            left: 0,
+                            right: g,
+                            top: 0,
+                            bottom: 0,
+                        }))
+                        .show(ui, |ui| {
+                            ui.visuals_mut().widgets = widgets.clone();
+                            let half = ((ui.available_height() - f32::from(g)) / 2.0).max(80.0);
+                            egui::Panel::top("queue-card")
+                                .exact_size(half + f32::from(g))
+                                .resizable(false)
+                                .show_separator_line(false)
+                                .frame(card(p.card_fill(), margins).outer_margin(egui::Margin {
+                                    left: 0,
+                                    right: 0,
+                                    top: 0,
+                                    bottom: g,
+                                }))
+                                .show(ui, |ui| ui::upnext::panel(self, ui));
+                            egui::Panel::top("lyrics-card")
+                                .exact_size(half)
+                                .resizable(false)
+                                .show_separator_line(false)
+                                .frame(card(p.card_fill(), margins))
+                                .show(ui, |ui| ui::lyrics::panel(self, ui));
+                        });
+                } else if show_queue || show_lyrics {
+                    egui::Panel::right("right-panel")
+                        .default_size(queue_w)
+                        .size_range(theme::UPNEXT_MIN..=queue_max)
+                        .resizable(true)
+                        .show_separator_line(false)
+                        .frame(card(p.card_fill(), margins).outer_margin(egui::Margin {
+                            left: 0,
+                            right: g,
+                            top: 0,
+                            bottom: 0,
+                        }))
+                        .show(ui, |ui| {
+                            ui.visuals_mut().widgets = widgets.clone();
+                            if show_queue {
+                                ui::upnext::panel(self, ui);
+                            } else {
+                                ui::lyrics::panel(self, ui);
+                            }
+                        });
                 }
-                let card = widgets::card_rect(top, theme::PAGE_INSET);
-                widgets::clip_card_content(ui, card, theme::PAGE_INSET_X, &p);
-                // Last frame's answer: the page draws after the banner, and a page that is itself
-                // the offline screen says it in full, so the strip would only repeat it.
-                let offline_page = std::mem::take(&mut self.offline_page_shown);
-                if self.offline && !offline_page {
-                    ui::offline_banner(self, ui);
-                }
-                match route {
-                    Route::Search => ui::search::page(self, ui),
-                    Route::Explore => ui::explore::page(self, ui),
-                    Route::NewReleases => ui::releases::page(self, ui),
-                    Route::Charts(_) => ui::charts::page(self, ui),
-                    Route::Moods => ui::moods::page(self, ui),
-                    Route::HomeShelf(title) => ui::home::shelf_page(self, ui, &title),
-                    Route::History => ui::history::page(self, ui),
-                    Route::Home => ui::home::page(self, ui),
-                    Route::Library => ui::library::page(self, ui),
-                    Route::Settings => ui::settings::page(self, ui),
-                    Route::Artist(_) => ui::artist::page(self, ui),
-                    Route::ArtistLiked(_) => ui::artist_liked::page(self, ui),
-                    Route::Album(_) => ui::album::page(self, ui),
-                    Route::Playlist(_) => ui::playlist::page(self, ui),
-                    Route::Mood(_) => ui::mood::page(self, ui),
-                }
-                // The card's rounded corners, painted after the page: content runs to the card's
-                // own top and bottom edges, and the part of it outside the rounded silhouette is
-                // covered with the gutter. The video view returns above — its frame is already
-                // rounded — so this never touches it.
-                widgets::paint_corner_notches(ui, card, theme::PAGE_INSET_X, &p);
-            });
+                ui.visuals_mut().widgets = widgets;
+                self.remember_panel_width(&ctx, PanelEdge::Queue);
+            }
+
+            // The video view takes the whole card: no inner margin, so its frame meets the card's
+            // own rounded edge instead of sitting inset behind a black border.
+            let content = if self.video_open {
+                egui::Frame::NONE
+                    .fill(Color32::BLACK)
+                    .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
+            } else {
+                card(p.card_fill(), theme::PAGE_INSET)
+            };
+            egui::CentralPanel::default()
+                .frame(content.outer_margin(egui::Margin {
+                    left: g,
+                    right: g,
+                    top: 0,
+                    bottom: 0,
+                }))
+                .show(ui, |ui| {
+                    // Captured first: `available_rect_before_wrap` only means "the top" before
+                    // the page allocates. It is the card's *content* rect — the panel less its
+                    // inner margin — which is the only honest source for where the card's own
+                    // edges are. A scroll area's clip rect is not it: egui builds that from the
+                    // viewport and the parent's clip, and it lands a few points out on every side,
+                    // which is how the header wash ended up short at the top and over the edge on
+                    // the right.
+                    let top = ui.available_rect_before_wrap();
+                    self.content_rect = top;
+                    // The video view takes the content card; the page it was opened from is still
+                    // behind it, one toggle away.
+                    if self.video_open {
+                        ui::video::panel(self, ui);
+                        return;
+                    }
+                    let card = widgets::card_rect(top, theme::PAGE_INSET);
+                    widgets::clip_card_content(ui, card, theme::PAGE_INSET_X, &p);
+                    // Last frame's answer: the page draws after the banner, and a page that is itself
+                    // the offline screen says it in full, so the strip would only repeat it.
+                    let offline_page = std::mem::take(&mut self.offline_page_shown);
+                    if self.offline && !offline_page {
+                        ui::offline_banner(self, ui);
+                    }
+                    match route {
+                        Route::Search => ui::search::page(self, ui),
+                        Route::Explore => ui::explore::page(self, ui),
+                        Route::NewReleases => ui::releases::page(self, ui),
+                        Route::Charts(_) => ui::charts::page(self, ui),
+                        Route::Moods => ui::moods::page(self, ui),
+                        Route::HomeShelf(title) => ui::home::shelf_page(self, ui, &title),
+                        Route::History => ui::history::page(self, ui),
+                        Route::Home => ui::home::page(self, ui),
+                        Route::Library => ui::library::page(self, ui),
+                        Route::Settings => ui::settings::page(self, ui),
+                        Route::Artist(_) => ui::artist::page(self, ui),
+                        Route::ArtistLiked(_) => ui::artist_liked::page(self, ui),
+                        Route::Album(_) => ui::album::page(self, ui),
+                        Route::Playlist(_) => ui::playlist::page(self, ui),
+                        Route::Mood(_) => ui::mood::page(self, ui),
+                    }
+                    // The card's rounded corners, painted after the page: content runs to the card's
+                    // own top and bottom edges, and the part of it outside the rounded silhouette is
+                    // covered with the gutter. The video view returns above — its frame is already
+                    // rounded — so this never touches it.
+                    widgets::paint_corner_notches(ui, card, theme::PAGE_INSET_X, &p);
+                });
+        }
+
         // The playlist management modals, over everything and on every route.
         ui::playlist::modals(self, ui);
         ui::help::modal(self, ui);
+        ui::home_order::modal(self, ui);
         ui::crash::modal(self, ui);
 
         if !self.decorated && !maximized {

@@ -263,6 +263,12 @@ pub struct Settings {
     /// Keep playing related songs when a hand-picked queue nears its end. YouTube's own radio,
     /// fetched for the queue's last track. On by default, as on the site.
     pub autoplay: bool,
+    /// Whether the fullscreen player shows the lyrics beside the cover. On by default; the
+    /// Lyrics button in that view changes it, and a song with no lyrics never does.
+    pub fullscreen_lyrics: bool,
+    /// The order of Home's sections, as [`crate::model::HomeSection::key`]s. Read through
+    /// [`crate::model::normalise_order`], which makes any saved list complete.
+    pub home_order: Vec<String>,
     /// Apply YouTube's own loudness measurement so tracks do not jump in level.
     pub normalise_volume: bool,
     /// Spotify-style playback: a single click on a song selects it and only a double click
@@ -315,7 +321,9 @@ impl Default for Settings {
             adaptive_art_color: true,
             quality: Quality::default(),
             autoplay: true,
-            normalise_volume: true,
+            fullscreen_lyrics: true,
+            home_order: crate::model::default_order_keys(),
+            normalise_volume: false,
             double_click_to_play: true,
             scrobble: true,
             account_page_id: None,

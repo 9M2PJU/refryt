@@ -403,6 +403,165 @@ pub struct Shelf {
     pub expanded: bool,
 }
 
+/// A kind of section on Home that the listener can place: the named ones YouTube serves, the
+/// shelves with a headline over their title, and "everything else" for the rest of the feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HomeSection {
+    ListenAgain,
+    QuickPicks,
+    Discover,
+    MixedForYou,
+    FromYourLibrary,
+    Trending,
+    NewReleases,
+    AlbumsForYou,
+    ForgottenFavorites,
+    FeaturedPlaylists,
+    MusicVideos,
+    CoversAndRemixes,
+    LongListens,
+    LivePerformances,
+    FromTheCommunity,
+    SimilarTo,
+    Themed,
+    Everything,
+}
+
+impl HomeSection {
+    /// The order a fresh install uses.
+    pub const DEFAULT: [HomeSection; 18] = [
+        HomeSection::ListenAgain,
+        HomeSection::QuickPicks,
+        HomeSection::Discover,
+        HomeSection::MixedForYou,
+        HomeSection::FromYourLibrary,
+        HomeSection::Trending,
+        HomeSection::NewReleases,
+        HomeSection::AlbumsForYou,
+        HomeSection::ForgottenFavorites,
+        HomeSection::FeaturedPlaylists,
+        HomeSection::MusicVideos,
+        HomeSection::CoversAndRemixes,
+        HomeSection::LongListens,
+        HomeSection::LivePerformances,
+        HomeSection::FromTheCommunity,
+        HomeSection::SimilarTo,
+        HomeSection::Themed,
+        HomeSection::Everything,
+    ];
+
+    /// What is saved in `settings.json`: stable text, so renaming a variant cannot break a file.
+    pub fn key(self) -> &'static str {
+        match self {
+            HomeSection::ListenAgain => "listen-again",
+            HomeSection::QuickPicks => "quick-picks",
+            HomeSection::Discover => "discover",
+            HomeSection::MixedForYou => "mixed-for-you",
+            HomeSection::FromYourLibrary => "from-your-library",
+            HomeSection::Trending => "trending",
+            HomeSection::NewReleases => "new-releases",
+            HomeSection::AlbumsForYou => "albums-for-you",
+            HomeSection::ForgottenFavorites => "forgotten-favorites",
+            HomeSection::FeaturedPlaylists => "featured-playlists",
+            HomeSection::MusicVideos => "music-videos",
+            HomeSection::CoversAndRemixes => "covers-and-remixes",
+            HomeSection::LongListens => "long-listens",
+            HomeSection::LivePerformances => "live-performances",
+            HomeSection::FromTheCommunity => "from-the-community",
+            HomeSection::SimilarTo => "similar-to",
+            HomeSection::Themed => "themed",
+            HomeSection::Everything => "everything-else",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::DEFAULT.into_iter().find(|s| s.key() == key)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HomeSection::ListenAgain => "Listen again",
+            HomeSection::QuickPicks => "Quick picks",
+            HomeSection::Discover => "Daily discover",
+            HomeSection::MixedForYou => "Mixed for you",
+            HomeSection::FromYourLibrary => "From your library",
+            HomeSection::Trending => "Trending songs",
+            HomeSection::NewReleases => "New releases",
+            HomeSection::AlbumsForYou => "Albums for you",
+            HomeSection::ForgottenFavorites => "Forgotten favorites",
+            HomeSection::FeaturedPlaylists => "Featured playlists",
+            HomeSection::MusicVideos => "Music videos",
+            HomeSection::CoversAndRemixes => "Covers and remixes",
+            HomeSection::LongListens => "Long listens",
+            HomeSection::LivePerformances => "Live performances",
+            HomeSection::FromTheCommunity => "From the community",
+            HomeSection::SimilarTo => "Similar to an artist",
+            HomeSection::Themed => "Themed picks",
+            HomeSection::Everything => "Everything else",
+        }
+    }
+
+    /// A line under the name where the name alone would not say what lands there.
+    pub fn hint(self) -> Option<&'static str> {
+        match self {
+            HomeSection::Discover => Some("YouTube calls it \"Your daily discover\""),
+            HomeSection::Trending => Some("\"Trending songs for you\""),
+            HomeSection::ForgottenFavorites => Some("Also \"Fresh finds, old favorites\""),
+            HomeSection::SimilarTo => Some("Shelves headed \"Similar to\" an artist"),
+            HomeSection::Themed => {
+                Some("Shelves with a headline above them, like \"Throwback to…\"")
+            }
+            HomeSection::Everything => Some("Genre shelves, and anything new or unrecognised"),
+            _ => None,
+        }
+    }
+}
+
+/// The saved keys as a complete order: unknown keys and repeats dropped, and any section the list
+/// lacks added in the default order just before "everything else" (or at the end if that is gone),
+/// so a file from an older build still gives every section a place and the named ones still come
+/// before the unrecognised.
+pub fn normalise_order(saved: &[String]) -> Vec<HomeSection> {
+    let mut out: Vec<HomeSection> = Vec::with_capacity(HomeSection::DEFAULT.len());
+    for key in saved {
+        if let Some(section) = HomeSection::from_key(key)
+            && !out.contains(&section)
+        {
+            out.push(section);
+        }
+    }
+    for section in HomeSection::DEFAULT {
+        if !out.contains(&section) {
+            let at = out
+                .iter()
+                .position(|s| *s == HomeSection::Everything)
+                .unwrap_or(out.len());
+            out.insert(at, section);
+        }
+    }
+    out
+}
+
+/// The default order as saved keys.
+pub fn default_order_keys() -> Vec<String> {
+    HomeSection::DEFAULT
+        .iter()
+        .map(|s| s.key().to_owned())
+        .collect()
+}
+
+/// Arrange shelves by `order`. Stable: shelves in the same section keep the order YouTube sent
+/// them in.
+pub fn order_home(shelves: &mut [Shelf], order: &[HomeSection]) {
+    shelves.sort_by_key(|shelf| {
+        let section = shelf.home_section();
+        order
+            .iter()
+            .position(|s| *s == section)
+            .unwrap_or(order.len())
+    });
+}
+
 impl Shelf {
     /// Whether this shelf is a list of playable songs rather than a grid of cards.
     ///
@@ -416,6 +575,46 @@ impl Shelf {
     /// Whether this shelf is "Moods & genres", which is chips rather than cards.
     pub fn is_mood_list(&self) -> bool {
         !self.items.is_empty() && self.items.iter().all(|i| matches!(i, Entry::Mood(_)))
+    }
+
+    /// Which of Home's orderable sections this shelf belongs to. Matched on the English title (and
+    /// the "Similar to" line over an artist's name); a shelf that fits none, which is every
+    /// personal or themed one, is [`HomeSection::Everything`].
+    pub fn home_section(&self) -> HomeSection {
+        let title = self.title.trim().to_lowercase();
+        let strapline = self
+            .strapline
+            .as_deref()
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default();
+        match title.as_str() {
+            "listen again" => HomeSection::ListenAgain,
+            "quick picks" => HomeSection::QuickPicks,
+            "your daily discover" | "daily discover" | "discover mix" | "discover mixes" => {
+                HomeSection::Discover
+            }
+            "mixed for you" => HomeSection::MixedForYou,
+            "from your library" => HomeSection::FromYourLibrary,
+            t if t.starts_with("trending") => HomeSection::Trending,
+            "new releases" | "new albums & singles" | "new albums and singles" => {
+                HomeSection::NewReleases
+            }
+            "albums for you" => HomeSection::AlbumsForYou,
+            "forgotten favorites" | "forgotten favourites" | "fresh finds, old favorites" => {
+                HomeSection::ForgottenFavorites
+            }
+            t if t.starts_with("featured playlists") => HomeSection::FeaturedPlaylists,
+            t if t.starts_with("music videos") => HomeSection::MusicVideos,
+            "covers and remixes" => HomeSection::CoversAndRemixes,
+            "long listens" => HomeSection::LongListens,
+            "live performances" => HomeSection::LivePerformances,
+            "from the community" => HomeSection::FromTheCommunity,
+            _ if strapline.starts_with("similar to") => HomeSection::SimilarTo,
+            // A headline over the title with nothing named above: the themed shelves, whose
+            // titles change from day to day but which all carry one.
+            _ if !strapline.is_empty() => HomeSection::Themed,
+            _ => HomeSection::Everything,
+        }
     }
 
     /// The playable tracks in this shelf, for starting a queue from one of them.
@@ -895,6 +1094,158 @@ pub fn fold_styled_letters(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shelf(title: &str, strapline: Option<&str>) -> Shelf {
+        Shelf {
+            title: title.to_owned(),
+            strapline: strapline.map(str::to_owned),
+            items: Vec::new(),
+            more_params: None,
+            more_browse_id: None,
+            expanded: false,
+        }
+    }
+
+    fn titles(shelves: &[Shelf]) -> Vec<&str> {
+        shelves.iter().map(|s| s.title.as_str()).collect()
+    }
+
+    /// The named sections are found by their English titles, whatever the case or spacing; the
+    /// "Similar to" line marks the artist shelves; any other headline over a title makes a themed
+    /// shelf; a bare unknown title is "everything else".
+    #[test]
+    fn a_shelf_belongs_to_the_section_its_title_names() {
+        use HomeSection::*;
+        let cases = [
+            ("Listen again", Some("IV"), ListenAgain),
+            ("  QUICK picks ", None, QuickPicks),
+            ("Your daily discover", None, Discover),
+            ("Mixed for you", None, MixedForYou),
+            ("From your library", None, FromYourLibrary),
+            ("Trending songs for you", None, Trending),
+            ("New releases", None, NewReleases),
+            ("Albums for you", None, AlbumsForYou),
+            ("Forgotten favorites", None, ForgottenFavorites),
+            ("Fresh finds, old favorites", None, ForgottenFavorites),
+            ("Featured playlists for you", None, FeaturedPlaylists),
+            ("Music videos for you", None, MusicVideos),
+            ("Covers and remixes", None, CoversAndRemixes),
+            ("Long listens", None, LongListens),
+            ("Live performances", None, LivePerformances),
+            ("From the community", None, FromTheCommunity),
+            ("Drake", Some("Similar to"), SimilarTo),
+            (
+                "Brb, Being Nostalgic!",
+                Some("Throwback to the og eras of music"),
+                Themed,
+            ),
+            ("Hip-hop", None, Everything),
+            ("Something new", None, Everything),
+        ];
+        for (title, strapline, want) in cases {
+            assert_eq!(shelf(title, strapline).home_section(), want, "{title}");
+        }
+        // The account's name over "Listen again" does not make it a themed shelf.
+        assert_eq!(shelf("Listen again", None).home_section(), ListenAgain);
+    }
+
+    /// The default puts the named sections first, in the agreed order, and sections of one kind keep
+    /// the order YouTube sent them in.
+    #[test]
+    fn the_default_order_ranks_the_named_sections_and_is_stable() {
+        let mut feed = vec![
+            shelf("Hip-hop", None),
+            shelf("Quick picks", None),
+            shelf("Brb, Being Nostalgic!", Some("Throwback")),
+            shelf("Another unknown", None),
+            shelf("Listen again", None),
+            shelf("Artist B", Some("Similar to")),
+            shelf("Artist A", Some("Similar to")),
+            shelf("Your daily discover", None),
+            shelf("From your library", None),
+            shelf("Mixed for you", None),
+        ];
+        order_home(&mut feed, &normalise_order(&default_order_keys()));
+        assert_eq!(
+            titles(&feed),
+            [
+                "Listen again",
+                "Quick picks",
+                "Your daily discover",
+                "Mixed for you",
+                "From your library",
+                "Artist B",
+                "Artist A",
+                "Brb, Being Nostalgic!",
+                "Hip-hop",
+                "Another unknown"
+            ]
+        );
+    }
+
+    /// A custom order is honoured, "everything else" included.
+    #[test]
+    fn a_custom_order_can_put_everything_else_first() {
+        let mut feed = vec![shelf("Listen again", None), shelf("Themed", None)];
+        let order = normalise_order(&["everything-else".to_owned(), "listen-again".to_owned()]);
+        order_home(&mut feed, &order);
+        assert_eq!(titles(&feed), ["Themed", "Listen again"]);
+    }
+
+    /// A saved list from another build still yields every section exactly once.
+    #[test]
+    fn a_saved_order_is_always_made_complete() {
+        let order = normalise_order(&[
+            "quick-picks".to_owned(),
+            "no-such-section".to_owned(),
+            "quick-picks".to_owned(),
+        ]);
+        assert_eq!(order.len(), HomeSection::DEFAULT.len());
+        assert_eq!(order[0], HomeSection::QuickPicks);
+        for section in HomeSection::DEFAULT {
+            assert_eq!(order.iter().filter(|s| **s == section).count(), 1);
+        }
+        assert_eq!(
+            normalise_order(&[]),
+            HomeSection::DEFAULT.to_vec(),
+            "nothing saved is the default"
+        );
+        // Sections an older build never knew come in before "everything else", not after it.
+        let old = normalise_order(&["listen-again".to_owned(), "everything-else".to_owned()]);
+        let everything = old
+            .iter()
+            .position(|s| *s == HomeSection::Everything)
+            .unwrap();
+        assert_eq!(
+            everything,
+            old.len() - 1,
+            "the unrecognised still come last"
+        );
+    }
+
+    /// A late page is arranged among itself and appended, so what was loaded does not move.
+    #[test]
+    fn a_late_page_never_moves_what_was_already_loaded() {
+        let order = normalise_order(&default_order_keys());
+        let mut feed = vec![shelf("Themed", None), shelf("Quick picks", None)];
+        order_home(&mut feed, &order);
+        let loaded = titles(&feed)
+            .iter()
+            .map(|t| (*t).to_owned())
+            .collect::<Vec<_>>();
+        let mut page = vec![shelf("Later themed", None), shelf("Listen again", None)];
+        order_home(&mut page, &order);
+        feed.extend(page);
+        assert_eq!(
+            titles(&feed),
+            [
+                loaded[0].as_str(),
+                loaded[1].as_str(),
+                "Listen again",
+                "Later themed"
+            ]
+        );
+    }
 
     /// Styled letters and digits fold to plain ones; everything else passes through untouched,
     /// and a title with nothing to fold is not copied.

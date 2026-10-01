@@ -3853,32 +3853,204 @@ pub fn toggle(ui: &mut Ui, palette: &Palette, id: egui::Id, on: &mut bool) -> eg
     response
 }
 
-/// A settings row: label and description on the left, the control right-aligned.
-///
-/// Reads as rows rather than a stack of labels, which is what the page was before.
-pub fn setting_row(
+/// A strip of text tabs under a page title: the open one at full brightness with an accent bar
+/// under it, the rest quiet, and a hairline under the whole strip. Returns the tab clicked.
+pub fn tab_strip(
     ui: &mut Ui,
     palette: &Palette,
-    label: &str,
-    description: &str,
-    control: impl FnOnce(&mut Ui),
-) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-        control(ui);
-        ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .font(theme::medium(13.0))
-                    .color(palette.text),
-            );
-            ui.label(
-                egui::RichText::new(description)
-                    .font(theme::regular(11.0))
-                    .color(palette.dim),
-            );
+    labels: &[&str],
+    selected: usize,
+) -> Option<usize> {
+    const HEIGHT: f32 = 38.0;
+    const GAP: f32 = 22.0;
+    let mut clicked = None;
+    let left = ui.cursor().min.x;
+    let right = ui.max_rect().right();
+    let mut x = left;
+    let top = ui.cursor().min.y;
+    for (i, label) in labels.iter().enumerate() {
+        let font = if i == selected {
+            theme::semibold(14.0)
+        } else {
+            theme::medium(14.0)
+        };
+        let galley =
+            ui.fonts_mut(|f| f.layout_no_wrap((*label).to_owned(), font, Color32::PLACEHOLDER));
+        let rect = Rect::from_min_size(egui::pos2(x, top), vec2(galley.size().x, HEIGHT));
+        let response = ui.interact(rect, ui.id().with(("tab", i)), Sense::click());
+        let t = lit(ui, &response);
+        let colour = if i == selected {
+            palette.text
+        } else {
+            mix(palette.secondary, palette.text, t)
+        };
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if ui.is_rect_visible(rect) {
+            let at = egui::pos2(rect.min.x, rect.center().y - galley.size().y / 2.0 - 1.0);
+            ui.painter().galley(at, galley, colour);
+        }
+        if response.clicked() {
+            clicked = Some(i);
+        }
+        x = rect.right() + GAP;
+    }
+    let base = top + HEIGHT;
+    ui.painter().hline(
+        left..=right,
+        base,
+        egui::Stroke::new(1.0, palette.outline.gamma_multiply(0.6)),
+    );
+    // The bar under the open tab, over the hairline.
+    let mut x = left;
+    for (i, label) in labels.iter().enumerate() {
+        let w = ui.fonts_mut(|f| {
+            f.layout_no_wrap(
+                (*label).to_owned(),
+                if i == selected {
+                    theme::semibold(14.0)
+                } else {
+                    theme::medium(14.0)
+                },
+                Color32::PLACEHOLDER,
+            )
+            .size()
+            .x
         });
-    });
-    ui.add_space(10.0);
+        if i == selected {
+            ui.painter().rect_filled(
+                Rect::from_min_size(egui::pos2(x, base - 2.0), vec2(w, 2.0)),
+                CornerRadius::same(1),
+                palette.accent,
+            );
+        }
+        x += w + GAP;
+    }
+    ui.allocate_space(vec2(right - left, HEIGHT + 1.0));
+    clicked
+}
+
+/// The height of a [`Group`] row that holds one line of control.
+const ROW_H: f32 = 58.0;
+
+/// Settings rows inside one card: each a title and a line under it on the left, its control on
+/// the right, with a hairline between rows. Build one with [`setting_group`].
+pub struct Group<'a> {
+    palette: &'a Palette,
+    first: bool,
+}
+
+impl Group<'_> {
+    /// The hairline above every row but the first.
+    fn divide(&mut self, ui: &mut Ui) {
+        if !self.first {
+            let y = ui.cursor().min.y;
+            let r = ui.max_rect();
+            ui.painter().hline(
+                r.left()..=r.right(),
+                y,
+                egui::Stroke::new(1.0, self.palette.outline.gamma_multiply(0.45)),
+            );
+            ui.add_space(1.0);
+        }
+        self.first = false;
+    }
+
+    fn text(&self, ui: &mut Ui, title: &str, detail: &str) {
+        ui.label(
+            egui::RichText::new(title)
+                .font(theme::medium(13.0))
+                .color(self.palette.text),
+        );
+        if !detail.is_empty() {
+            ui.label(
+                egui::RichText::new(detail)
+                    .font(theme::regular(11.0))
+                    .color(self.palette.dim),
+            );
+        }
+    }
+
+    /// A title and its line on the left, one control on the right. A chip group is added
+    /// right to left, so it goes in last-first.
+    pub fn row(&mut self, ui: &mut Ui, title: &str, detail: &str, control: impl FnOnce(&mut Ui)) {
+        self.divide(ui);
+        let width = ui.available_width();
+        ui.allocate_ui_with_layout(
+            vec2(width, ROW_H),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.set_min_height(ROW_H);
+                control(ui);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    // Centred by measure: a `vertical` starts at the top of the row's rect.
+                    let lines = if detail.is_empty() { 1.0 } else { 2.0 };
+                    ui.add_space(((ROW_H - lines * 15.5) / 2.0 - 1.0).max(8.0));
+                    self.text(ui, title, detail);
+                });
+            },
+        );
+    }
+
+    /// A title and its line, then the control on a line of its own: for a row of chips too wide
+    /// to sit beside the words.
+    pub fn wide_row(
+        &mut self,
+        ui: &mut Ui,
+        title: &str,
+        detail: &str,
+        control: impl FnOnce(&mut Ui),
+    ) {
+        self.divide(ui);
+        ui.add_space(12.0);
+        self.text(ui, title, detail);
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(control);
+        ui.add_space(12.0);
+    }
+
+    /// Free content with the same side and top padding as a row.
+    pub fn free(&mut self, ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
+        self.divide(ui);
+        ui.add_space(12.0);
+        contents(ui);
+        ui.add_space(12.0);
+    }
+}
+
+/// A card of settings under a small caption. `contents` adds its rows through the [`Group`].
+pub fn setting_group(
+    ui: &mut Ui,
+    palette: &Palette,
+    caption: Option<&str>,
+    contents: impl FnOnce(&mut Ui, &mut Group),
+) {
+    if let Some(caption) = caption {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(caption)
+                .font(theme::semibold(12.0))
+                .color(palette.secondary),
+        );
+        ui.add_space(8.0);
+    }
+    let inner = ui.available_width() - 32.0;
+    egui::Frame::NONE
+        // Between the page and a chip's own fill, so an unselected chip still shows on it.
+        .fill(mix(palette.panel, palette.surface, 0.4))
+        .corner_radius(CornerRadius::same(theme::RADIUS + 4))
+        .inner_margin(egui::Margin::symmetric(16, 0))
+        .show(ui, |ui| {
+            ui.set_width(inner);
+            let mut group = Group {
+                palette,
+                first: true,
+            };
+            contents(ui, &mut group);
+        });
+    ui.add_space(24.0);
 }
 
 enum PillStyle {

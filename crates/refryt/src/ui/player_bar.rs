@@ -1,6 +1,6 @@
 //! The now-playing bar at the bottom: cover, title, transport, seek and volume.
 
-use egui::{Rect, Sense, vec2};
+use egui::{Color32, Rect, Sense, vec2};
 
 use crate::app::{App, RepeatMode, Route};
 use crate::icons::Icon;
@@ -48,6 +48,29 @@ fn seek_width(width: f32, cluster_left: f32, total_w: f32, center_x: f32) -> f32
         .min(2.0 * room.max(0.0))
 }
 
+/// Where playback is and how long the song runs, for the seek bar. A restored, not-yet-loaded
+/// track still shows its saved position and length: mpv has no state until play, so `resume`
+/// stands in, and scrubbing updates it rather than the player.
+pub(crate) fn clock(app: &App) -> (f64, f64) {
+    let state = app.player_state;
+    let restored = (!app.playback_started)
+        .then_some(app.resume)
+        .flatten()
+        .filter(|(i, _)| Some(*i) == app.current);
+    let position = restored.map(|(_, p)| p).unwrap_or(state.position);
+    let duration = if state.duration > 0.0 {
+        state.duration
+    } else {
+        app.now
+            .track
+            .as_ref()
+            .and_then(|t| t.duration)
+            .map(|d| d as f64)
+            .unwrap_or(0.0)
+    };
+    (position, duration)
+}
+
 pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     let rect = ui.available_rect_before_wrap();
     let p = app.palette;
@@ -68,7 +91,6 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         BAR_ART_PT,
     );
     widgets::paint_art(ui, &p, art, bar_art, widgets::ArtShape::Square);
-
     // A failure replaces the credits; otherwise the credits are the same linked pieces a row
     // draws, which is what makes *every* artist here clickable rather than only the first.
     // Loading keeps them: the ring on the play button says it, and the artist is what you look
@@ -154,6 +176,30 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     )
     .unwrap_or_else(|| ui.interact(title_rect, ui.id().with("np-title-hit"), Sense::click()));
     let art_hit = ui.interact(art, ui.id().with("np-art-hit"), Sense::click());
+    // Hovering the playing song's cover offers the fullscreen view: the cover dims and an expand
+    // glyph appears on it. A primary click opens it; the right-click menu is unchanged.
+    if app.now.track.is_some() {
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(art_hit.id.with("hover"), art_hit.hovered(), 0.12);
+        if t > 0.0 {
+            ui.painter().rect_filled(
+                art,
+                widgets::ArtShape::Square.radius(art),
+                Color32::from_black_alpha((140.0 * t) as u8),
+            );
+            Icon::Maximize2
+                .image(Color32::WHITE.gamma_multiply(t), 20.0)
+                .paint_at(ui, Rect::from_center_size(art.center(), vec2(20.0, 20.0)));
+        }
+        if art_hit.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if art_hit.clicked() {
+            let ctx = ui.ctx().clone();
+            app.fs_enter(&ctx);
+        }
+    }
     if app.now.track.as_ref().is_some_and(|t| t.album_id.is_some()) && title_hit.hovered() {
         // The same hover treatment a row's artist link gets: a pointing hand and a hairline
         // under the text.
@@ -326,23 +372,7 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         egui::pos2(rect.center().x, rect.center().y + SEEK_DY),
         vec2(bar_w, 4.0),
     );
-    // A restored, not-yet-loaded track still shows its saved position and length: mpv has no
-    // state until play, so `resume` stands in, and scrubbing updates it rather than the player.
-    let restored = (!app.playback_started)
-        .then_some(app.resume)
-        .flatten()
-        .filter(|(i, _)| Some(*i) == app.current);
-    let position = restored.map(|(_, p)| p).unwrap_or(state.position);
-    let duration = if state.duration > 0.0 {
-        state.duration
-    } else {
-        app.now
-            .track
-            .as_ref()
-            .and_then(|t| t.duration)
-            .map(|d| d as f64)
-            .unwrap_or(0.0)
-    };
+    let (position, duration) = clock(app);
     let fraction = if duration > 0.0 {
         (position / duration).clamp(0.0, 1.0)
     } else {

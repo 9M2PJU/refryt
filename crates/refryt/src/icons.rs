@@ -45,6 +45,8 @@ icons! {
     LoaderCircle => "loader-circle",
     LogOut => "log-out",
     MicVocal => "mic-vocal",
+    Maximize2 => "maximize-2",
+    Minimize2 => "minimize-2",
     Minus => "minus",
     Music => "music",
     PanelLeft => "panel-left",

@@ -669,7 +669,16 @@ impl Api {
                 // And those rows are the only place the tracks' own ratings live: the typed
                 // parser has no field for a like button, so every album track used to arrive
                 // unrated and a song you had liked did not look liked once it was playing.
-                merge_track_states(&mut out.tracks, &innertube::track_states(&json));
+                let states = innertube::track_states(&json);
+                merge_track_states(&mut out.tracks, &states);
+                // The rows' own credits, where a track's differ from the album's.
+                for track in &mut out.tracks {
+                    if let Some(state) = states.get(&track.video_id)
+                        && !state.artists.is_empty()
+                    {
+                        track.artists = state.artists.clone();
+                    }
+                }
             }
             Err(e) => tracing::debug!(%id, error = %format!("{e:#}"),
                 "raw album browse failed; keeping the typed library state"),
@@ -2762,10 +2771,8 @@ fn map_album(id: &str, a: GetAlbum) -> model::Album {
         .map(|t| Track {
             video_id: t.video_id.get_raw().to_owned(),
             title: t.title,
-            artists: vec![model::ArtistLink {
-                name: artist.clone(),
-                id: artist_id.clone(),
-            }],
+            // The album's artists, each linked; the page's own rows refine this per track.
+            artists: links.clone(),
             album: Some(a.title.clone()),
             // Every track on an album page belongs to the album being shown.
             album_id: Some(id.to_owned()),
