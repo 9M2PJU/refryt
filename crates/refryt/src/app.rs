@@ -335,6 +335,52 @@ impl Load {
 }
 
 /// How old the home feed may get before a visit to Home reloads it.
+/// The stages of leaving a window restored fullscreen: looking at what it started as, waiting for
+/// it to be out of fullscreen, done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullscreenCheck {
+    Looking,
+    Leaving,
+    Done,
+}
+
+/// What to do about it this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FullscreenAction {
+    Nothing,
+    /// Ask the window to leave fullscreen.
+    Leave,
+    /// Left, but not out yet: look again shortly.
+    Wait,
+    /// Out of fullscreen: put the window at its default size.
+    Resize,
+}
+
+/// One step of getting a window out of a fullscreen it was restored into. Pure, for the test.
+/// The size goes only once the window says it is out: asked in the same breath, it is applied to
+/// a window still fullscreen and the compositor puts the old size back.
+fn fullscreen_step(
+    check: FullscreenCheck,
+    player_has_it: bool,
+    fullscreen: bool,
+    since_start: Duration,
+) -> (FullscreenCheck, FullscreenAction) {
+    use FullscreenAction::{Leave, Nothing, Resize, Wait};
+    use FullscreenCheck::{Done, Leaving, Looking};
+    match check {
+        Done => (Done, Nothing),
+        Looking if player_has_it => (Done, Nothing),
+        Looking if fullscreen => (Leaving, Leave),
+        Looking if since_start > Duration::from_secs(3) => (Done, Nothing),
+        Looking => (Looking, Nothing),
+        Leaving if fullscreen => (Leaving, Wait),
+        Leaving => (Done, Resize),
+    }
+}
+
+/// The window's size when nothing else says: what `main` opens it at.
+const DEFAULT_WINDOW_SIZE: (f32, f32) = (1100.0, 720.0);
+
 /// How often the window is asked to grow to the shell's minimum before giving up: a compositor may
 /// ignore the first asks, and one that never complies must not be asked for ever.
 const WINDOW_FIT_TRIES: u8 = 12;
@@ -1301,6 +1347,8 @@ pub struct App {
     /// How many times the window has been asked to grow to `min_window_w` since that last changed;
     /// at [`WINDOW_FIT_TRIES`] it is done, wide enough or not.
     window_fit_tries: u8,
+    /// Where the check for a window restored fullscreen has got to.
+    fullscreen_check: FullscreenCheck,
     /// Which kind of result the search page is filtered to. `All` is a view over `results`
     /// (never a second request); every other scope drives a dedicated per-category fetch, since
     /// the mixed ranked response often surfaces far fewer of that kind than actually exist — see
@@ -1888,6 +1936,7 @@ impl App {
             panels_seeded: false,
             min_window_w: theme::WINDOW_MIN_W,
             window_fit_tries: 0,
+            fullscreen_check: FullscreenCheck::Looking,
             search_scope: SearchScope::default(),
             scoped_results: Vec::new(),
             scoped_loading: false,
@@ -3727,6 +3776,45 @@ impl App {
         );
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(min_w, size.y)));
         ctx.request_repaint_after(Duration::from_millis(120));
+    }
+
+    /// Take a window that came up fullscreen out of it, when the app did not put it there.
+    ///
+    /// eframe remembers the window's last state and restores it at the next launch, so an app
+    /// closed while the fullscreen player had the window starts fullscreen next time: a window
+    /// whose own buttons do nothing (a fullscreen window cannot be minimised or resized) and that
+    /// the shell, thinking it is merely windowed, paints with rounded corners. Only the fullscreen
+    /// player puts the window there, so a window found fullscreen with the player closed is leaving
+    /// it, back to the default size: the size it remembers is the screen's. Looked at for the
+    /// first few seconds only, which is how long the compositor takes to say what the window is.
+    fn leave_restored_fullscreen(&mut self, ctx: &egui::Context) {
+        if self.fullscreen_check == FullscreenCheck::Done {
+            return;
+        }
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let player_has_it = self.fs.open || self.fs.manages_window;
+        let (next, action) = fullscreen_step(
+            self.fullscreen_check,
+            player_has_it,
+            fullscreen,
+            crate::elapsed_since_start(),
+        );
+        self.fullscreen_check = next;
+        match action {
+            FullscreenAction::Nothing => {}
+            FullscreenAction::Leave => {
+                tracing::info!("the window was restored fullscreen; leaving it");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            FullscreenAction::Wait => ctx.request_repaint_after(Duration::from_millis(100)),
+            FullscreenAction::Resize => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    DEFAULT_WINDOW_SIZE.0,
+                    DEFAULT_WINDOW_SIZE.1,
+                )));
+            }
+        }
     }
 
     /// Bring a panel back to the width the listener chose once the window has room for it again.
@@ -7125,7 +7213,11 @@ impl eframe::App for App {
         crate::widgets::set_downloaded(&ctx, std::sync::Arc::clone(&self.downloaded_ids));
         crate::widgets::set_premium(&ctx, self.can_download());
 
-        let maximized = Self::is_maximized(&ctx) || self.fs.open;
+        self.leave_restored_fullscreen(&ctx);
+        // A fullscreen window is as square as a maximised one: nothing of the shell's own edge
+        // shows, and there is nothing to resize.
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let maximized = Self::is_maximized(&ctx) || fullscreen || self.fs.open;
         // Square on Windows, where the shell is opaque: the outer corner pixels of a rounded
         // rect are never painted, and with transparency off that shows the window's own
         // backdrop as small light marks in the four corners. Linux keeps the rounded shell — and its real
@@ -7696,6 +7788,47 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
+    /// A window restored fullscreen is taken out of it and then resized — in that order, and the
+    /// resize only once the window reports it is out. The fullscreen player's own fullscreen is
+    /// never touched, nor is a window that was never fullscreen, and a fullscreen that arrives
+    /// well after start (the listener's own) is left alone.
+    #[test]
+    fn a_restored_fullscreen_is_left_but_the_players_is_not() {
+        use FullscreenAction::{Leave, Nothing, Resize, Wait};
+        use FullscreenCheck::{Done, Leaving, Looking};
+        let t = |ms| Duration::from_millis(ms);
+        // Restored fullscreen: leave, wait while it still is, resize when it is not, then done.
+        assert_eq!(
+            fullscreen_step(Looking, false, true, t(300)),
+            (Leaving, Leave)
+        );
+        assert_eq!(
+            fullscreen_step(Leaving, false, true, t(400)),
+            (Leaving, Wait)
+        );
+        assert_eq!(
+            fullscreen_step(Leaving, false, false, t(700)),
+            (Done, Resize)
+        );
+        assert_eq!(fullscreen_step(Done, false, false, t(900)), (Done, Nothing));
+        // The player has the window: never touched, however fullscreen it is.
+        assert_eq!(
+            fullscreen_step(Looking, true, true, t(300)),
+            (Done, Nothing)
+        );
+        // Never fullscreen: watched for three seconds, then done.
+        assert_eq!(
+            fullscreen_step(Looking, false, false, t(2900)),
+            (Looking, Nothing)
+        );
+        assert_eq!(
+            fullscreen_step(Looking, false, false, t(3100)),
+            (Done, Nothing)
+        );
+        // Fullscreen only after the first seconds is the listener's doing, and stays.
+        assert_eq!(fullscreen_step(Done, false, true, t(9000)), (Done, Nothing));
+    }
+
     fn tick(position: f64) -> PlayingTick {
         PlayingTick {
             position,
