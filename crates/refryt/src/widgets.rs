@@ -915,29 +915,55 @@ pub(crate) fn paint_corner_notches(ui: &Ui, card: egui::Rect, inset_x: f32, pale
         }
         painter.add(mesh);
     }
-    // The notches cover the card's corner pixels, the outline's among them.
-    redraw_outline_after_notches(ui, card, palette);
 }
 
-/// Put a solid card's outline back after the corner notches have covered its corner pixels.
+/// The edge round a solid card, drawn once, last.
 ///
-/// The card's frame draws its edge before the page, and the notches are painted after it in the
-/// gutter's colour, so each corner's arc comes out broken. The edge is drawn once more, over the
-/// whole card, in the opaque colour the frame's translucent one blends to over the card, so the
-/// straight edges come out as they were and the corners are whole. Nothing when outlines are off.
-fn redraw_outline_after_notches(ui: &Ui, card: egui::Rect, palette: &Palette) {
-    if palette.card_edge().is_none() {
-        return;
+/// A see-through card's frame draws its own edge. A solid card cannot let it: the corner notches
+/// ([`paint_corner_notches`]) are painted after the page, in the gutter's colour, and cover the
+/// corner pixels of anything drawn before them, and drawing the edge twice to get round that put
+/// two lines a fraction of a pixel apart, thick and blurred. So a solid card's frame draws no
+/// edge and its function holds one of these from the top: dropped as the function ends, on any
+/// return, it draws the edge exactly once, after the notches, snapped to whole pixels. The
+/// colour is the opaque one the translucent edge blends to over the card. Nothing when outlines
+/// are off or the window is see-through.
+pub(crate) struct CardEdge {
+    ctx: egui::Context,
+    layer: egui::LayerId,
+    card: egui::Rect,
+    colour: Option<Color32>,
+}
+
+impl CardEdge {
+    pub(crate) fn new(ui: &Ui, card: egui::Rect, palette: &Palette) -> Self {
+        let colour = (!palette.translucent() && palette.card_edge().is_some()).then(|| {
+            palette
+                .panel
+                .lerp_to_gamma(palette.text, crate::theme::CARD_EDGE_STRENGTH)
+        });
+        Self {
+            ctx: ui.ctx().clone(),
+            layer: ui.layer_id(),
+            card,
+            colour,
+        }
     }
-    let edge = palette
-        .panel
-        .lerp_to_gamma(palette.text, crate::theme::CARD_EDGE_STRENGTH);
-    egui::Painter::new(ui.ctx().clone(), ui.layer_id(), card).rect_stroke(
-        card,
-        CornerRadius::same(crate::theme::PANEL_RADIUS),
-        egui::Stroke::new(1.0, edge),
-        egui::StrokeKind::Inside,
-    );
+}
+
+impl Drop for CardEdge {
+    fn drop(&mut self) {
+        let Some(colour) = self.colour else { return };
+        let painter = egui::Painter::new(self.ctx.clone(), self.layer, self.card);
+        painter.add(
+            egui::epaint::RectShape::stroke(
+                self.card,
+                CornerRadius::same(crate::theme::PANEL_RADIUS),
+                egui::Stroke::new(1.0, colour),
+                egui::StrokeKind::Inside,
+            )
+            .with_round_to_pixels(true),
+        );
+    }
 }
 
 /// What a scrolling line remembers between frames. Lives in egui's temp storage under the

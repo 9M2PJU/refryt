@@ -11,14 +11,16 @@ use crate::ui::{ListClick, RowSpec, centered, is_active, spec_rows, track_subtit
 use crate::widgets::{self, ArtShape};
 
 pub fn panel(app: &mut App, ui: &mut egui::Ui) {
+    // The card's own rect, before the list consumes the ui: the corner repaint at the end
+    // needs its rounded edges. Taken before the empty queue returns, so that card has its edge
+    // too. Not in the fullscreen drawer, which is no card (see the notches below).
+    let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
+    let _edge = (!app.fs.open).then(|| widgets::CardEdge::new(ui, card, &app.palette));
     let start = app.current.map(|i| i + 1).unwrap_or(0);
     if start >= app.queue.len() {
         centered(app, ui, "Empty queue");
         return;
     }
-    // The card's own rect, before the list consumes the ui: the corner repaint at the end
-    // needs its rounded edges.
-    let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
     widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &app.palette);
 
     let mut area = egui::ScrollArea::vertical()

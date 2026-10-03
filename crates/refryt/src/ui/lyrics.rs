@@ -12,6 +12,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     // The card's own rect, before the header and list consume the ui: the corner repaint at
     // the end needs its rounded edges.
     let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
+    let _edge = widgets::CardEdge::new(ui, card, &p);
     widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &p);
 
     if app.lyrics_loading {

@@ -7309,11 +7309,13 @@ impl eframe::App for App {
                     .fill(fill)
                     .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
                     // A hairline gives a card an edge to tell it from the gutter beside it, which
-                    // a see-through one otherwise lacks. A setting, on by default.
-                    .stroke(
-                        p.card_edge()
-                            .map_or(egui::Stroke::NONE, |c| egui::Stroke::new(1.0, c)),
-                    )
+                    // a see-through one otherwise lacks. A setting, on by default. Only a
+                    // see-through card's frame draws it: a solid one's is drawn after its page,
+                    // once (`widgets::CardEdge`).
+                    .stroke(match p.card_edge() {
+                        Some(c) if p.translucent() => egui::Stroke::new(1.0, c),
+                        _ => egui::Stroke::NONE,
+                    })
                     .inner_margin(margin)
             };
             let g = theme::GUTTER as i8;
@@ -7513,11 +7515,12 @@ impl eframe::App for App {
                     self.content_rect = top;
                     // The video view takes the content card; the page it was opened from is still
                     // behind it, one toggle away.
+                    let card = widgets::card_rect(top, theme::PAGE_INSET);
+                    let _edge = widgets::CardEdge::new(ui, card, &p);
                     if self.video_open {
                         ui::video::panel(self, ui);
                         return;
                     }
-                    let card = widgets::card_rect(top, theme::PAGE_INSET);
                     widgets::clip_card_content(ui, card, theme::PAGE_INSET_X, &p);
                     // Last frame's answer: the page draws after the banner, and a page that is itself
                     // the offline screen says it in full, so the strip would only repeat it.

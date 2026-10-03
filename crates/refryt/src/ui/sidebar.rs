@@ -21,6 +21,7 @@ pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
     // The card's own rect, taken before any panel claims space: the corner repaint at the end
     // needs its rounded edges.
     let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
+    let _edge = widgets::CardEdge::new(ui, card, &app.palette);
     widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &app.palette);
     // Claimed first, so the scrolling middle gets whatever is left rather than pushing it off.
     if app.player_error.is_some() {
