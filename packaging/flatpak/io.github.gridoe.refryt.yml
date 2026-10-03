@@ -14,7 +14,10 @@ finish-args:
   - --share=network
   - --share=ipc
   - --socket=wayland
-  - --socket=fallback-x11
+  # Not `fallback-x11`: the sign-in window is WebKitGTK, which wry can only build into an X11
+  # window, so refryt points that child at XWayland. `fallback-x11` would leave a Wayland session
+  # with no X11 socket in the sandbox and the window could not open.
+  - --socket=x11
   - --socket=pulseaudio
   - --device=dri
   # Media keys and the desktop's media controls: the name playwire registers.
