@@ -33,6 +33,26 @@ This bundles the release binary, every shared library short of glibc (`libmpv` i
 freshly-fetched `yt-dlp`, and the app icon into a single `dist/refryt-<version>-x86_64.AppImage`.
 Needs `python3` with Pillow and `curl`; no root required anywhere.
 
+## Linux: the Flatpak
+
+```sh
+just flatpak           # or: ./scripts/build-flatpak.sh
+flatpak install --user dist/refryt-<version>-x86_64.flatpak
+```
+
+This builds `dist/refryt-<version>-x86_64.flatpak` from `packaging/flatpak/`. It needs
+`flatpak`, `flatpak-builder`, the GNOME 49 Platform and Sdk, and the `rust-stable` Sdk extension
+(`org.freedesktop.Sdk.Extension.rust-stable//25.08`), all installed for your user. The first
+build takes a while: it compiles libass, libplacebo, a libmpv-only mpv and the tray's libraries,
+because the GNOME runtime has none of them. The refryt module also needs the network, for the
+crates.
+
+The Flatpak differs from the AppImage in three ways. The sandbox cannot read a browser's profile
+folder, so Settings leaves out "Import from a Browser" and the sign-in window is the only way in.
+Its autostart entry would land in the sandbox's own config folder, where nothing reads it, so
+"Launch on Startup" is left out too. And `yt-dlp` is bundled at build time, the same as the
+AppImage's, so it is as old as the build.
+
 ## macOS: the app bundle
 
 ```sh
@@ -133,6 +153,34 @@ stay a no-op on every other platform without a `cfg` that would just check the w
 
 The installer is unsigned — nobody's bought a code-signing certificate for this project — so
 Windows' SmartScreen will warn on first run. That's expected, not a bug in the build.
+
+## Releasing
+
+The version lives in one place, `[workspace.package]` in the root `Cargo.toml`. Every build
+script reads it from there, so the AppImage, the Windows zip and installer, the macOS bundle and
+the Flatpak all name themselves after it. The one other place is the Flatpak's metainfo, which
+lists each release by hand. `scripts/release.sh` does the bumping and checks the rest:
+
+```sh
+just release-prep 0.1.7      # version, Cargo.lock, metainfo, the gate, and a "Release 0.1.7" commit
+just appimage                # then build what ships, on the machine that can:
+./scripts/build-windows.sh   #   Linux and Windows build here,
+just flatpak                 #   the Flatpak here too,
+./scripts/build-macos.sh     #   and the macOS image on a Mac, copied into dist/
+just release-verify 0.1.7    # checks the repo and dist/ agree
+just release-publish 0.1.7 notes.md      # shows what it would do
+./scripts/release.sh publish 0.1.7 --notes notes.md --yes      # does it
+```
+
+`prep` refuses a dirty tree, a version that isn't newer, a tag that already exists, and a tree
+with the private local patch applied (that patch is a build for one machine and
+never part of a release). `verify` checks that each file in `dist/` exists, was built after
+`HEAD`'s commit (an older one is stale), and has the right things in it. A missing macOS image is
+a warning, since it can only come from a Mac. `publish` runs `verify` again, then tags `v<version>`,
+pushes `main` and the tag, and creates the release with every artifact attached.
+
+There's no CI yet, so the gate in `prep` (fmt, clippy `-D warnings`, the tests, and with `--perf`
+the memory and frame-time gates) is the only thing standing between a change and a release.
 
 ## Packaged size
 

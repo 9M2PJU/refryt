@@ -81,6 +81,21 @@ appimage:
 appimage-install:
     ./scripts/appimage-install.sh install
 
+# Build the Flatpak bundle into dist/.
+flatpak:
+    ./scripts/build-flatpak.sh
+
+# Release: bump the version and run the gate, check what was built, publish. See docs/BUILDING.md.
+release-prep version:
+    ./scripts/release.sh prep {{version}}
+
+release-verify version:
+    ./scripts/release.sh verify {{version}}
+
+# Tags, pushes and creates the GitHub release; a dry run unless --yes is added by hand.
+release-publish version notes:
+    ./scripts/release.sh publish {{version}} --notes {{notes}}
+
 # Resolve + play through mpv, no GUI.
 play id:
     ./scripts/play.sh {{id}}
@@ -99,7 +114,7 @@ size:
 
 # Install as a desktop application: binary, hicolor icons, desktop entry.
 install:
-    cargo install --path crates/refryt
+    cargo install --path crates/refryt --bin refryt
     for s in 16 32 48 64 128 256 512; do
       install -Dm644 "assets/icons/app/refryt-$s.png" \
         "$HOME/.local/share/icons/hicolor/${s}x${s}/apps/refryt.png"

@@ -50,6 +50,10 @@ are there on purpose:
 - **Playlists that behave.** Create, rename, drag to reorder, and get asked when a song is
   already in one instead of it quietly going in twice. Your own playlists get YouTube's
   Suggestions underneath, with a + on each. Settings can open every playlist newest-first.
+- **Home in your order.** Drag Home's sections into the order you want. YouTube decides what
+  exists and sends it in batches, so a late section lands below what's showing. Settings has a
+  Strict Home Order switch, off by default, that waits a few seconds longer for your top seven
+  sections before it shows Home.
 - **Liked songs everywhere.** A liked song shows its thumb in search, on Home and on every
   list. Each artist page has a tile with the songs you've liked by them.
 - **Local files.** Point Settings at a folder and browse it like a file explorer. Any folder
@@ -89,13 +93,15 @@ browser.
 ## Themes
 
 22 of them, and each one is a [plain CSS file](docs/THEMES.md) in your config folder. Edit
-one and the app repaints when you save. Delete one and it's gone. Drop in your own and it
+one and the app repaints when you come back to its window or open Settings. Delete one and it's gone. Drop in your own and it
 turns up in the list. Headers can also take their colour from the album art, which is on by
 default.
 
 The window can be see-through with real compositor blur behind it. That only works where the
 system offers blur, which today means KDE on Wayland and macOS. Windows hides both settings,
-because what shows through there is a washed-out grey, not your desktop.
+because what shows through there is a washed-out grey, not your desktop. Chips, the search box
+and the highlights stay see-through with the window, and the cards get a thin edge so they don't
+melt into each other; Settings has a switch for that edge, solid window or not.
 
 ## Signing in
 
@@ -146,6 +152,20 @@ build it:
 
 Uninstalling leaves `~/.config/refryt` and your downloads alone. Delete those yourself if
 you want everything gone.
+
+**Linux, Flatpak.** The releases page also has a `.flatpak` file. It isn't on Flathub, so install
+the file itself:
+
+```sh
+flatpak install --user refryt-<version>-x86_64.flatpak
+flatpak run io.github.gridoe.refryt
+```
+
+It needs the GNOME 49 runtime, which Flatpak offers to fetch from Flathub the first time. mpv
+and yt-dlp are inside it. The sandbox can't see your browsers' profile folders, so "Import from
+a Browser" is hidden and you sign in through the app's own window. It can't write a login item
+for your desktop either, so "Launch on Startup" is hidden too. `./scripts/build-flatpak.sh`
+builds it from source.
 
 **macOS.** Build the app bundle yourself (needs Homebrew's `mpv` and `dylibbundler`):
 

@@ -6,8 +6,9 @@ Nord, Gruvbox, Tokyo Night, Dracula, Rosé Pine, Everforest and Solarized, each 
 flavour as its own file). From then on the folder is all there is:
 
 - **Delete a file** and that theme is gone. Nothing puts it back.
-- **Edit a file** and that theme changes. Save it while refryt is open and the app repaints
-  within a second.
+- **Edit a file** and that theme changes. Save it while refryt is open, then come back to the
+  window (or open Settings) and the app repaints. It looks at the folder at those moments, not on
+  a timer, so an idle refryt does nothing in the background.
 - **Add a file** and it shows up in **Settings → Theme** under its file name.
 
 The folder is:
