@@ -135,6 +135,8 @@ impl Ramp {
             // Opaque until `Palette::with_opacity` says otherwise.
             gutter_alpha: 1.0,
             card_alpha: 1.0,
+            glass_alpha: 1.0,
+            card_outline: true,
         }
     }
 }

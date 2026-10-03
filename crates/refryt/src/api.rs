@@ -1079,7 +1079,12 @@ impl Api {
     /// filter skips the Explore top-up — padding "Relax" with New releases would be nonsense —
     /// while continuations are still followed, since the token identifies the filtered feed
     /// server-side.
-    pub async fn home(&self, filter: Option<&str>) -> Result<model::HomeFeed> {
+    pub async fn home(
+        &self,
+        filter: Option<&str>,
+        fetch: &model::HomeFetch,
+    ) -> Result<model::HomeFeed> {
+        let started = std::time::Instant::now();
         let json = match filter {
             Some(params) => {
                 self.run_browse(BrowseQuery::filtered(HOME, params.to_owned()), HOME)
@@ -1092,18 +1097,63 @@ impl Api {
 
         // Home pages its shelves in too. Following a few is what turns a signed-in feed from three
         // shelves into something that looks like YouTube's; bounded, because it does not end.
+        //
+        // How many is the load's policy: a few for the ordinary one; for a strict one, until the
+        // sections the listener ranked highest have all appeared, or the clock or the page cap
+        // says enough. A strict load never waits on one slow page past its budget, and what it
+        // leaves unread stays in the token, so scrolling carries on from there.
         let mut token = innertube::continuation_token(&json);
-        for _ in 0..HOME_PAGES {
-            let Some(next) = token.take() else { break };
-            let Ok(json) = self.run_browse(BrowseQuery::next_page(next), HOME).await else {
-                break;
-            };
-            let more = innertube::parse_browse_shelves(&json);
-            if more.is_empty() {
-                break;
+        let mut pages = 0;
+        let stop = loop {
+            if token.is_none() {
+                break model::HomeStop::FeedEnded;
             }
+            let seen: Vec<_> = shelves.iter().map(model::Shelf::home_section).collect();
+            if let Some(why) = model::home_fetch_stop(fetch, pages, &seen, started.elapsed()) {
+                break why;
+            }
+            let next = token.clone().unwrap_or_default();
+            let request = self.run_browse(BrowseQuery::next_page(next), HOME);
+            let page = match fetch {
+                model::HomeFetch::Strict { budget, .. } => {
+                    let left = budget.saturating_sub(started.elapsed());
+                    match tokio::time::timeout(left, request).await {
+                        Ok(page) => page,
+                        Err(_) => break model::HomeStop::Budget,
+                    }
+                }
+                model::HomeFetch::Quick => request.await,
+            };
+            pages += 1;
+            // A page that fails or comes back empty ends the feed, as it always has.
+            let more = match page {
+                Ok(json) => {
+                    let more = innertube::parse_browse_shelves(&json);
+                    if more.is_empty() {
+                        token = None;
+                        break model::HomeStop::FeedEnded;
+                    }
+                    token = innertube::continuation_token(&json);
+                    more
+                }
+                Err(_) => {
+                    token = None;
+                    break model::HomeStop::FeedEnded;
+                }
+            };
             shelves.extend(more);
-            token = innertube::continuation_token(&json);
+        };
+        if let model::HomeFetch::Strict { wanted, .. } = fetch {
+            let seen: Vec<_> = shelves.iter().map(model::Shelf::home_section).collect();
+            let missing: Vec<_> = wanted.iter().filter(|w| !seen.contains(w)).collect();
+            tracing::info!(
+                pages,
+                shelves = shelves.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                stopped = ?stop,
+                ?missing,
+                "strict home fetch"
+            );
         }
 
         if filter.is_none() && shelves.len() < THIN_HOME && !self.is_signed_in().await {
@@ -2242,12 +2292,8 @@ const MEMBERSHIPS: &str = "FEmemberships_and_purchases";
 /// Below this many shelves, the feed is the signed-out one and is worth supplementing.
 const THIN_HOME: usize = 4;
 
-/// How many extra pages of home shelves to follow. The feed does not end; this is the point at
-/// which more costs a request and buys nothing anyone will scroll to.
-const HOME_PAGES: usize = 3;
-
 /// How many extra pages of library playlists the sidebar will follow to get the whole
-/// collection, not just the first page. Bounded for the same reason `HOME_PAGES` is.
+/// collection, not just the first page. Bounded for the same reason the ordinary Home load is (`model::QUICK_HOME_PAGES`).
 const SIDEBAR_PLAYLIST_PAGES: usize = 20;
 
 /// Which library section a continuation belongs to.

@@ -255,6 +255,8 @@ pub struct Settings {
     pub opacity: Opacity,
     /// Ask the compositor to blur what shows through, where it offers it.
     pub blur: bool,
+    /// A thin edge around each card, solid window or see-through.
+    pub card_outline: bool,
     /// Tint an album/playlist header with a colour pulled from its own cover art, instead of
     /// the scheme's fixed accent. Off falls back to the accent everywhere, unconditionally.
     pub adaptive_art_color: bool,
@@ -269,6 +271,10 @@ pub struct Settings {
     /// The order of Home's sections, as [`crate::model::HomeSection::key`]s. Read through
     /// [`crate::model::normalise_order`], which makes any saved list complete.
     pub home_order: Vec<String>,
+    /// Spend more of Home's load following the feed until the sections ranked highest have
+    /// appeared, so the order is kept more closely, up to a time limit. Off, Home loads as
+    /// quickly as it always did.
+    pub home_strict_order: bool,
     /// Apply YouTube's own loudness measurement so tracks do not jump in level.
     pub normalise_volume: bool,
     /// Spotify-style playback: a single click on a song selects it and only a double click
@@ -318,11 +324,13 @@ impl Default for Settings {
             custom_theme: None,
             opacity: Opacity::default(),
             blur: true,
+            card_outline: true,
             adaptive_art_color: true,
             quality: Quality::default(),
             autoplay: true,
             fullscreen_lyrics: true,
             home_order: crate::model::default_order_keys(),
+            home_strict_order: false,
             normalise_volume: false,
             double_click_to_play: true,
             scrobble: true,
@@ -367,6 +375,7 @@ impl Settings {
             None => crate::theme::custom::fallback(dark).palette(),
         }
         .with_opacity(self.opacity)
+        .with_card_outline(self.card_outline)
     }
 
     /// Fold a pre-files settings file into [`Self::dark_theme`]/[`Self::light_theme`]: a family
@@ -535,6 +544,35 @@ mod tests {
         // An integer is a number too.
         let zero: Settings = serde_json::from_str(r#"{"opacity":0}"#).unwrap();
         assert_eq!(zero.opacity, Opacity::OFF);
+    }
+
+    /// Strict Home Order is opt-in: off for a new install and for a file from before it existed,
+    /// and a choice to turn it on survives a save.
+    #[test]
+    fn strict_home_order_is_off_until_chosen() {
+        assert!(!Settings::default().home_strict_order);
+        let old: Settings = serde_json::from_str(r#"{"opacity":0.5}"#).unwrap();
+        assert!(!old.home_strict_order);
+        let on = Settings {
+            home_strict_order: true,
+            ..Settings::default()
+        };
+        let back: Settings = serde_json::from_slice(&serde_json::to_vec(&on).unwrap()).unwrap();
+        assert!(back.home_strict_order);
+    }
+
+    /// Card outlines are on for anyone whose file predates the setting, and a choice to turn them
+    /// off survives a save.
+    #[test]
+    fn card_outlines_default_on_and_remember_off() {
+        let old: Settings = serde_json::from_str(r#"{"opacity":0.5}"#).unwrap();
+        assert!(old.card_outline);
+        let off = Settings {
+            card_outline: false,
+            ..Settings::default()
+        };
+        let back: Settings = serde_json::from_slice(&serde_json::to_vec(&off).unwrap()).unwrap();
+        assert!(!back.card_outline);
     }
 
     #[test]

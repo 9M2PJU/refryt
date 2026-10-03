@@ -24,9 +24,7 @@
 //! edits it. Only when nothing usable is left does the compiled-in [`fallback`] paint.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use egui::Color32;
 
@@ -452,35 +450,53 @@ fn parse_colour(value: &str) -> Option<u32> {
     }
 }
 
-/// Watch the themes folder: a background thread that compares the folder's `.css` files and
-/// their modification times once a second, and on a change raises the returned flag and wakes
-/// the UI. Polling, not an inotify dependency — one `read_dir` a second is nothing, and it
-/// behaves the same on every platform. The app idles without frames either way: the thread
-/// only asks for one when something actually changed.
-pub fn watch(ctx: egui::Context) -> Arc<AtomicBool> {
-    let changed = Arc::new(AtomicBool::new(false));
-    let Some(dir) = dir() else {
-        return changed;
-    };
-    let flag = Arc::clone(&changed);
-    let spawned = std::thread::Builder::new()
-        .name("theme-watch".into())
-        .spawn(move || {
-            let mut last = snapshot(&dir);
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                let now = snapshot(&dir);
-                if now != last {
-                    last = now;
-                    flag.store(true, Ordering::SeqCst);
-                    ctx.request_repaint();
-                }
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::warn!(%e, "could not start the theme watcher; theme edits apply on restart");
+/// Notices edits to the themes folder: it remembers the folder's `.css` files and their
+/// modification times, and [`Watcher::check`] compares them. There is no thread and no timer —
+/// it used to poll once a second for as long as the app ran, a wakeup a second forever to catch
+/// a change that happens when someone edits a theme. The app checks when its window gains focus
+/// (the way back from an editor), once at startup, and on entering Settings, where the folder is
+/// offered.
+pub struct Watcher {
+    dir: Option<PathBuf>,
+    last: Vec<(PathBuf, Option<SystemTime>)>,
+    changed: bool,
+}
+
+impl Watcher {
+    /// Remember the folder as it is now.
+    pub fn new() -> Self {
+        Self::at(dir())
     }
-    changed
+
+    fn at(dir: Option<PathBuf>) -> Self {
+        let last = dir.as_deref().map(snapshot).unwrap_or_default();
+        Self {
+            dir,
+            last,
+            changed: false,
+        }
+    }
+
+    /// Compare the folder with what was last seen, and remember a difference until it is taken.
+    pub fn check(&mut self) {
+        let Some(dir) = &self.dir else { return };
+        let now = snapshot(dir);
+        if now != self.last {
+            self.last = now;
+            self.changed = true;
+        }
+    }
+
+    /// Whether the folder changed since this was last asked, clearing the answer.
+    pub fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+}
+
+impl Default for Watcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn snapshot(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
@@ -501,6 +517,42 @@ fn snapshot(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
 
 #[cfg(test)]
 mod tests {
+    /// The watcher sees a theme file added, edited and removed, and only when asked: it keeps
+    /// no thread of its own, and a quiet folder reports nothing.
+    #[test]
+    fn the_watcher_sees_changes_only_when_checked() {
+        let dir = std::env::temp_dir().join(format!("refryt-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut watcher = Watcher::at(Some(dir.clone()));
+
+        watcher.check();
+        assert!(!watcher.take_changed(), "an untouched folder is quiet");
+
+        std::fs::write(dir.join("mine.css"), "a: b").unwrap();
+        assert!(
+            !watcher.take_changed(),
+            "nothing is noticed until it is checked"
+        );
+        watcher.check();
+        assert!(watcher.take_changed(), "a new theme file is seen");
+        assert!(!watcher.take_changed(), "and reported once");
+
+        std::fs::write(dir.join("notes.txt"), "not a theme").unwrap();
+        watcher.check();
+        assert!(!watcher.take_changed(), "other files are not themes");
+
+        std::fs::remove_file(dir.join("mine.css")).unwrap();
+        watcher.check();
+        assert!(watcher.take_changed(), "a removed theme file is seen");
+
+        assert!(
+            !Watcher::at(None).take_changed(),
+            "no folder, nothing to watch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

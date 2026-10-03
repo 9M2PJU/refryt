@@ -550,6 +550,97 @@ pub fn default_order_keys() -> Vec<String> {
         .collect()
 }
 
+/// How many of the listener's top-ranked sections Strict Home Order waits to see.
+pub const STRICT_HOME_SECTIONS: usize = 7;
+/// The longest Strict Home Order spends fetching, counted from when the request starts. Past it
+/// the shelves in hand are sorted and shown, and the rest of the feed loads on scroll.
+pub const STRICT_HOME_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+/// The most extra pages Strict Home Order follows, whatever the clock says.
+pub const STRICT_HOME_PAGES: usize = 12;
+/// The extra pages the ordinary load follows. The feed does not end; this is the point at which
+/// more costs a request and buys nothing anyone will scroll to.
+pub const QUICK_HOME_PAGES: usize = 3;
+
+/// How far one Home load follows the feed's continuations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HomeFetch {
+    /// A few pages, as it always was.
+    Quick,
+    /// Pages until every section in `wanted` has appeared, the feed ends, or the `budget` or the
+    /// `max_pages` cap is spent — whichever comes first.
+    Strict {
+        wanted: Vec<HomeSection>,
+        budget: std::time::Duration,
+        max_pages: usize,
+    },
+}
+
+impl HomeFetch {
+    /// The strict plan for a listener's order: wait for their top [`STRICT_HOME_SECTIONS`].
+    pub fn strict(order: &[HomeSection]) -> Self {
+        Self::Strict {
+            wanted: wanted_sections(order, STRICT_HOME_SECTIONS),
+            budget: STRICT_HOME_BUDGET,
+            max_pages: STRICT_HOME_PAGES,
+        }
+    }
+}
+
+/// Why a Home load stopped following the feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HomeStop {
+    /// YouTube had no more pages.
+    FeedEnded,
+    /// The ordinary load's few pages were done.
+    Quick,
+    /// Every wanted section has appeared.
+    Enough,
+    /// The time budget was spent.
+    Budget,
+    /// The page cap was reached.
+    PageCap,
+}
+
+/// The first `n` sections of `order` a strict load waits for, leaving out "everything else": it is
+/// the catch-all, so something always lands there and waiting for it would mean nothing.
+pub fn wanted_sections(order: &[HomeSection], n: usize) -> Vec<HomeSection> {
+    order
+        .iter()
+        .copied()
+        .filter(|s| *s != HomeSection::Everything)
+        .take(n)
+        .collect()
+}
+
+/// Whether a load that has followed `pages_done` extra pages in `elapsed` should stop, and why;
+/// `None` means follow the next one. Pure, so the whole rule is testable without a clock or a
+/// network. The caller handles a feed with no next page, which is [`HomeStop::FeedEnded`].
+pub fn home_fetch_stop(
+    fetch: &HomeFetch,
+    pages_done: usize,
+    seen: &[HomeSection],
+    elapsed: std::time::Duration,
+) -> Option<HomeStop> {
+    match fetch {
+        HomeFetch::Quick => (pages_done >= QUICK_HOME_PAGES).then_some(HomeStop::Quick),
+        HomeFetch::Strict {
+            wanted,
+            budget,
+            max_pages,
+        } => {
+            if wanted.iter().all(|w| seen.contains(w)) {
+                Some(HomeStop::Enough)
+            } else if elapsed >= *budget {
+                Some(HomeStop::Budget)
+            } else if pages_done >= *max_pages {
+                Some(HomeStop::PageCap)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Arrange shelves by `order`. Stable: shelves in the same section keep the order YouTube sent
 /// them in.
 pub fn order_home(shelves: &mut [Shelf], order: &[HomeSection]) {
@@ -1147,6 +1238,74 @@ mod tests {
         }
         // The account's name over "Listen again" does not make it a themed shelf.
         assert_eq!(shelf("Listen again", None).home_section(), ListenAgain);
+    }
+
+    /// A strict load waits for the top seven named sections, never for the catch-all, and follows
+    /// the listener's own order rather than the default.
+    #[test]
+    fn a_strict_load_waits_for_the_top_named_sections() {
+        let default = normalise_order(&default_order_keys());
+        let wanted = wanted_sections(&default, STRICT_HOME_SECTIONS);
+        assert_eq!(wanted.len(), STRICT_HOME_SECTIONS);
+        assert_eq!(wanted[0], HomeSection::ListenAgain);
+        assert!(!wanted.contains(&HomeSection::Everything));
+
+        // "Everything else" ranked first is skipped, not waited for.
+        let mut keys = default_order_keys();
+        keys.retain(|k| k != HomeSection::Everything.key());
+        keys.insert(0, HomeSection::Everything.key().to_owned());
+        keys.insert(1, HomeSection::LongListens.key().to_owned());
+        let custom = wanted_sections(&normalise_order(&keys), 3);
+        assert_eq!(custom[0], HomeSection::LongListens);
+        assert_eq!(custom.len(), 3);
+        assert!(!custom.contains(&HomeSection::Everything));
+    }
+
+    /// The stop rule: strict stops the moment everything wanted is in, then at the clock, then at
+    /// the page cap; the ordinary load keeps to its few pages whatever has arrived.
+    #[test]
+    fn the_strict_stop_rule_follows_found_then_clock_then_pages() {
+        use std::time::Duration;
+        let wanted = vec![HomeSection::ListenAgain, HomeSection::QuickPicks];
+        let strict = HomeFetch::Strict {
+            wanted: wanted.clone(),
+            budget: Duration::from_secs(6),
+            max_pages: 12,
+        };
+        let secs = Duration::from_secs;
+        let one = [HomeSection::ListenAgain];
+        // Missing one wanted section, with time and pages to spare: keep going.
+        assert_eq!(home_fetch_stop(&strict, 2, &one, secs(1)), None);
+        // All wanted in: stop, even with time left, and even before any page.
+        assert_eq!(
+            home_fetch_stop(&strict, 0, &wanted, secs(0)),
+            Some(HomeStop::Enough)
+        );
+        // Still missing one: the clock stops it, and so does the page cap.
+        assert_eq!(
+            home_fetch_stop(&strict, 3, &one, secs(6)),
+            Some(HomeStop::Budget)
+        );
+        assert_eq!(
+            home_fetch_stop(&strict, 12, &one, secs(2)),
+            Some(HomeStop::PageCap)
+        );
+        // The ordinary load is the old three pages, found or not.
+        assert_eq!(home_fetch_stop(&HomeFetch::Quick, 2, &[], secs(30)), None);
+        assert_eq!(
+            home_fetch_stop(&HomeFetch::Quick, 3, &[], secs(0)),
+            Some(HomeStop::Quick)
+        );
+        // Nothing wanted at all (an empty order) is trivially satisfied.
+        let none = HomeFetch::Strict {
+            wanted: Vec::new(),
+            budget: secs(6),
+            max_pages: 12,
+        };
+        assert_eq!(
+            home_fetch_stop(&none, 0, &[], secs(0)),
+            Some(HomeStop::Enough)
+        );
     }
 
     /// The default puts the named sections first, in the agreed order, and sections of one kind keep

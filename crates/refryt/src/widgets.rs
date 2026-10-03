@@ -67,6 +67,16 @@ fn state_fill(ui: &Ui, palette: &Palette, response: &egui::Response) -> Option<C
     (t > 0.001).then(|| palette.surface_hover.gamma_multiply(t))
 }
 
+/// [`state_fill`] for a control that sits on the shell itself — a nav entry, an icon button —
+/// where the fill must stay see-through when the window is. Popups keep the solid one.
+fn shell_state_fill(ui: &Ui, palette: &Palette, response: &egui::Response) -> Option<Color32> {
+    if held(response) {
+        return Some(palette.glass(palette.surface_active));
+    }
+    let t = lit(ui, response);
+    (t > 0.001).then(|| palette.glass_state(palette.surface_hover, t))
+}
+
 /// The id the double-click-to-play flag is kept under in egui's memory.
 const DOUBLE_CLICK_KEY: &str = "ytm-double-click-play";
 
@@ -183,7 +193,7 @@ pub fn icon_button(
 
     if ui.is_rect_visible(rect) {
         let t = lit(ui, &response);
-        if let Some(fill) = state_fill(ui, palette, &response) {
+        if let Some(fill) = shell_state_fill(ui, palette, &response) {
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(theme::RADIUS), fill);
         }
@@ -294,9 +304,9 @@ pub fn nav_item(
         // The page you are on wears the same pill a selected playlist in the rail below does,
         // so where you are reads at a glance rather than by comparing font weights.
         let fill = if selected {
-            Some(palette.surface_active)
+            Some(palette.glass(palette.surface_active))
         } else {
-            state_fill(ui, palette, &response)
+            shell_state_fill(ui, palette, &response)
         };
         if let Some(fill) = fill {
             ui.painter()
@@ -371,7 +381,7 @@ impl ArtShape {
 /// never change height when images load.
 pub fn art_placeholder(ui: &Ui, palette: &Palette, rect: Rect, shape: ArtShape) {
     ui.painter()
-        .rect_filled(rect, shape.radius(rect), palette.surface);
+        .rect_filled(rect, shape.radius(rect), palette.glass(palette.surface));
     let g = rect.width() * 0.5;
     // A disc reads as a release; a person outline would read as an artist, but the icon set has no
     // person, so the artist placeholder is simply the empty circle.
@@ -395,8 +405,11 @@ pub fn paint_art(
             let radius = shape.radius(rect);
             // The backing is the placeholder's own colour, never black: a light theme was
             // growing a dark rim wherever the image did not quite reach the rect's edges.
-            ui.painter()
-                .add(egui::Shape::rect_filled(rect, radius, palette.surface));
+            ui.painter().add(egui::Shape::rect_filled(
+                rect,
+                radius,
+                palette.glass(palette.surface),
+            ));
             // Fit, never stretch: a crop that arrives at a different aspect than its slot
             // letterboxes instead of squashing. A square cover in a square slot is unchanged.
             let tex_size = tex.size_vec2();
@@ -1416,9 +1429,11 @@ pub fn skeleton_fill_in(
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         return;
     }
-    ui.painter()
-        .with_clip_rect(clip)
-        .rect_filled(rect, radius, palette.surface_hover);
+    ui.painter().with_clip_rect(clip).rect_filled(
+        rect,
+        radius,
+        palette.glass(palette.surface_hover),
+    );
     // Reduced motion: the shapes alone, still, and no frames asked for.
     if reduced_motion() {
         return;
@@ -1995,12 +2010,15 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         // The selection (a single click in double-click mode) sits under the hover fill, so the
         // marked row reads at rest and the pointer still lights it.
         if selected {
-            ui.painter()
-                .rect_filled(rect, radius, palette.surface_active.gamma_multiply(0.55));
+            ui.painter().rect_filled(
+                rect,
+                radius,
+                palette.glass_state(palette.surface_active, 0.55),
+            );
         }
         if t > 0.001 {
             ui.painter()
-                .rect_filled(rect, radius, palette.surface_hover.gamma_multiply(t));
+                .rect_filled(rect, radius, palette.glass_state(palette.surface_hover, t));
         }
 
         // The row that asked to play shows it loading: over its cover, or — on a page whose
@@ -2278,9 +2296,9 @@ fn add_button(ui: &mut Ui, palette: &Palette, rect: Rect, id: egui::Id) -> egui:
     if ui.is_rect_visible(rect) {
         let t = lit(ui, &response);
         let backing = if held(&response) {
-            Some(palette.surface_active)
+            Some(palette.glass(palette.surface_active))
         } else {
-            (t > 0.001).then(|| palette.surface_hover.gamma_multiply(t))
+            (t > 0.001).then(|| palette.glass_state(palette.surface_hover, t))
         };
         if let Some(fill) = backing {
             ui.painter().circle_filled(rect.center(), 15.0, fill);
@@ -2965,15 +2983,18 @@ pub fn art_card(
         let t = fade(ui, response.id.with("lit"), response.contains_pointer());
         // The single-click selection sits under the hover lift, same as a row's.
         if selected {
-            ui.painter()
-                .rect_filled(rect, radius, palette.surface_active.gamma_multiply(0.55));
+            ui.painter().rect_filled(
+                rect,
+                radius,
+                palette.glass_state(palette.surface_active, 0.55),
+            );
         }
         if t > 0.001 {
             // Lifts: a fill plus a shadow underneath, both fading with the hover.
             ui.painter().add(egui::epaint::RectShape::filled(
                 rect,
                 radius,
-                palette.surface_hover.gamma_multiply(t),
+                palette.glass_state(palette.surface_hover, t),
             ));
         }
         let art = Rect::from_min_size(
@@ -3073,7 +3094,7 @@ pub fn folder_card(
             ui.painter().add(egui::epaint::RectShape::filled(
                 rect,
                 radius,
-                palette.surface_hover.gamma_multiply(t),
+                palette.glass_state(palette.surface_hover, t),
             ));
         }
         let art = Rect::from_min_size(
@@ -3081,7 +3102,7 @@ pub fn folder_card(
             vec2(width - 16.0, card_art_height(width, shape)),
         );
         ui.painter()
-            .rect_filled(art, shape.radius(art), palette.surface);
+            .rect_filled(art, shape.radius(art), palette.glass(palette.surface));
         let g = art.width() * 0.5;
         Icon::Folder
             .image(palette.dim, g)
@@ -3496,7 +3517,7 @@ pub fn icon_chip(ui: &mut Ui, palette: &Palette, icon: Icon, glyph: f32) -> egui
 
     if ui.is_rect_visible(rect) {
         let t = lit(ui, &response);
-        let fill = mix(palette.surface, palette.surface_hover, t);
+        let fill = palette.glass(mix(palette.surface, palette.surface_hover, t));
         let fill = if held(&response) {
             fill.gamma_multiply(0.85)
         } else {
@@ -3551,7 +3572,7 @@ pub fn swatch_chip(
             (mix(palette.text, Color32::WHITE, t * 0.4), palette.window)
         } else {
             (
-                mix(palette.surface, palette.surface_hover, t),
+                palette.glass(mix(palette.surface, palette.surface_hover, t)),
                 mix(palette.secondary, palette.text, t),
             )
         };
@@ -3803,7 +3824,7 @@ pub fn toggle_enabled(
     let (rect, response) = ui.allocate_exact_size(vec2(40.0, 22.0), Sense::hover());
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_with_time(id, *on, 0.12);
-        let track = palette.surface.lerp_to_gamma(palette.dim, t * 0.5);
+        let track = palette.glass(palette.surface.lerp_to_gamma(palette.dim, t * 0.5));
         ui.painter()
             .rect_filled(rect, CornerRadius::same(11), track);
         let r = (rect.height() - 6.0) / 2.0;
@@ -3828,7 +3849,9 @@ pub fn toggle(ui: &mut Ui, palette: &Palette, id: egui::Id, on: &mut bool) -> eg
     }
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_with_time(id, *on, 0.12);
-        let track = palette.surface_hover.lerp_to_gamma(palette.accent, t);
+        let track = palette
+            .glass(palette.surface_hover)
+            .lerp_to_gamma(palette.accent, t);
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(11),
@@ -4039,7 +4062,7 @@ pub fn setting_group(
     let inner = ui.available_width() - 32.0;
     egui::Frame::NONE
         // Between the page and a chip's own fill, so an unselected chip still shows on it.
-        .fill(mix(palette.panel, palette.surface, 0.4))
+        .fill(palette.glass(mix(palette.panel, palette.surface, 0.4)))
         .corner_radius(CornerRadius::same(theme::RADIUS + 4))
         .inner_margin(egui::Margin::symmetric(16, 0))
         .show(ui, |ui| {
@@ -4084,7 +4107,7 @@ fn pill(ui: &mut Ui, palette: &Palette, label: &str, style: PillStyle) -> egui::
                 palette.on_accent,
             ),
             PillStyle::Quiet => (
-                mix(palette.surface, palette.surface_hover, t),
+                palette.glass(mix(palette.surface, palette.surface_hover, t)),
                 mix(palette.secondary, palette.text, t),
             ),
             PillStyle::Selected => (mix(palette.text, Color32::WHITE, t * 0.4), palette.window),
@@ -4094,7 +4117,7 @@ fn pill(ui: &mut Ui, palette: &Palette, label: &str, style: PillStyle) -> egui::
                 if t <= 0.001 {
                     Color32::TRANSPARENT
                 } else {
-                    palette.surface_hover.gamma_multiply(t)
+                    palette.glass_state(palette.surface_hover, t)
                 },
                 mix(palette.text, Color32::WHITE, t * 0.4),
             ),
@@ -4144,9 +4167,9 @@ pub fn rate_button(
     if draw && ui.is_rect_visible(rect) {
         let t = lit(ui, &response);
         let backing = if held(&response) {
-            Some(palette.surface_active)
+            Some(palette.glass(palette.surface_active))
         } else {
-            (t > 0.001).then(|| palette.surface_hover.gamma_multiply(t))
+            (t > 0.001).then(|| palette.glass_state(palette.surface_hover, t))
         };
         if let Some(fill) = backing {
             ui.painter().circle_filled(rect.center(), 15.0, fill);
@@ -4345,7 +4368,7 @@ pub fn seek_bar(
 
     let radius = CornerRadius::same(2);
     ui.painter()
-        .rect_filled(bar, radius, palette.surface_active);
+        .rect_filled(bar, radius, palette.glass(palette.surface_active));
     if fraction > 0.0 {
         ui.painter().rect_filled(
             Rect::from_min_size(bar.min, vec2(bar.width() * fraction, bar.height())),
@@ -4431,7 +4454,7 @@ pub fn slider(
         };
         let radius = CornerRadius::same(2);
         ui.painter()
-            .rect_filled(bar, radius, palette.surface_active);
+            .rect_filled(bar, radius, palette.glass(palette.surface_active));
         ui.painter().rect_filled(
             Rect::from_min_size(bar.min, vec2(bar.width() * t, bar.height())),
             radius,
@@ -4469,7 +4492,7 @@ pub fn volume_slider(ui: &mut Ui, palette: &Palette, volume: f64, unmute_to: f64
     let fraction = (volume / 100.0).clamp(0.0, 1.0) as f32;
     let radius = CornerRadius::same(2);
     ui.painter()
-        .rect_filled(bar, radius, palette.surface_active);
+        .rect_filled(bar, radius, palette.glass(palette.surface_active));
     ui.painter().rect_filled(
         Rect::from_min_size(bar.min, vec2(bar.width() * fraction, bar.height())),
         radius,

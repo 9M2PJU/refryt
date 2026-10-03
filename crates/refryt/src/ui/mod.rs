@@ -1549,7 +1549,7 @@ pub(crate) fn mood_chips<'a>(
                 ui.painter().rect_filled(
                     rect,
                     egui::CornerRadius::same(theme::RADIUS),
-                    widgets::mix(palette.surface, palette.surface_hover, t),
+                    palette.glass(widgets::mix(palette.surface, palette.surface_hover, t)),
                 );
                 match colour {
                     Some([r, g, b]) => {
@@ -3122,7 +3122,7 @@ pub(crate) fn offline_banner(app: &mut crate::app::App, ui: &mut egui::Ui) {
     let (strip, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::hover());
     ui.painter()
-        .rect_filled(strip, egui::CornerRadius::same(18), p.surface);
+        .rect_filled(strip, egui::CornerRadius::same(18), p.glass(p.surface));
     let mut row = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(strip.shrink2(egui::vec2(14.0, 0.0)))

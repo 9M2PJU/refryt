@@ -31,7 +31,7 @@ impl Media {
     pub fn new(ctx: egui::Context, hwnd: Option<u64>) -> Option<Self> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
-        let mut config = PlayerConfig::new("refryt").desktop_entry("refryt");
+        let mut config = PlayerConfig::new("refryt").desktop_entry(crate::flatpak::app_id());
         if let Some(hwnd) = hwnd {
             config = config.hwnd(hwnd);
         }

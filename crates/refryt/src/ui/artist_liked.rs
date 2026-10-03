@@ -255,7 +255,7 @@ fn paint_tiled_cover(
     ui.painter().rect_filled(
         rect,
         widgets::ArtShape::Square.radius(rect),
-        palette.surface,
+        palette.glass(palette.surface),
     );
     for (i, url) in covers.iter().take(4).enumerate() {
         let quarter = egui::Rect::from_min_size(

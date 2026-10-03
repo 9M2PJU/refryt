@@ -405,9 +405,9 @@ fn rail_row(
         let t = widgets::lit(ui, &response);
         if selected || t > 0.001 {
             let fill = if selected {
-                palette.surface_active
+                palette.glass(palette.surface_active)
             } else {
-                palette.surface_hover.gamma_multiply(t)
+                palette.glass_state(palette.surface_hover, t)
             };
             ui.painter()
                 .rect_filled(rect, egui::CornerRadius::same(theme::RADIUS), fill);

@@ -47,6 +47,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    // How long Strict Home Order takes against the live feed, for choosing its time limit:
+    // `REFRYT_HOME_MEASURE=<runs>` runs the ordinary load and then strict loads for a few orders,
+    // `<runs>` times each, and prints only timings and section names. Nothing else is checked.
+    if let Some(runs) = std::env::var("REFRYT_HOME_MEASURE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        measure_home(&api, runs).await;
+        return Ok(());
+    }
+
     // One specific playlist by id, for chasing a shape that only sometimes arrives.
     if let Some(id) = std::env::var_os("REFRYT_PLAYLIST_ID") {
         let id = id.to_string_lossy().into_owned();
@@ -376,7 +387,7 @@ async fn main() -> Result<()> {
 
     // The home feed, the third response we parse ourselves.
     let feed = api
-        .home(None)
+        .home(None, &refryt::model::HomeFetch::Quick)
         .await
         .context("could not load the home feed")?;
     println!();
@@ -477,4 +488,81 @@ async fn main() -> Result<()> {
         bail!("moods parsed but every section is empty");
     }
     Ok(())
+}
+
+/// Time the ordinary Home load against strict ones for a few orders. Prints section names and
+/// timings only.
+async fn measure_home(api: &Api, runs: usize) {
+    use refryt::model::{HomeFetch, HomeSection as S, normalise_order};
+    use std::time::Instant;
+
+    let keys = |first: &[S]| {
+        let mut out: Vec<String> = first.iter().map(|s| s.key().to_owned()).collect();
+        out.extend(
+            S::DEFAULT
+                .iter()
+                .filter(|s| !first.contains(s))
+                .map(|s| s.key().to_owned()),
+        );
+        out
+    };
+    let orders: [(&str, Vec<String>); 3] = [
+        ("default order", keys(&[])),
+        (
+            "mid-feed sections first",
+            keys(&[
+                S::FeaturedPlaylists,
+                S::MusicVideos,
+                S::ForgottenFavorites,
+                S::NewReleases,
+                S::Trending,
+                S::AlbumsForYou,
+                S::FromYourLibrary,
+            ]),
+        ),
+        (
+            "rare sections first",
+            keys(&[
+                S::LongListens,
+                S::LivePerformances,
+                S::FromTheCommunity,
+                S::CoversAndRemixes,
+                S::SimilarTo,
+                S::Themed,
+                S::ForgottenFavorites,
+            ]),
+        ),
+    ];
+
+    for run in 1..=runs {
+        let started = Instant::now();
+        match api.home(None, &HomeFetch::Quick).await {
+            Ok(feed) => println!(
+                "run {run}: ordinary load {:>5} ms, {} shelves",
+                started.elapsed().as_millis(),
+                feed.shelves.len()
+            ),
+            Err(e) => println!("run {run}: ordinary load failed: {e:#}"),
+        }
+        for (name, saved) in &orders {
+            let fetch = HomeFetch::strict(&normalise_order(saved));
+            let HomeFetch::Strict { wanted, .. } = &fetch else {
+                continue;
+            };
+            let started = Instant::now();
+            match api.home(None, &fetch).await {
+                Ok(feed) => {
+                    let seen: Vec<_> = feed.shelves.iter().map(|s| s.home_section()).collect();
+                    let missing: Vec<_> = wanted.iter().filter(|w| !seen.contains(w)).collect();
+                    println!(
+                        "run {run}: strict, {name:<24} {:>5} ms, {:>2} shelves, more after: {}, missing {missing:?}",
+                        started.elapsed().as_millis(),
+                        feed.shelves.len(),
+                        feed.next.is_some(),
+                    );
+                }
+                Err(e) => println!("run {run}: strict, {name}: failed: {e:#}"),
+            }
+        }
+    }
 }

@@ -144,8 +144,15 @@ fn search_field(app: &mut App, ui: &mut Ui, width: f32) {
     ui.painter().rect(
         rect,
         CornerRadius::same((SEARCH_H / 2.0) as u8),
-        widgets::mix(p.surface, p.surface_hover, t),
-        egui::Stroke::new(1.0, if focused { p.outline } else { p.surface }),
+        p.glass(widgets::mix(p.surface, p.surface_hover, t)),
+        egui::Stroke::new(
+            1.0,
+            if focused {
+                p.outline
+            } else {
+                p.glass(p.surface)
+            },
+        ),
         egui::StrokeKind::Inside,
     );
     Icon::Search.image(p.secondary, 16.0).paint_at(
@@ -346,7 +353,7 @@ fn avatar_circle(app: &mut App, ui: &mut Ui, name: Option<&str>) -> egui::Respon
                 ui.painter().circle_filled(
                     rect.center(),
                     d / 2.0,
-                    widgets::mix(p.surface_active, p.accent, t),
+                    p.glass(widgets::mix(p.surface_active, p.accent, t)),
                 );
                 let initial = account
                     .chars()

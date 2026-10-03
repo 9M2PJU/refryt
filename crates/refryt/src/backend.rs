@@ -451,6 +451,31 @@ pub enum Event {
 }
 
 impl Event {
+    /// Whether this event carries what a big response was parsed into: a feed, a library, a page.
+    /// The parse tree behind it is already freed, and the memory it used is worth handing back.
+    fn follows_big_parse(&self) -> bool {
+        matches!(
+            self,
+            Event::HomeLoaded { .. }
+                | Event::HomeMore { .. }
+                | Event::HomeShelfLoaded { .. }
+                | Event::SidebarPlaylists { .. }
+                | Event::LibraryLoaded { .. }
+                | Event::LibraryMore { .. }
+                | Event::LikedPage { .. }
+                | Event::SearchDone { .. }
+                | Event::ScopedSearchDone { .. }
+                | Event::ArtistLoaded { .. }
+                | Event::AlbumLoaded { .. }
+                | Event::PlaylistLoaded { .. }
+                | Event::ExploreLoaded { .. }
+                | Event::ReleasesLoaded { .. }
+                | Event::ChartsLoaded { .. }
+                | Event::MoodsLoaded { .. }
+                | Event::HistoryLoaded { .. }
+        )
+    }
+
     /// Whether this event is a page's content (or a song's lyrics) arriving or failing to, which
     /// is what swaps a skeleton out — for the debug-only `REFRYT_HOLD_LOADING`.
     #[cfg(debug_assertions)]
@@ -1041,10 +1066,15 @@ impl Backend {
     }
 
     fn emit(tx: &Sender<Event>, ctx: &egui::Context, event: Event) {
+        let big = event.follows_big_parse();
         if tx.send(event).is_ok() {
             // Wake the UI thread; without this the result would sit unseen until the next
             // input event.
             ctx.request_repaint();
+        }
+        // The response is parsed and its tree dropped by now; give back what it left behind.
+        if big {
+            crate::memory::trim_after_parse();
         }
     }
 
@@ -1604,10 +1634,10 @@ impl Backend {
         });
     }
 
-    pub fn fetch_home(&self, filter: Option<String>, epoch: u64) {
+    pub fn fetch_home(&self, filter: Option<String>, epoch: u64, fetch: crate::model::HomeFetch) {
         let (api, tx, ctx) = (Arc::clone(&self.api), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
-            let event = match api.home(filter.as_deref()).await {
+            let event = match api.home(filter.as_deref(), &fetch).await {
                 Ok(feed) => Event::HomeLoaded {
                     filter,
                     shelves: feed.shelves,

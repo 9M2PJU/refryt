@@ -111,6 +111,10 @@ pub struct State {
     /// The song the lyrics were last laid out for, so a new song snaps instead of gliding from
     /// the old one's place.
     scroll_key: Option<String>,
+    /// The width the lyrics were last wrapped to. When it changes the lines re-flow and their
+    /// heights change, so the offset is snapped to the active line rather than left pointing at
+    /// where it used to be.
+    wrap_width: f32,
     /// The queue list's scroll offset, content height and viewport height as of its last draw,
     /// written by `upnext::panel`.
     pub queue_scroll: (f32, f32, f32),
@@ -134,6 +138,7 @@ impl Default for State {
             manual: 0.0,
             manual_at: now,
             scroll_key: None,
+            wrap_width: 0.0,
             queue_scroll: (0.0, 0.0, 0.0),
             lyrics_since: None,
         }
@@ -459,28 +464,57 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
         info_text(ui, &p, &m, info, &title, &credits, centre_t);
     }
 
+    // Where the queue drawer sits. The block (cover and lyrics) and the drawer are one group
+    // centred on the screen, so the drawer's margin on the right is the cover's on the left:
+    // laid out with the drawer's room set aside, whichever way the animation is going. It slides
+    // in by its whole width, so its left edge is never over the words it is making room beside.
+    let drawer = (!m.portrait).then(|| {
+        let room = m.drawer_w + m.drawer_gap;
+        let open = Layout::lerp(
+            &layout(screen, &m, false, room, video),
+            &layout(screen, &m, true, room, video),
+            region_t,
+        );
+        drawer_placement(screen, &m, &open, queue_t)
+    });
+
     // The lyrics, fading in over their region; on a vertical screen they fade out as the queue
     // sheet takes the same place.
     if let Some(region) = with.region {
         let alpha = lyrics_t * if m.portrait { 1.0 - queue_t } else { 1.0 };
         if alpha > 0.01 {
+            // Wrapped to the width they will settle at, not the one the drawer is animating
+            // through: a width that changes every frame re-flows the lines every frame, and the
+            // whole column shimmers and jumps. The position still glides; only the wrap is held.
+            let settle = if m.portrait || !app.fs.queue {
+                0.0
+            } else {
+                m.drawer_w + m.drawer_gap
+            };
+            let wrapped = layout(screen, &m, true, settle, video)
+                .region
+                .map_or(region.width(), |r| r.width());
+            let region = Rect::from_min_size(region.min, vec2(wrapped, region.height()));
+            // While the drawer is on its way out the words are wider than the room it has
+            // left; they are revealed as it goes rather than drawn over it.
+            let visible_right = drawer
+                .filter(|_| queue_t > 0.001)
+                .map_or(f32::INFINITY, |(rect, offset)| {
+                    rect.left() + offset.x - m.drawer_gap * 0.5
+                });
             let mut layer = ui.new_child(UiBuilder::new().max_rect(region));
             layer.multiply_opacity(alpha);
-            lyrics_column(app, &mut layer, &m, region, &video_id);
+            lyrics_column(app, &mut layer, &m, region, visible_right, &video_id);
         }
     }
 
     if queue_t > 0.001 {
-        let (rect, offset) = if m.portrait {
-            let region = with.region.unwrap_or(screen);
-            (region, vec2(0.0, (1.0 - queue_t) * 40.0 * m.scale))
-        } else {
-            let right = screen.right() - m.margin;
-            let rect = Rect::from_min_max(
-                pos2(right - m.drawer_w, screen.top() + m.top_band),
-                pos2(right, screen.bottom() - m.bottom_band),
-            );
-            (rect, vec2((1.0 - queue_t) * m.drawer_w * 0.25, 0.0))
+        let (rect, offset) = match drawer {
+            Some(placed) => placed,
+            None => (
+                with.region.unwrap_or(screen),
+                vec2(0.0, (1.0 - queue_t) * 40.0 * m.scale),
+            ),
         };
         queue_region(app, ui, &m, rect.translate(offset), queue_t, |y| {
             background_at(&p, tint, screen, y)
@@ -546,12 +580,17 @@ fn cover_shadow(ui: &egui::Ui, cover: Rect, radius: CornerRadius) {
 }
 
 /// The two ends of the background's wash: the cover's tint over the window colour at the top,
-/// nearly gone at the bottom.
+/// nearly gone at the bottom. Painted at the shell's own opacity, so on a see-through window
+/// the desktop shows through the wash the way it does through the gutter.
 fn wash(p: &theme::Palette, tint: Color32) -> (Color32, Color32) {
     let strength = if p.dark { (0.52, 0.08) } else { (0.34, 0.06) };
     (
-        p.window.lerp_to_gamma(tint, strength.0),
-        p.window.lerp_to_gamma(tint, strength.1),
+        p.window
+            .lerp_to_gamma(tint, strength.0)
+            .gamma_multiply(p.gutter_alpha),
+        p.window
+            .lerp_to_gamma(tint, strength.1)
+            .gamma_multiply(p.gutter_alpha),
     )
 }
 
@@ -563,8 +602,8 @@ fn background_at(p: &theme::Palette, tint: Color32, screen: Rect, y: f32) -> Col
     top.lerp_to_gamma(bottom, t)
 }
 
-/// An opaque base with the cover's tint washing down from the top. Opaque on purpose: this view
-/// covers the desktop edge to edge, and the shell's translucency has nothing to show through to.
+/// A base with the cover's tint washing down from the top. As opaque as the shell is: solid by
+/// default, and see-through (and blurred, where the compositor does that) when the window is.
 fn background(ui: &egui::Ui, p: &theme::Palette, screen: Rect, tint: Color32) {
     let (top, bottom) = wash(p, tint);
     let mut mesh = egui::Mesh::default();
@@ -665,9 +704,25 @@ fn lyrics_skeleton(ui: &mut egui::Ui, p: &theme::Palette, m: &Metrics, rect: Rec
 }
 
 /// The words, large, gliding to keep the line being sung in place.
-fn lyrics_column(app: &mut App, ui: &mut egui::Ui, m: &Metrics, rect: Rect, video_id: &str) {
+/// The lyrics in `rect`, wrapped to its width. `visible_right` is as far right as they may be
+/// seen, which is less than `rect`'s edge only while the queue drawer is still moving over it.
+fn lyrics_column(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    m: &Metrics,
+    rect: Rect,
+    visible_right: f32,
+    video_id: &str,
+) {
     let p = app.palette;
     let ctx = ui.ctx().clone();
+    let visible = Rect::from_min_max(
+        rect.min,
+        pos2(
+            rect.right().min(visible_right).max(rect.left()),
+            rect.bottom(),
+        ),
+    );
     if app.lyrics_loading {
         lyrics_skeleton(ui, &p, m, rect);
         return;
@@ -743,7 +798,11 @@ fn lyrics_column(app: &mut App, ui: &mut egui::Ui, m: &Metrics, rect: Rect, vide
         .unwrap_or(first + rect.height() * (ANCHOR - 0.12));
     let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.05);
     let now = Instant::now();
-    if app.fs.scroll_key.as_deref() != Some(video_id) {
+    // A new wrap width re-flows every line, so offsets measured against the old one point at the
+    // wrong place: snap to the active line, as for a new song, instead of gliding there.
+    let rewrapped = (app.fs.wrap_width - rect.width()).abs() > 0.5;
+    app.fs.wrap_width = rect.width();
+    if app.fs.scroll_key.as_deref() != Some(video_id) || rewrapped {
         app.fs.scroll_key = Some(video_id.to_owned());
         app.fs.scroll = target;
         app.fs.manual = 0.0;
@@ -770,7 +829,7 @@ fn lyrics_column(app: &mut App, ui: &mut egui::Ui, m: &Metrics, rect: Rect, vide
 
     let anchor = rect.top() + rect.height() * ANCHOR;
     let view = app.fs.scroll + app.fs.manual;
-    let painter = ui.painter().with_clip_rect(rect);
+    let painter = ui.painter().with_clip_rect(visible);
     let melt = 90.0 * m.scale;
     let mut clicked = None;
     for (i, galley) in galleys.iter().enumerate() {
@@ -782,7 +841,7 @@ fn lyrics_column(app: &mut App, ui: &mut egui::Ui, m: &Metrics, rect: Rect, vide
         let line_rect = Rect::from_min_size(pos2(rect.left(), top_y), vec2(rect.width(), height));
         let hit = line_rect
             .expand2(vec2(12.0, m.line_gap / 2.0))
-            .intersect(rect);
+            .intersect(visible);
         let response = ui.interact(hit, Id::new(("fs-lyric", i)), Sense::click());
         let mut want = line_alpha(i, active);
         if response.hovered() {
@@ -871,6 +930,35 @@ pub(crate) fn edge_fades(scroll: (f32, f32, f32), fade: f32) -> (f32, f32) {
 }
 
 /// The seek bar and transport along the bottom, the toggles in the top-right corner.
+/// Where the queue drawer sits on a landscape screen, and how far it is still to slide.
+///
+/// `open` is the layout with the drawer's room set aside. The block it holds and the drawer are
+/// one group centred on the screen, so the drawer's margin on the right is the cover's on the
+/// left, whatever the block's width. `offset` carries the whole drawer off the right edge at
+/// `queue_t` 0 and nowhere at 1, so it moves as a unit rather than growing out of its place.
+pub(crate) fn drawer_placement(
+    screen: Rect,
+    m: &Metrics,
+    open: &Layout,
+    queue_t: f32,
+) -> (Rect, egui::Vec2) {
+    let left_margin = open
+        .cover
+        .map(|c| c.left())
+        .or_else(|| open.region.map(|r| r.left()))
+        .unwrap_or(screen.left() + m.margin)
+        - screen.left();
+    let right = screen.right() - left_margin;
+    let rect = Rect::from_min_max(
+        pos2(right - m.drawer_w, screen.top() + m.top_band),
+        pos2(right, screen.bottom() - m.bottom_band),
+    );
+    (
+        rect,
+        vec2((1.0 - queue_t) * (m.drawer_w + left_margin), 0.0),
+    )
+}
+
 fn controls(app: &mut App, ui: &mut egui::Ui, m: &Metrics, bottom: Rect, top: Rect, missing: bool) {
     let p = app.palette;
     let s = m.scale;
@@ -1112,6 +1200,51 @@ mod tests {
             assert!(region.bottom() <= h - m.bottom_band + 0.01);
             assert!(region.height() > 300.0, "{w}x{h}: room for lyrics");
             assert!(l.centred);
+        }
+    }
+
+    /// The block and the open drawer are one group centred on the screen: the drawer's margin on
+    /// the right is the block's on the left, with the room the layout set aside between them,
+    /// with or without lyrics, and the drawer starts fully off screen.
+    #[test]
+    fn the_open_drawer_is_symmetrical_with_the_block() {
+        for (w, h) in [
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+            (1366.0, 768.0),
+            (1100.0, 720.0),
+        ] {
+            let screen = screen(w, h);
+            let m = Metrics::new(screen);
+            let room = m.drawer_w + m.drawer_gap;
+            for with_region in [true, false] {
+                let open = layout(screen, &m, with_region, room, false);
+                let (rect, offset) = drawer_placement(screen, &m, &open, 1.0);
+                assert_eq!(offset, egui::Vec2::ZERO);
+                let block_left = open
+                    .cover
+                    .map(|c| c.left())
+                    .or_else(|| open.region.map(|r| r.left()))
+                    .unwrap();
+                assert!(
+                    ((w - rect.right()) - (block_left - screen.left())).abs() < 0.5,
+                    "{w}x{h} region {with_region}: margins differ"
+                );
+                let block_right = open
+                    .region
+                    .map(|r| r.right())
+                    .or_else(|| open.cover.map(|c| c.right()))
+                    .unwrap();
+                assert!(
+                    rect.left() >= block_right + m.drawer_gap - 0.5,
+                    "{w}x{h} region {with_region}: the drawer crowds the block"
+                );
+                let (rect, offset) = drawer_placement(screen, &m, &open, 0.0);
+                assert!(
+                    rect.left() + offset.x >= screen.right() - 0.5,
+                    "starts on screen"
+                );
+            }
         }
     }
 

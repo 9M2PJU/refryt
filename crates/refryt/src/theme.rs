@@ -61,6 +61,44 @@ pub const UPNEXT_MIN: f32 = 240.0;
 pub const UPNEXT_MAX: f32 = 480.0;
 pub const TITLEBAR_HEIGHT: f32 = 56.0;
 
+/// The narrowest the page card is allowed to get. Home sets a song column no narrower than 340
+/// points and the card pads each side by [`PANEL_RADIUS`]; below this a page reads as a sliver
+/// beside its panels, which is what a queue and lyrics open in a small window used to do to it.
+pub const PAGE_MIN_W: f32 = 400.0;
+/// The narrowest the window goes with no side panel open.
+pub const WINDOW_MIN_W: f32 = 760.0;
+/// The window's least height.
+pub const WINDOW_MIN_H: f32 = 480.0;
+
+/// The width the gutters between the shell's cards take: one on each outer edge and one between
+/// neighbours, so a fourth when the queue/lyrics panel is open.
+fn gutters_w(right_open: bool) -> f32 {
+    GUTTER * if right_open { 4.0 } else { 3.0 }
+}
+
+/// The narrowest window the shell stays readable in. The panels give way to their own floors
+/// first ([`panel_limits`]); this is what is left once they have, and so what the window may be
+/// shrunk to: the old fixed floor, or more while the queue/lyrics panel is open.
+pub fn window_min_width(right_open: bool) -> f32 {
+    let right = if right_open { UPNEXT_MIN } else { 0.0 };
+    (SIDEBAR_MIN + right + PAGE_MIN_W + gutters_w(right_open)).max(WINDOW_MIN_W)
+}
+
+/// The most the sidebar and the right panel may each take in a window `screen_w` wide, so the
+/// page card keeps [`PAGE_MIN_W`]. The right panel yields first, being auxiliary; the sidebar
+/// only once that is at its floor. `sidebar_w` is the sidebar's width as it stands.
+/// Returns `(sidebar_max, right_max)`, each never under its own floor and never over its usual
+/// ceiling (`right_cap` is the panel's own, which also depends on the window).
+pub fn panel_limits(screen_w: f32, sidebar_w: f32, right_open: bool, right_cap: f32) -> (f32, f32) {
+    let room = (screen_w - gutters_w(right_open) - PAGE_MIN_W).max(0.0);
+    let right_floor = if right_open { UPNEXT_MIN } else { 0.0 };
+    let sidebar_max = SIDEBAR_MAX.min(room - right_floor).max(SIDEBAR_MIN);
+    let right_max = right_cap
+        .min(room - sidebar_w.clamp(SIDEBAR_MIN, sidebar_max))
+        .max(UPNEXT_MIN);
+    (sidebar_max, right_max)
+}
+
 /// The gap between panels, through which the window background shows.
 ///
 /// The shell is rounded cards floating on a near-black gutter rather than flat panels divided by
@@ -169,6 +207,12 @@ pub struct Palette {
     pub gutter_alpha: f32,
     /// How opaque a card's own fill paints, given the gutter is already down underneath it.
     pub card_alpha: f32,
+    /// How opaque a small control's fill (a chip, the search pill) paints on the shell. Those
+    /// fills are solid `surface` colours, which on a see-through window read as dark slabs
+    /// pasted over the glass; this lets the backdrop show through them in step with the shell.
+    pub glass_alpha: f32,
+    /// Whether each card is drawn with a thin edge.
+    pub card_outline: bool,
 }
 
 impl Palette {
@@ -196,7 +240,47 @@ impl Palette {
         } else {
             ((card - gutter) / (1.0 - gutter)).clamp(0.0, 1.0)
         };
+        // Down to 0.40 at the sheerest the gutter goes: below that a chip stops reading as a
+        // shape at all, and above it the slab look comes back.
+        let sheer = ((1.0 - gutter) / 0.55).clamp(0.0, 1.0);
+        self.glass_alpha = 1.0 - 0.60 * sheer;
+        // The text tones were tuned against a solid card. With the backdrop showing through, the
+        // faint ones (counts, times, icons) lose the contrast they were chosen for, and nothing
+        // behind the window is known. So the further the shell thins, the closer they sit to
+        // the full text colour.
+        self.dim = self.dim.lerp_to_gamma(self.text, 0.45 * sheer);
+        self.secondary = self.secondary.lerp_to_gamma(self.text, 0.25 * sheer);
         self
+    }
+
+    /// A hover, pressed or selected fill at strength `t`: `base` veiled the way [`Self::glass`]
+    /// veils a resting fill, then scaled by `t`. On an opaque window exactly
+    /// `base.gamma_multiply(t)`, as it always was. The veil goes on first because it blends in
+    /// premultiplied space and wants an opaque colour.
+    pub fn glass_state(&self, base: Color32, t: f32) -> Color32 {
+        self.glass(base).gamma_multiply(t)
+    }
+
+    /// A copy that draws, or leaves out, the thin edge around each card.
+    pub fn with_card_outline(mut self, on: bool) -> Self {
+        self.card_outline = on;
+        self
+    }
+
+    /// The edge colour of a card: the text colour, faint. `None` when outlines are off.
+    pub fn card_edge(&self) -> Option<Color32> {
+        self.card_outline.then(|| self.text.gamma_multiply(0.09))
+    }
+
+    /// A small control's resting fill as painted. Unchanged on an opaque window; on a see-through
+    /// one it is lifted a touch toward the text colour and let through, a frosted veil that keeps
+    /// its shape against the backdrop without sitting on it like a solid piece.
+    pub fn glass(&self, fill: Color32) -> Color32 {
+        if self.glass_alpha >= 1.0 {
+            return fill;
+        }
+        fill.lerp_to_gamma(self.text, 0.12)
+            .gamma_multiply(self.glass_alpha)
     }
 
     /// The window background as painted: the gutter colour at the shell's opacity.
@@ -595,6 +679,96 @@ mod tests {
             let opaque = base.with_opacity(crate::settings::Opacity::OFF);
             assert_eq!(opaque.window_fill(), base.window);
             assert_eq!(opaque.card_fill(), base.panel);
+        }
+    }
+
+    /// The window may not be shrunk below what keeps the page card readable beside the panels the
+    /// shell shows, and the panels give way to their floors before the page does: at any width at
+    /// or above the minimum, the page keeps its floor whatever widths the panels were left at.
+    #[test]
+    fn the_page_keeps_its_floor_while_the_panels_yield() {
+        assert_eq!(window_min_width(false), WINDOW_MIN_W);
+        let with_panel = window_min_width(true);
+        assert!(with_panel > WINDOW_MIN_W, "a panel open needs more room");
+        for right_open in [false, true] {
+            let min_w = window_min_width(right_open);
+            for screen_w in [min_w, min_w + 1.0, 1000.0, 1100.0, 1600.0, 2560.0] {
+                for sidebar in [SIDEBAR_MIN, theme_sidebar(), SIDEBAR_MAX] {
+                    let cap = (screen_w * 0.40).clamp(UPNEXT_MIN, UPNEXT_MAX);
+                    let (sidebar_max, right_max) = panel_limits(screen_w, sidebar, right_open, cap);
+                    assert!(sidebar_max >= SIDEBAR_MIN && right_max >= UPNEXT_MIN);
+                    let sidebar_w = sidebar.clamp(SIDEBAR_MIN, sidebar_max);
+                    let right_w = if right_open { right_max } else { 0.0 };
+                    let page = screen_w - gutters_w(right_open) - sidebar_w - right_w;
+                    assert!(
+                        page >= PAGE_MIN_W - 0.5,
+                        "{screen_w} wide, sidebar {sidebar}, right open {right_open}: page {page}"
+                    );
+                }
+            }
+        }
+        // Roomy: the panels keep their usual ceilings.
+        let (sidebar_max, right_max) = panel_limits(2560.0, 280.0, true, UPNEXT_MAX);
+        assert_eq!((sidebar_max, right_max), (SIDEBAR_MAX, UPNEXT_MAX));
+        // Tight: the right panel gives way first, to its floor, before the sidebar does.
+        let (sidebar_max, right_max) =
+            panel_limits(window_min_width(true), 280.0, true, UPNEXT_MAX);
+        assert_eq!(right_max, UPNEXT_MIN);
+        assert_eq!(sidebar_max, SIDEBAR_MIN);
+    }
+
+    fn theme_sidebar() -> f32 {
+        SIDEBAR_WIDTH
+    }
+
+    /// The glass treatment is for a see-through window only: opaque, every control fill, text
+    /// tone and glass alpha is exactly what the theme says; and the further the shell thins,
+    /// the more see-through a chip gets and the closer the faint text sits to the main colour.
+    #[test]
+    fn glass_follows_the_shell_and_leaves_an_opaque_window_alone() {
+        use crate::settings::Opacity;
+        for (name, css) in custom::BUILTIN {
+            let base = custom::parse(name, css).unwrap().palette();
+            let opaque = base.with_opacity(Opacity::OFF);
+            assert_eq!(opaque.glass_alpha, 1.0);
+            assert_eq!(opaque.glass(base.surface), base.surface);
+            assert_eq!((opaque.dim, opaque.secondary), (base.dim, base.secondary));
+            // A hover fill is what it always was on a solid window, at any strength.
+            for t in [0.0, 0.3, 1.0] {
+                assert_eq!(
+                    opaque.glass_state(base.surface_hover, t),
+                    base.surface_hover.gamma_multiply(t)
+                );
+            }
+            // The outline follows its switch, in either mode.
+            assert!(opaque.card_edge().is_some());
+            assert!(opaque.with_card_outline(false).card_edge().is_none());
+            let sheer = base.with_opacity(Opacity::new(1.0));
+            assert!(sheer.card_edge().is_some());
+            assert!(sheer.with_card_outline(false).card_edge().is_none());
+            // Veiled, a hover fill is never more present than the strength asked for.
+            assert!(sheer.glass_state(base.surface_hover, 1.0).a() < 255);
+
+            let (mut last_glass, mut last_gap) = (1.0, f32::MAX);
+            for sheer in [0.2, 0.5, 0.8, 1.0, Opacity::MAX] {
+                let p = base.with_opacity(Opacity::new(sheer));
+                assert!(
+                    p.glass_alpha < last_glass,
+                    "{name}: glass did not fall at {sheer}"
+                );
+                assert!(p.glass_alpha >= 0.399, "{name}: a chip vanishes at {sheer}");
+                let gap = |c: Color32| {
+                    (0..3)
+                        .map(|i| (c.to_array()[i] as f32 - base.text.to_array()[i] as f32).abs())
+                        .sum::<f32>()
+                };
+                assert!(
+                    gap(p.dim) <= last_gap,
+                    "{name}: dim moved away from text at {sheer}"
+                );
+                last_glass = p.glass_alpha;
+                last_gap = gap(p.dim);
+            }
         }
     }
 

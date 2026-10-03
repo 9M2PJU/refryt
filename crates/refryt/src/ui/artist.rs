@@ -315,7 +315,10 @@ fn hero_header(app: &mut App, ui: &mut egui::Ui) {
             None => {
                 let mut fill = egui::Mesh::default();
                 add_rows(&mut fill, &rows, &mut |_| {
-                    (egui::epaint::WHITE_UV, app.palette.surface)
+                    (
+                        egui::epaint::WHITE_UV,
+                        app.palette.glass(app.palette.surface),
+                    )
                 });
                 painter.add(fill);
             }
@@ -804,7 +807,7 @@ fn you_liked(app: &mut App, ui: &mut egui::Ui) {
             ui.painter().rect_filled(
                 rect.expand2(egui::vec2(8.0, 6.0)),
                 egui::CornerRadius::same(crate::theme::RADIUS),
-                p.surface,
+                p.glass(p.surface),
             );
         }
         let art_rect = egui::Rect::from_min_size(rect.min, egui::vec2(ART, ART));

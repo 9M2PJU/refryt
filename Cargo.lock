@@ -4914,6 +4914,7 @@ dependencies = [
  "gtk",
  "icu_normalizer",
  "image",
+ "libc",
  "libmpv2",
  "libmpv2-sys",
  "lofty",

@@ -124,7 +124,7 @@ fn window_button(ui: &mut Ui, palette: &Palette, icon: Icon, danger: bool) -> eg
             let bg = if danger {
                 palette.danger
             } else {
-                palette.surface_hover
+                palette.glass(palette.surface_hover)
             };
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(theme::RADIUS_SMALL), bg);

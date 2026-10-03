@@ -97,14 +97,14 @@ fn ranked(app: &mut App, ui: &mut egui::Ui, section: &ChartSection) {
                     ui.painter().rect_filled(
                         rect,
                         egui::CornerRadius::same(theme::RADIUS_SMALL),
-                        p.surface_active.gamma_multiply(0.55),
+                        p.glass_state(p.surface_active, 0.55),
                     );
                 }
                 if t > 0.001 {
                     ui.painter().rect_filled(
                         rect,
                         egui::CornerRadius::same(theme::RADIUS_SMALL),
-                        widgets::mix(p.surface, p.surface_hover, t),
+                        p.glass_state(p.surface_hover, t),
                     );
                 }
                 let art_rect =

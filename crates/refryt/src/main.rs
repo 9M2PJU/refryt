@@ -9,6 +9,8 @@ use refryt::{app, mark_start, window_icon};
 
 fn main() -> eframe::Result {
     mark_start();
+    // Before any other thread exists: how glibc treats freed memory (see `memory.rs`).
+    refryt::memory::tune();
 
     refryt::init_tracing("warn,refryt=info");
     // Record a panic before the abort so the next launch can offer it.
@@ -169,9 +171,23 @@ fn main() -> eframe::Result {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Refryt")
-        .with_app_id("refryt")
+        .with_app_id(refryt::flatpak::app_id())
         .with_inner_size([1100.0, 720.0])
-        .with_min_inner_size([760.0, 480.0]);
+        .with_min_inner_size([refryt::theme::WINDOW_MIN_W, refryt::theme::WINDOW_MIN_H]);
+
+    // A test aid for debug builds: `REFRYT_WINDOW_SIZE=800x600` opens at that size, for checking
+    // a layout at a width the window manager will not hand over by itself.
+    #[cfg(debug_assertions)]
+    if let Some((w, h)) = std::env::var("REFRYT_WINDOW_SIZE")
+        .ok()
+        .and_then(|v| {
+            v.split_once('x')
+                .map(|(w, h)| (w.parse::<f32>(), h.parse::<f32>()))
+        })
+        .and_then(|(w, h)| Some((w.ok()?, h.ok()?)))
+    {
+        viewport = viewport.with_inner_size([w, h]);
+    }
 
     // A test aid: open maximized, for checking layouts at full-screen widths.
     if args.iter().any(|a| a == "--maximized") {

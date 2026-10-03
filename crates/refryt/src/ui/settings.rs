@@ -302,6 +302,7 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
     let mut sheer = app.settings.opacity.sheer();
     #[cfg(not(target_os = "windows"))]
     let mut blur = app.settings.blur;
+    let mut card_outline = app.settings.card_outline;
     widgets::setting_group(ui, &p, Some("Window"), |ui, g| {
         #[cfg(not(target_os = "windows"))]
         {
@@ -369,6 +370,16 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
                 },
             );
         }
+        // Outside the block above: a solid window takes the edge too, and Windows has one.
+        toggle_row(
+            g,
+            ui,
+            &p,
+            "setting-card-outline",
+            "Card Outlines",
+            "A thin edge around each panel.",
+            &mut card_outline,
+        );
         toggle_row(
             g,
             ui,
@@ -391,6 +402,7 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
         s.dark_theme = dark_choice;
         s.light_theme = light_choice;
         s.adaptive_art_color = adaptive_art_color;
+        s.card_outline = card_outline;
     });
 }
 
@@ -489,6 +501,7 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
     });
 
     // Which sections come first on Home: a window of its own, since it is a list to drag about.
+    let mut strict = app.settings.home_strict_order;
     widgets::setting_group(ui, &p, Some("Home"), |ui, g| {
         g.row(
             ui,
@@ -497,6 +510,15 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
             |ui| {
                 open_order = widgets::outline_button(ui, &p, "Change…").clicked();
             },
+        );
+        toggle_row(
+            g,
+            ui,
+            &p,
+            "setting-home-strict",
+            "Strict Home Order",
+            "Waits longer for Home so your top sections come first. Gives up after a few seconds.",
+            &mut strict,
         );
     });
     if open_order {
@@ -507,6 +529,7 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
     app.update_settings(&ctx, |s| {
         s.double_click_to_play = double_click;
         s.playlist_default_sort = playlist_sort;
+        s.home_strict_order = strict;
     });
 
     local_music(app, ui);
@@ -572,16 +595,20 @@ fn system(app: &mut App, ui: &mut egui::Ui) {
         "Closing hides to the tray instead of quitting."
     };
     widgets::setting_group(ui, &p, Some("Desktop"), |ui, g| {
+        // Not inside a Flatpak: its autostart entry would land in the sandbox's own config
+        // folder, where nothing reads it.
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        toggle_row(
-            g,
-            ui,
-            &p,
-            "setting-start-on-boot",
-            "Launch on Startup",
-            "Opens refryt when you log in.",
-            &mut start_on_boot,
-        );
+        if !crate::flatpak::sandboxed() {
+            toggle_row(
+                g,
+                ui,
+                &p,
+                "setting-start-on-boot",
+                "Launch on Startup",
+                "Opens refryt when you log in.",
+                &mut start_on_boot,
+            );
+        }
         toggle_row(
             g,
             ui,
@@ -660,7 +687,10 @@ fn sign_in(app: &mut App, ui: &mut egui::Ui) {
         });
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         window_sign_in(app, ui, g);
-        browser_import(app, ui, g);
+        // The sandbox cannot read a browser's profile folder, so there would be nothing to find.
+        if !crate::flatpak::sandboxed() {
+            browser_import(app, ui, g);
+        }
     });
 }
 

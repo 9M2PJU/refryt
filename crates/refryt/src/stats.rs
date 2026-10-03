@@ -42,6 +42,9 @@ pub struct Snapshot {
     pub inflight: usize,
     pub rows_drawn: usize,
     pub rows_total: usize,
+    /// The glyph atlas's width and height in pixels: 4 bytes a pixel in memory, and again on the
+    /// GPU, and nothing else here sees it.
+    pub atlas: [usize; 2],
 }
 
 impl Snapshot {
@@ -49,7 +52,7 @@ impl Snapshot {
     pub fn print(&self) {
         println!(
             "stats frame_ms={:.2} fps={} textures={} texture_bytes={} inflight={} \
-             rows_drawn={} rows_total={}",
+             rows_drawn={} rows_total={} atlas={}x{}",
             self.frame_ms,
             self.fps,
             self.textures,
@@ -57,6 +60,8 @@ impl Snapshot {
             self.inflight,
             self.rows_drawn,
             self.rows_total,
+            self.atlas[0],
+            self.atlas[1],
         );
     }
 }
@@ -126,7 +131,7 @@ impl Stats {
         self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32 * 1000.0
     }
 
-    pub fn snapshot(&self, images: &crate::images::Images) -> Snapshot {
+    pub fn snapshot(&self, ctx: &egui::Context, images: &crate::images::Images) -> Snapshot {
         Snapshot {
             frame_ms: self.mean_frame_ms(),
             fps: self.fps,
@@ -135,6 +140,7 @@ impl Stats {
             inflight: images.inflight(),
             rows_drawn: self.rows_drawn,
             rows_total: self.rows_total,
+            atlas: ctx.fonts(|f| f.font_image_size()),
         }
     }
 
@@ -143,13 +149,14 @@ impl Stats {
         if !self.enabled {
             return;
         }
-        let s = self.snapshot(images);
+        let s = self.snapshot(ui.ctx(), images);
         let mb = |b: usize| b as f32 / (1024.0 * 1024.0);
         let lines = [
             format!("{:.2} ms   {} fps", s.frame_ms, s.fps),
             format!("{} textures   {:.1} MB", s.textures, mb(s.texture_bytes)),
             format!("{} fetches in flight", s.inflight),
             format!("rows {} / {}", s.rows_drawn, s.rows_total),
+            format!("glyph atlas {}x{}", s.atlas[0], s.atlas[1]),
         ];
 
         let font = theme::regular(11.0);

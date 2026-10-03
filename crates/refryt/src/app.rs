@@ -24,9 +24,53 @@ use crate::widgets;
 /// only by an explicit submit — see `App::submit_search`.
 const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(120);
 
-/// While audio is playing the progress bar needs to move. Four times a second is enough to look
-/// continuous and is two orders of magnitude cheaper than repainting every frame.
-const PLAYING_REPAINT: Duration = Duration::from_millis(250);
+/// While audio is playing the progress bar and the clock need to move, and a frame is also what
+/// notices a track end (the player is polled, not evented). The quick tick is for the moments
+/// those matter at a finer grain than a second; the rest of the time a frame a second is enough.
+const PLAYING_FAST_REPAINT: Duration = Duration::from_millis(250);
+
+/// How long before a track's end the quick tick takes over, so the next song starts about as
+/// promptly as it did when every tick was quick.
+const TRACK_END_WINDOW: f64 = 3.0;
+
+/// What decides when the next frame is due while a song plays.
+#[derive(Clone, Copy, Debug)]
+struct PlayingTick {
+    /// Seconds into the track.
+    position: f64,
+    /// The track's length in seconds; zero or less when not known.
+    duration: f64,
+    /// Whether this attempt has been seen playing yet. Until it has, a quick tick lets the stall
+    /// guard tell a track that played briefly from one that never started.
+    seen_playing: bool,
+    /// Seconds at which the next synced lyric line starts, when lyrics are on screen.
+    next_lyric: Option<f64>,
+    /// The window is minimised or hidden behind others: nothing it paints is seen.
+    hidden: bool,
+}
+
+/// When to ask for the next frame while a song plays. A frame a second, on the second so the
+/// clock and the bar move together, or earlier for a lyric line that starts sooner; a quick tick
+/// at the start of an attempt and near the track's end, where promptness is behaviour and not
+/// looks. Hidden, it relaxes to two seconds, still waking for the track's end.
+fn playing_repaint_after(t: PlayingTick) -> Duration {
+    let remaining = t.duration - t.position;
+    if !t.seen_playing || t.duration <= 0.0 || remaining <= TRACK_END_WINDOW {
+        return PLAYING_FAST_REPAINT;
+    }
+    let slow = if t.hidden { 2.0 } else { 1.0 };
+    // To the next whole second, a hair past it so the frame lands after the clock has ticked.
+    let to_second = (1.0 - t.position.fract()) + 0.02;
+    let mut wait = if t.hidden { slow } else { to_second };
+    if !t.hidden
+        && let Some(at) = t.next_lyric
+    {
+        wait = wait.min((at - t.position).max(0.0) + 0.02);
+    }
+    // Never later than the quick-tick window opens, so the end is not slept through.
+    wait = wait.min((remaining - TRACK_END_WINDOW).max(0.0) + 0.02);
+    Duration::from_secs_f64(wait.clamp(0.05, slow))
+}
 
 /// How many "previous" steps the transport remembers within one queue. Enough to retrace a few
 /// songs, not the whole session. The entries are `(index, queue length)` — cheap — because the
@@ -291,6 +335,10 @@ impl Load {
 }
 
 /// How old the home feed may get before a visit to Home reloads it.
+/// How often the window is asked to grow to the shell's minimum before giving up: a compositor may
+/// ignore the first asks, and one that never complies must not be asked for ever.
+const WINDOW_FIT_TRIES: u8 = 12;
+
 const HOME_STALE: Duration = Duration::from_secs(30 * 60);
 
 /// Whether a feed fetched at `loaded_at` is due a refresh by `now`. A feed with no time is
@@ -1175,7 +1223,9 @@ pub struct App {
     /// The themes folder as last read. Settings lists these; `settings.custom_theme` picks one.
     pub(crate) custom_themes: theme::custom::Themes,
     /// Raised by the folder watcher when a theme file is added, removed or saved.
-    themes_changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    theme_watch: theme::custom::Watcher,
+    /// Whether the window had focus on the last frame, to notice it coming back.
+    was_focused: bool,
     history: History,
     pub(crate) decorated: bool,
     startup_timing: bool,
@@ -1245,6 +1295,12 @@ pub struct App {
     panel_save: [u8; 2],
     /// The panels' widths have been set from Settings this session. See `seed_panel_widths`.
     panels_seeded: bool,
+    /// The window minimum width last asked of the compositor, so a change is sent once, not every
+    /// frame. See `fit_window_to_shell`.
+    min_window_w: f32,
+    /// How many times the window has been asked to grow to `min_window_w` since that last changed;
+    /// at [`WINDOW_FIT_TRIES`] it is done, wide enough or not.
+    window_fit_tries: u8,
     /// Which kind of result the search page is filtered to. `All` is a view over `results`
     /// (never a second request); every other scope drives a dedicated per-category fetch, since
     /// the mixed ranked response often surfaces far fewer of that kind than actually exist — see
@@ -1761,7 +1817,7 @@ impl App {
             settings.opacity = crate::settings::Opacity::OFF;
             settings.blur = false;
         }
-        let themes_changed = theme::custom::watch(cc.egui_ctx.clone());
+        let theme_watch = theme::custom::Watcher::new();
         let palette = settings.palette(&cc.egui_ctx, &custom_themes);
         theme::apply(&cc.egui_ctx, &palette);
         let blur = crate::blur::Blur::new(cc);
@@ -1788,7 +1844,8 @@ impl App {
         let mut app = Self {
             palette,
             custom_themes,
-            themes_changed,
+            theme_watch,
+            was_focused: true,
             // Open on Home, as YouTube Music does — it is a real feed now rather than a page we
             // assembled. `--search` starts on Search, and `--page` overrides both.
             history: History::new(match (page, search.is_some()) {
@@ -1829,6 +1886,8 @@ impl App {
             panel_dragging: [false; 2],
             panel_save: [0; 2],
             panels_seeded: false,
+            min_window_w: theme::WINDOW_MIN_W,
+            window_fit_tries: 0,
             search_scope: SearchScope::default(),
             scoped_results: Vec::new(),
             scoped_loading: false,
@@ -2161,10 +2220,13 @@ impl App {
     /// Re-read the themes folder when the watcher saw it change, repainting if the theme on
     /// screen is among what changed. Cheap to call every frame: one atomic load at rest.
     fn reload_custom_themes(&mut self, ctx: &egui::Context) {
-        if !self
-            .themes_changed
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
+        // The way back from an editor: the window is focused again, so look at the folder.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        if focused && !self.was_focused {
+            self.theme_watch.check();
+        }
+        self.was_focused = focused;
+        if !self.theme_watch.take_changed() {
             return;
         }
         let themes = theme::custom::load();
@@ -2198,6 +2260,7 @@ impl App {
             || self.settings.dark_theme != before.dark_theme
             || self.settings.light_theme != before.light_theme
             || self.settings.opacity != before.opacity
+            || self.settings.card_outline != before.card_outline
         {
             self.repaint_palette(ctx);
         }
@@ -2906,6 +2969,10 @@ impl App {
     /// new visit has begun. The shelves on screen are deliberately kept: a revisit refreshes
     /// underneath the old list rather than showing the loading skeleton again.
     fn note_route_entered(&mut self) {
+        // Settings is where the themes folder is offered, so what is in it is looked at fresh.
+        if matches!(self.current_route(), Route::Settings) {
+            self.theme_watch.check();
+        }
         if matches!(self.current_route(), Route::Home) {
             self.refresh_home_if_stale();
         }
@@ -3161,14 +3228,30 @@ impl App {
     /// signed-out response, there is nothing here to retry it once the real session settles.
     /// `ensure_route_loaded` runs every frame, so this simply tries again once `Checking`
     /// resolves either way.
+    /// How far a Home load follows the feed: the strict plan when the listener turned on Strict
+    /// Home Order and this is the default feed (a mood's shelves are never ordered), else the
+    /// ordinary few pages.
+    fn home_fetch(&self) -> crate::model::HomeFetch {
+        if self.settings.home_strict_order && self.home_filter.is_none() {
+            crate::model::HomeFetch::strict(&crate::model::normalise_order(
+                &self.settings.home_order,
+            ))
+        } else {
+            crate::model::HomeFetch::Quick
+        }
+    }
+
     fn load_home(&mut self) {
         if matches!(self.auth, crate::auth::AuthState::Checking) {
             return;
         }
         if self.home.is_none() && self.home_error.is_none() && !self.home_loading {
             self.home_loading = true;
-            self.backend
-                .fetch_home(self.home_filter.clone(), self.account_epoch);
+            self.backend.fetch_home(
+                self.home_filter.clone(),
+                self.account_epoch,
+                self.home_fetch(),
+            );
         }
     }
 
@@ -3222,8 +3305,11 @@ impl App {
         tracing::info!("home feed is stale; refreshing it");
         self.home_refreshing = true;
         self.home_loading = true;
-        self.backend
-            .fetch_home(self.home_filter.clone(), self.account_epoch);
+        self.backend.fetch_home(
+            self.home_filter.clone(),
+            self.account_epoch,
+            self.home_fetch(),
+        );
     }
 
     /// The full list behind a Home shelf's "Show all", when the shelf names where to get it.
@@ -3267,8 +3353,11 @@ impl App {
         self.home_error = None;
         self.home_loading = true;
         self.scroll_to_top = true;
-        self.backend
-            .fetch_home(self.home_filter.clone(), self.account_epoch);
+        self.backend.fetch_home(
+            self.home_filter.clone(),
+            self.account_epoch,
+            self.home_fetch(),
+        );
     }
 
     fn artist_is_for(&self, id: &str) -> bool {
@@ -3596,6 +3685,85 @@ impl App {
             // record is dropped and `default_size` decides.
             d.remove::<egui::containers::panel::PanelState>(queue_id);
         });
+    }
+
+    /// Keep the window from being shrunk past what the shell can hold: its least width is the
+    /// old fixed floor, or more while the queue/lyrics panel is open, and a window already
+    /// narrower than that grows to it rather than leaving the page squeezed to a sliver. A
+    /// maximized or fullscreen window is left to the compositor.
+    fn fit_window_to_shell(&mut self, ctx: &egui::Context, right_open: bool) {
+        let min_w = theme::window_min_width(right_open);
+        if (self.min_window_w - min_w).abs() >= 0.5 {
+            self.min_window_w = min_w;
+            self.window_fit_tries = 0;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                min_w,
+                theme::WINDOW_MIN_H,
+            )));
+        }
+        if self.window_fit_tries >= WINDOW_FIT_TRIES {
+            return;
+        }
+        let (size, maximized, fullscreen) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                i.raw.screen_rect.map(|r| r.size()),
+                v.maximized.unwrap_or(false),
+                v.fullscreen.unwrap_or(false),
+            )
+        });
+        let Some(size) = size else { return };
+        if size.x >= min_w - 0.5 || maximized || fullscreen {
+            self.window_fit_tries = WINDOW_FIT_TRIES;
+            return;
+        }
+        // The compositor may not take a size before the window is first configured, so ask a few
+        // times, a moment apart, until the window is as wide as it needs to be.
+        self.window_fit_tries += 1;
+        tracing::debug!(
+            width = size.x,
+            min_w,
+            "growing the window to fit the panels"
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(min_w, size.y)));
+        ctx.request_repaint_after(Duration::from_millis(120));
+    }
+
+    /// Bring a panel back to the width the listener chose once the window has room for it again.
+    /// egui clamps a panel into its range every frame and keeps the clamped width, so after a
+    /// narrow spell a panel would stay narrow; this puts it back, and never fights a drag.
+    fn restore_panel_width(
+        &self,
+        ctx: &egui::Context,
+        name: &str,
+        preferred: f32,
+        range: std::ops::RangeInclusive<f32>,
+    ) {
+        use egui::containers::panel::PanelState;
+        let id = egui::Id::new(name);
+        if ctx
+            .read_response(id.with("__resize"))
+            .is_some_and(|r| r.dragged())
+        {
+            return;
+        }
+        let want = preferred.clamp(*range.start(), *range.end());
+        let Some(state) = PanelState::load(ctx, id) else {
+            return;
+        };
+        if state.size().x + 4.0 < want {
+            ctx.data_mut(|d| {
+                d.insert_persisted(
+                    id,
+                    PanelState {
+                        outer_rect: egui::Rect::from_min_size(
+                            state.outer_rect.min,
+                            egui::vec2(want, state.outer_rect.height()),
+                        ),
+                    },
+                );
+            });
+        }
     }
 
     /// Save a panel's width to Settings when a drag of its edge ends. egui keeps the width in
@@ -5504,6 +5672,20 @@ impl App {
         }
     }
 
+    /// The second at which the next synced lyric line starts, when lyrics are on screen: what a
+    /// slow frame rate has to wake for, or the highlight would trail the singer by up to a second.
+    fn next_lyric_at(&self, position: f64) -> Option<f64> {
+        let lyrics = self.lyrics.as_ref().filter(|l| l.synced)?;
+        if !self.lyrics_wanted() {
+            return None;
+        }
+        lyrics
+            .lines
+            .iter()
+            .map(|l| l.at_ms as f64 / 1000.0)
+            .find(|at| *at > position)
+    }
+
     /// Whether anything on screen shows lyrics: the side panel, or the fullscreen view's column.
     fn lyrics_wanted(&self) -> bool {
         self.lyrics_open || (self.fs.open && self.fs.lyrics)
@@ -7034,6 +7216,12 @@ impl eframe::App for App {
                 egui::Frame::NONE
                     .fill(fill)
                     .corner_radius(egui::CornerRadius::same(theme::PANEL_RADIUS))
+                    // A hairline gives a card an edge to tell it from the gutter beside it, which
+                    // a see-through one otherwise lacks. A setting, on by default.
+                    .stroke(
+                        p.card_edge()
+                            .map_or(egui::Stroke::NONE, |c| egui::Stroke::new(1.0, c)),
+                    )
                     .inner_margin(margin)
             };
             let g = theme::GUTTER as i8;
@@ -7062,11 +7250,30 @@ impl eframe::App for App {
             // the cue here; the line is switched off for the panels' edges and the panels' own
             // contents get the ordinary style back.
             self.seed_panel_widths(&ctx);
+            // How narrow the window is allowed to be, and how much of it the two panels may take:
+            // they give way before the page card drops under its floor (`theme::panel_limits`).
+            let right_open = self.upnext_open || self.lyrics_open;
+            self.fit_window_to_shell(&ctx, right_open);
+            let screen_w = ctx.input(|i| i.raw.screen_rect.map_or(0.0, |r| r.width()));
+            let sidebar_pref = self.settings.sidebar_width.unwrap_or(theme::SIDEBAR_WIDTH);
+            let right_cap = (screen_w * 0.40).clamp(theme::UPNEXT_MIN, theme::UPNEXT_MAX);
+            let (sidebar_max, right_max) = theme::panel_limits(
+                screen_w,
+                sidebar_pref.clamp(theme::SIDEBAR_MIN, theme::SIDEBAR_MAX),
+                right_open,
+                right_cap,
+            );
+            self.restore_panel_width(
+                &ctx,
+                "sidebar",
+                sidebar_pref,
+                theme::SIDEBAR_MIN..=sidebar_max,
+            );
             let widgets = ui.visuals().widgets.clone();
             quiet_panel_edges(ui);
             egui::Panel::left("sidebar")
-                .default_size(self.settings.sidebar_width.unwrap_or(theme::SIDEBAR_WIDTH))
-                .size_range(theme::SIDEBAR_MIN..=theme::SIDEBAR_MAX)
+                .default_size(sidebar_pref.min(sidebar_max))
+                .size_range(theme::SIDEBAR_MIN..=sidebar_max)
                 .resizable(true)
                 .show_separator_line(false)
                 .frame(
@@ -7112,7 +7319,13 @@ impl eframe::App for App {
                     .panel_width
                     .unwrap_or(theme::UPNEXT_WIDTH.min(screen_w * 0.30))
                     .max(theme::UPNEXT_MIN);
-                let queue_max = (screen_w * 0.40).clamp(theme::UPNEXT_MIN, theme::UPNEXT_MAX);
+                let queue_max = right_max;
+                self.restore_panel_width(
+                    &ctx,
+                    "right-panel",
+                    queue_w,
+                    theme::UPNEXT_MIN..=queue_max,
+                );
                 let show_queue = self.upnext_open;
                 let show_lyrics = self.lyrics_open;
                 // The card insets: a small side padding, and none top or bottom — content runs to
@@ -7358,7 +7571,17 @@ impl eframe::App for App {
             // Loading asks for no frames of its own here: the skeletons and the loading ring each
             // ask for theirs while they are on screen, and background work shows nothing.
             if self.playback_started && !state.paused {
-                ctx.request_repaint_after(PLAYING_REPAINT);
+                let hidden = ctx.input(|i| {
+                    let v = i.viewport();
+                    v.occluded.unwrap_or(false) || v.minimized.unwrap_or(false)
+                });
+                ctx.request_repaint_after(playing_repaint_after(PlayingTick {
+                    position: state.position,
+                    duration: state.duration,
+                    seen_playing: self.stall.played_any,
+                    next_lyric: self.next_lyric_at(state.position),
+                    hidden,
+                }));
             }
         }
         // A pending stall reload needs a frame at its due time; nothing else will ask for one.
@@ -7450,7 +7673,7 @@ impl eframe::App for App {
             && crate::elapsed_since_start() >= after
         {
             self.stats_after = None;
-            self.stats.snapshot(&self.images).print();
+            self.stats.snapshot(&ctx, &self.images).print();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if self.stats_after.is_some() {
@@ -7473,6 +7696,93 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
+    fn tick(position: f64) -> PlayingTick {
+        PlayingTick {
+            position,
+            duration: 200.0,
+            seen_playing: true,
+            next_lyric: None,
+            hidden: false,
+        }
+    }
+
+    fn near(a: Duration, secs: f64) -> bool {
+        (a.as_secs_f64() - secs).abs() < 0.001
+    }
+
+    /// While a song plays the next frame lands just past the next whole second, so the clock and
+    /// the bar change together, and never later than a second away.
+    #[test]
+    fn a_playing_frame_is_due_on_the_next_second() {
+        assert!(near(playing_repaint_after(tick(10.3)), 0.72));
+        assert!(near(playing_repaint_after(tick(10.0)), 1.02f64.min(1.0)));
+        // Just before a boundary the wait never drops below 50 ms.
+        assert!(near(playing_repaint_after(tick(10.99)), 0.05));
+    }
+
+    /// The quick tick covers what a slow one would break: an attempt not yet seen playing (the
+    /// stall guard tells "played briefly" from "never started" by what a frame saw), the last
+    /// seconds of a track (the next song starts as promptly as before), and a length not known.
+    #[test]
+    fn the_quick_tick_covers_the_start_the_end_and_the_unknown() {
+        let mut t = tick(1.2);
+        t.seen_playing = false;
+        assert_eq!(playing_repaint_after(t), PLAYING_FAST_REPAINT);
+        assert_eq!(playing_repaint_after(tick(197.5)), PLAYING_FAST_REPAINT);
+        assert_eq!(playing_repaint_after(tick(200.0)), PLAYING_FAST_REPAINT);
+        let mut unknown = tick(50.0);
+        unknown.duration = 0.0;
+        assert_eq!(playing_repaint_after(unknown), PLAYING_FAST_REPAINT);
+        // Hidden does not excuse the end: a track must still advance.
+        let mut hidden = tick(198.0);
+        hidden.hidden = true;
+        assert_eq!(playing_repaint_after(hidden), PLAYING_FAST_REPAINT);
+    }
+
+    /// A lyric line that starts before the next second pulls the frame forward to it, one later
+    /// than that changes nothing, and a hidden window ignores lyrics and waits two seconds.
+    #[test]
+    fn a_lyric_line_pulls_the_frame_forward_and_hidden_relaxes_it() {
+        let mut t = tick(10.3);
+        t.next_lyric = Some(10.5);
+        assert!(near(playing_repaint_after(t), 0.22));
+        t.next_lyric = Some(14.0);
+        assert!(near(playing_repaint_after(t), 0.72));
+        t.hidden = true;
+        t.next_lyric = Some(10.5);
+        assert!(near(playing_repaint_after(t), 2.0));
+    }
+
+    /// Played out frame by frame, a 200-second song takes about 200 frames — not the 800 a quick
+    /// tick took — and no gap in the last three seconds is longer than the quick tick.
+    #[test]
+    fn a_whole_song_takes_a_frame_a_second_and_wakes_for_its_end() {
+        let (mut position, mut frames, mut worst_gap_at_end) = (0.0f64, 0u32, 0.0f64);
+        let mut seen = false;
+        while position < 200.0 {
+            let wait = playing_repaint_after(PlayingTick {
+                position,
+                duration: 200.0,
+                seen_playing: seen,
+                next_lyric: None,
+                hidden: false,
+            })
+            .as_secs_f64();
+            if position >= 197.0 {
+                worst_gap_at_end = worst_gap_at_end.max(wait);
+            }
+            position += wait;
+            frames += 1;
+            seen = seen || position > 0.5;
+        }
+        assert!(frames < 260, "{frames} frames for 200 s");
+        assert!(frames > 190, "{frames} frames: the bar would stall");
+        assert!(
+            worst_gap_at_end <= 0.2501,
+            "gap {worst_gap_at_end} near the end"
+        );
+    }
+
     use super::*;
 
     fn artist(id: &str) -> Route {

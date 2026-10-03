@@ -26,7 +26,8 @@ const EDGE_SPEED: f32 = 9.0;
 pub(crate) const DISCLAIMER: &str = "Home may not always follow this exactly. YouTube chooses \
 which sections you get and sends them in batches. A section that arrives late is added below \
 what is already on screen, so the page does not jump around while you read, and shelves we do \
-not recognise go under Everything else.";
+not recognise go under Everything else. Strict Home Order, in Settings, waits longer so fewer \
+arrive late.";
 
 fn row_height(section: HomeSection) -> f32 {
     if section.hint().is_some() {
