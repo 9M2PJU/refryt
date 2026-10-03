@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.gridoe.refryt</id>
+  <name>Refryt</name>
+  <summary>A fast, native YouTube Music client</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <url type="homepage">https://github.com/gridoe/refryt</url>
+  <url type="bugtracker">https://github.com/gridoe/refryt/issues</url>
+  <description>
+    <p>Refryt is a YouTube Music client that is a native program rather than a web page. It plays through mpv, shows synced lyrics, and downloads songs for Premium accounts.</p>
+  </description>
+  <launchable type="desktop-id">io.github.gridoe.refryt.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.6" date="2026-10-01"/>
+  </releases>
+</component>

@@ -19,3 +19,10 @@
 *.session
 *cookie*.txt
 .env
+
+# The Flatpak build's own state and the pieces its script fetches.
+/packaging/flatpak/.flatpak-builder/
+/packaging/flatpak/build-dir/
+/packaging/flatpak/repo/
+/packaging/flatpak/shared-modules/
+/packaging/flatpak/yt-dlp

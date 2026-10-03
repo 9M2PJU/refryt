@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Refryt
+GenericName=Music Player
+Comment=A fast, native YouTube Music client
+Exec=refryt
+Icon=io.github.gridoe.refryt
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;youtube;player;
+StartupNotify=true
