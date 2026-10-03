@@ -915,6 +915,29 @@ pub(crate) fn paint_corner_notches(ui: &Ui, card: egui::Rect, inset_x: f32, pale
         }
         painter.add(mesh);
     }
+    // The notches cover the card's corner pixels, the outline's among them.
+    redraw_outline_after_notches(ui, card, palette);
+}
+
+/// Put a solid card's outline back after the corner notches have covered its corner pixels.
+///
+/// The card's frame draws its edge before the page, and the notches are painted after it in the
+/// gutter's colour, so each corner's arc comes out broken. The edge is drawn once more, over the
+/// whole card, in the opaque colour the frame's translucent one blends to over the card, so the
+/// straight edges come out as they were and the corners are whole. Nothing when outlines are off.
+fn redraw_outline_after_notches(ui: &Ui, card: egui::Rect, palette: &Palette) {
+    if palette.card_edge().is_none() {
+        return;
+    }
+    let edge = palette
+        .panel
+        .lerp_to_gamma(palette.text, crate::theme::CARD_EDGE_STRENGTH);
+    egui::Painter::new(ui.ctx().clone(), ui.layer_id(), card).rect_stroke(
+        card,
+        CornerRadius::same(crate::theme::PANEL_RADIUS),
+        egui::Stroke::new(1.0, edge),
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// What a scrolling line remembers between frames. Lives in egui's temp storage under the

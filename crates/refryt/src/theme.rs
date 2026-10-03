@@ -67,6 +67,8 @@ pub const TITLEBAR_HEIGHT: f32 = 56.0;
 pub const PAGE_MIN_W: f32 = 400.0;
 /// The narrowest the window goes with no side panel open.
 pub const WINDOW_MIN_W: f32 = 760.0;
+/// How strong a card's edge is: the share of the text colour it is drawn in.
+pub const CARD_EDGE_STRENGTH: f32 = 0.09;
 /// The window's least height.
 pub const WINDOW_MIN_H: f32 = 480.0;
 
@@ -269,7 +271,8 @@ impl Palette {
 
     /// The edge colour of a card: the text colour, faint. `None` when outlines are off.
     pub fn card_edge(&self) -> Option<Color32> {
-        self.card_outline.then(|| self.text.gamma_multiply(0.09))
+        self.card_outline
+            .then(|| self.text.gamma_multiply(CARD_EDGE_STRENGTH))
     }
 
     /// A small control's resting fill as painted. Unchanged on an opaque window; on a see-through
