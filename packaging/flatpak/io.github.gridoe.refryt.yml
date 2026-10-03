@@ -28,8 +28,9 @@ finish-args:
   # Discord Rich Presence connects to Discord's IPC socket.
   - --filesystem=xdg-run/discord-ipc-0
   - --filesystem=xdg-run/app/com.discordapp.Discord:create
-  # Folders added under Settings -> Library -> Local files.
-  - --filesystem=xdg-music:ro
+  # Downloads are written to ~/Music/refryt, so Music needs write access, not only read access;
+  # it is also where Settings -> Library -> Local files looks.
+  - --filesystem=xdg-music
   - --filesystem=xdg-download
 
 build-options:
