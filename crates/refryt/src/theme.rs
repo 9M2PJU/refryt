@@ -58,9 +58,11 @@ pub const SIDEBAR_MAX: f32 = 400.0;
 /// Its card is 64 wide and the 8 pt padding leaves 48, the width of a nav pill with its icon
 /// 24 pt in, so the icon is centred without being moved, and room for a 44 pt cover.
 pub const SIDEBAR_RAIL: f32 = 72.0;
-/// Where a dragged sidebar stops being a sidebar and becomes the rail: halfway between the two.
-/// Below this it already draws the rail, and lets go as one.
-pub const SIDEBAR_SNAP_AT: f32 = (SIDEBAR_RAIL + SIDEBAR_MIN) / 2.0;
+/// Where a dragged sidebar stops being a sidebar and becomes the rail. Below this it already draws
+/// the rail, and lets go as one. Close to the rail's own width rather than halfway to the minimum:
+/// at 136 the icons sat centred in a card still twice the rail's width, a layout that only made
+/// sense once the sidebar was nearly as narrow as the rail it was turning into.
+pub const SIDEBAR_SNAP_AT: f32 = 100.0;
 
 /// Whether a sidebar `panel_w` wide, margin included, is drawn as the icon rail.
 pub fn sidebar_is_rail(panel_w: f32) -> bool {
@@ -752,11 +754,12 @@ mod tests {
     /// the halfway point, and what is drawn while dragging agrees with what it snaps to.
     #[test]
     fn a_dragged_sidebar_snaps_to_the_rail_or_to_its_minimum() {
-        assert_eq!(SIDEBAR_SNAP_AT, 136.0);
+        assert_eq!(SIDEBAR_SNAP_AT, 100.0);
         assert_eq!(snap_sidebar_width(SIDEBAR_RAIL), SIDEBAR_RAIL);
-        assert_eq!(snap_sidebar_width(100.0), SIDEBAR_RAIL);
+        assert_eq!(snap_sidebar_width(90.0), SIDEBAR_RAIL);
         assert_eq!(snap_sidebar_width(SIDEBAR_SNAP_AT - 0.5), SIDEBAR_RAIL);
         assert_eq!(snap_sidebar_width(SIDEBAR_SNAP_AT), SIDEBAR_MIN);
+        assert_eq!(snap_sidebar_width(136.0), SIDEBAR_MIN);
         assert_eq!(snap_sidebar_width(170.0), SIDEBAR_MIN);
         assert_eq!(snap_sidebar_width(SIDEBAR_MIN), SIDEBAR_MIN);
         assert_eq!(
@@ -766,7 +769,17 @@ mod tests {
         );
         assert_eq!(snap_sidebar_width(SIDEBAR_MAX), SIDEBAR_MAX);
         // Drawn as the rail exactly when it snaps to the rail.
-        for w in [SIDEBAR_RAIL, 90.0, 135.9, 136.0, 170.0, 200.0, 280.0, 400.0] {
+        for w in [
+            SIDEBAR_RAIL,
+            90.0,
+            99.9,
+            100.0,
+            136.0,
+            170.0,
+            200.0,
+            280.0,
+            400.0,
+        ] {
             assert_eq!(
                 sidebar_is_rail(w),
                 snap_sidebar_width(w) == SIDEBAR_RAIL,
