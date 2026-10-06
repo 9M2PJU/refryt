@@ -67,6 +67,12 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
             title(ui, &p);
             let mut clicked = None;
             for (i, line) in lyrics.lines.iter().enumerate() {
+                // The gap goes before each line but the first, not after each: after the last
+                // one it was blank space below the lyrics, inside a card whose content runs to
+                // its bottom edge.
+                if i > 0 {
+                    ui.add_space(4.0);
+                }
                 let is_active = Some(i) == active;
                 let font = if is_active {
                     theme::semibold(15.0)
@@ -115,7 +121,6 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                         Some(egui::Align::Center),
                     );
                 }
-                ui.add_space(4.0);
             }
             clicked
         })
