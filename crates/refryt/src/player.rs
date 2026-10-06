@@ -102,11 +102,34 @@ impl Player {
                 format!("ytdl_hook-ytdl_path={}", crate::backend::yt_dlp_program()),
             )?;
             init.set_property("terminal", "no")?;
+            // mpv's PipeWire output asks for the graph's own step, 1024 samples (21 ms), and is
+            // woken for every one: about 47 times a second per thread for as long as a song
+            // plays, and a window the sound server cannot make bigger on its own. Asking for
+            // 45 ms halves those wakeups (118 to 70 a second for the whole process, measured) and
+            // costs 24 ms of latency, which a pause, a seek or the volume slider never shows.
+            // The step is ours to bound: a bigger ask (250) is granted in full on a stock
+            // PipeWire and would make those controls lag. mpv built without PipeWire, or
+            // playing through PulseAudio, has no such option, and the failure is the answer.
+            #[cfg(target_os = "linux")]
+            let _ = init.set_property("pipewire-buffer", "45");
             // Diagnostic hatch for the video path, whose failures mpv reports only in its own
             // log: point `REFRYT_MPV_LOG` at a file to capture it.
             if let Ok(path) = std::env::var("REFRYT_MPV_LOG") {
                 let _ = init.set_property("log-file", path);
                 let _ = init.set_property("msg-level", "all=v");
+            }
+            // A test aid for debug builds: `REFRYT_MPV_OPTS="pipewire-buffer=200,audio-buffer=0.4"`
+            // sets those mpv options, to try an audio setting without a rebuild.
+            #[cfg(debug_assertions)]
+            for pair in std::env::var("REFRYT_MPV_OPTS")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|p| !p.is_empty())
+            {
+                if let Some((name, value)) = pair.split_once('=') {
+                    let set = init.set_property(name, value);
+                    tracing::info!(name, value, ok = set.is_ok(), "REFRYT_MPV_OPTS");
+                }
             }
             Ok(())
         })
