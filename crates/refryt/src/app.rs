@@ -1139,6 +1139,32 @@ enum PanelEdge {
     Queue,
 }
 
+impl PanelEdge {
+    /// The panel's egui id, which its stored width and its drag handle hang off.
+    fn name(self) -> &'static str {
+        match self {
+            PanelEdge::Sidebar => "sidebar",
+            PanelEdge::Queue => "right-panel",
+        }
+    }
+
+    /// Where this panel's drag state is kept (`panel_dragging`, `panel_save`).
+    fn slot(self) -> usize {
+        match self {
+            PanelEdge::Sidebar => 0,
+            PanelEdge::Queue => 1,
+        }
+    }
+}
+
+/// The width to put a panel back to, if any: what the listener chose, when the panel is more than a
+/// few points narrower than it. Never while the panel is `settling`, the drag that set its width
+/// has not finished or Settings does not hold the result yet: the old width is still the saved one
+/// then, and putting it back undid every shrink.
+fn restored_width(current: f32, want: f32, settling: bool) -> Option<f32> {
+    (!settling && current + 4.0 < want).then_some(want)
+}
+
 /// Switch off the line egui draws along a resizable panel's edge under the pointer and while
 /// dragging: it reads those two strokes from the parent's style, so blanking them there removes
 /// it without touching anything drawn inside the panels.
@@ -3823,23 +3849,26 @@ impl App {
     fn restore_panel_width(
         &self,
         ctx: &egui::Context,
-        name: &str,
+        edge: PanelEdge,
         preferred: f32,
         range: std::ops::RangeInclusive<f32>,
     ) {
         use egui::containers::panel::PanelState;
-        let id = egui::Id::new(name);
+        let id = egui::Id::new(edge.name());
         if ctx
             .read_response(id.with("__resize"))
             .is_some_and(|r| r.dragged())
         {
             return;
         }
+        // A drag that has just ended is still being saved (`remember_panel_width`): until it is,
+        // the preference is the width from before it.
+        let settling = self.panel_dragging[edge.slot()] || self.panel_save[edge.slot()] > 0;
         let want = preferred.clamp(*range.start(), *range.end());
         let Some(state) = PanelState::load(ctx, id) else {
             return;
         };
-        if state.size().x + 4.0 < want {
+        if let Some(want) = restored_width(state.size().x, want, settling) {
             ctx.data_mut(|d| {
                 d.insert_persisted(
                     id,
@@ -3857,11 +3886,8 @@ impl App {
     /// Save a panel's width to Settings when a drag of its edge ends. egui keeps the width in
     /// its own memory too, but that is a cache it may drop; Settings is the record.
     fn remember_panel_width(&mut self, ctx: &egui::Context, edge: PanelEdge) {
-        let (name, slot) = match edge {
-            PanelEdge::Sidebar => ("sidebar", 0),
-            PanelEdge::Queue => ("right-panel", 1),
-        };
-        let id = egui::Id::new(name);
+        let slot = edge.slot();
+        let id = egui::Id::new(edge.name());
         // The drag handle egui registers for the edge: `<panel id>.with("__resize")`.
         let dragging = ctx
             .read_response(id.with("__resize"))
@@ -7359,7 +7385,7 @@ impl eframe::App for App {
             );
             self.restore_panel_width(
                 &ctx,
-                "sidebar",
+                PanelEdge::Sidebar,
                 sidebar_pref,
                 theme::SIDEBAR_MIN..=sidebar_max,
             );
@@ -7416,7 +7442,7 @@ impl eframe::App for App {
                 let queue_max = right_max;
                 self.restore_panel_width(
                     &ctx,
-                    "right-panel",
+                    PanelEdge::Queue,
                     queue_w,
                     theme::UPNEXT_MIN..=queue_max,
                 );
@@ -8422,6 +8448,51 @@ mod tests {
         // is not really a playlist item, which the server call has nothing to identify it by.
         let mut items = vec![track("a"), playlist_track("b")];
         assert!(reorder_tracks(&mut items, 0, 1).is_none());
+    }
+
+    /// A panel dragged narrower stays where it was let go. The width is only saved a frame or two
+    /// after the release, so on the first frames the preference is still the old, wider one, and
+    /// restoring it put the sidebar straight back.
+    #[test]
+    fn a_panel_just_dragged_narrower_is_not_restored() {
+        assert_eq!(
+            restored_width(200.0, 280.0, true),
+            None,
+            "settling after the release"
+        );
+        assert_eq!(
+            restored_width(200.0, 200.0, false),
+            None,
+            "saved: the preference is the new width"
+        );
+    }
+
+    /// What the restore is for: a window that was too narrow squeezed the panel, and now has room.
+    #[test]
+    fn a_panel_the_window_squeezed_comes_back() {
+        assert_eq!(restored_width(240.0, 288.0, false), Some(288.0));
+        assert_eq!(restored_width(283.9, 288.0, false), Some(288.0));
+    }
+
+    /// Within a few points, and wider than wanted, is left alone.
+    #[test]
+    fn a_panel_close_to_or_over_its_width_is_left_alone() {
+        assert_eq!(
+            restored_width(284.0, 288.0, false),
+            None,
+            "exactly the margin"
+        );
+        assert_eq!(restored_width(288.0, 288.0, false), None);
+        assert_eq!(restored_width(340.0, 280.0, false), None, "dragged wider");
+    }
+
+    /// The edge names and slots the drag state is kept under are distinct and stable.
+    #[test]
+    fn each_panel_edge_has_its_own_name_and_slot() {
+        assert_eq!(PanelEdge::Sidebar.name(), "sidebar");
+        assert_eq!(PanelEdge::Queue.name(), "right-panel");
+        assert_ne!(PanelEdge::Sidebar.slot(), PanelEdge::Queue.slot());
+        assert!(PanelEdge::Sidebar.slot() < 2 && PanelEdge::Queue.slot() < 2);
     }
 
     /// The bug this fixes: `ViewportCommand::Visible` is a documented no-op on Wayland (winit's
