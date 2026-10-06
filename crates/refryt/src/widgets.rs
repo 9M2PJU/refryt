@@ -830,6 +830,19 @@ pub(crate) fn card_rect(inner: egui::Rect, inset: egui::Margin) -> egui::Rect {
     )
 }
 
+/// Lay `add_contents` out in `rect`, a card's content area, so that it can never make the card
+/// taller.
+///
+/// A card is a `Frame`, and a frame is as tall as what is laid out in it. A page that is not in
+/// a scroll area — a loader's placeholder rows and shelves, in a window shorter than they are —
+/// ran past the card, the frame went with it, and its rounded bottom corners ended up below the
+/// clip, leaving the fill square. In a child that is only handed `rect`, the content spills past
+/// the bottom and the clip cuts it, as it does a scrolled page, and the frame stays the card.
+pub(crate) fn contain<R>(ui: &mut Ui, rect: Rect, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
+    add_contents(&mut child)
+}
+
 /// How far in from a card's top and bottom edge the rounded silhouette meets the content
 /// column `inset_x` in from its sides. Content kept at least this far from both edges never
 /// reaches outside the silhouette.
@@ -4898,6 +4911,36 @@ mod tests {
             paint_corner_notches(ui, card, 8.0, &acrylic);
         });
         assert!(meshes.is_empty(), "no notches over a translucent gutter");
+    }
+
+    /// A card's frame is as tall as its content, so content taller than the card must not reach
+    /// the card's own `Ui`: contained, it overflows its child and the parent stays as it was.
+    #[test]
+    fn contained_content_cannot_grow_the_card() {
+        let ctx = egui::Context::default();
+        let mut seen = None;
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            if seen.is_some() {
+                return;
+            }
+            let max = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(300.0, 100.0));
+            let mut loose = ui.new_child(egui::UiBuilder::new().max_rect(max));
+            loose.allocate_space(vec2(300.0, 500.0));
+            let mut card = ui.new_child(egui::UiBuilder::new().max_rect(max));
+            let inner = contain(&mut card, max, |ui| {
+                ui.allocate_space(vec2(300.0, 500.0));
+                ui.min_rect().bottom()
+            });
+            seen = Some((loose.min_rect().bottom(), card.min_rect().bottom(), inner));
+        });
+        frame.textures_delta.clear();
+        let (loose, card, inner) = seen.expect("the pass ran");
+        assert!(loose >= 500.0, "without it the card grows: {loose}");
+        assert!(card <= 100.0, "contained, the card stays put: {card}");
+        assert!(
+            inner >= 500.0,
+            "the content itself is not squeezed: {inner}"
+        );
     }
 
     /// The translucent clip stops exactly where the notch rows do, so no content the opaque

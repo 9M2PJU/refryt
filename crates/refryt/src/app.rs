@@ -7525,26 +7525,31 @@ impl eframe::App for App {
                     // Last frame's answer: the page draws after the banner, and a page that is itself
                     // the offline screen says it in full, so the strip would only repeat it.
                     let offline_page = std::mem::take(&mut self.offline_page_shown);
-                    if self.offline && !offline_page {
-                        ui::offline_banner(self, ui);
-                    }
-                    match route {
-                        Route::Search => ui::search::page(self, ui),
-                        Route::Explore => ui::explore::page(self, ui),
-                        Route::NewReleases => ui::releases::page(self, ui),
-                        Route::Charts(_) => ui::charts::page(self, ui),
-                        Route::Moods => ui::moods::page(self, ui),
-                        Route::HomeShelf(title) => ui::home::shelf_page(self, ui, &title),
-                        Route::History => ui::history::page(self, ui),
-                        Route::Home => ui::home::page(self, ui),
-                        Route::Library => ui::library::page(self, ui),
-                        Route::Settings => ui::settings::page(self, ui),
-                        Route::Artist(_) => ui::artist::page(self, ui),
-                        Route::ArtistLiked(_) => ui::artist_liked::page(self, ui),
-                        Route::Album(_) => ui::album::page(self, ui),
-                        Route::Playlist(_) => ui::playlist::page(self, ui),
-                        Route::Mood(_) => ui::mood::page(self, ui),
-                    }
+                    // The page lays out inside the card and no taller: a loader is not in a scroll
+                    // area, and a frame as tall as its content grew past the card, taking its
+                    // rounded bottom corners out of the clip.
+                    widgets::contain(ui, top, |ui| {
+                        if self.offline && !offline_page {
+                            ui::offline_banner(self, ui);
+                        }
+                        match route {
+                            Route::Search => ui::search::page(self, ui),
+                            Route::Explore => ui::explore::page(self, ui),
+                            Route::NewReleases => ui::releases::page(self, ui),
+                            Route::Charts(_) => ui::charts::page(self, ui),
+                            Route::Moods => ui::moods::page(self, ui),
+                            Route::HomeShelf(title) => ui::home::shelf_page(self, ui, &title),
+                            Route::History => ui::history::page(self, ui),
+                            Route::Home => ui::home::page(self, ui),
+                            Route::Library => ui::library::page(self, ui),
+                            Route::Settings => ui::settings::page(self, ui),
+                            Route::Artist(_) => ui::artist::page(self, ui),
+                            Route::ArtistLiked(_) => ui::artist_liked::page(self, ui),
+                            Route::Album(_) => ui::album::page(self, ui),
+                            Route::Playlist(_) => ui::playlist::page(self, ui),
+                            Route::Mood(_) => ui::mood::page(self, ui),
+                        }
+                    });
                     // The card's rounded corners, painted after the page: content runs to the card's
                     // own top and bottom edges, and the part of it outside the rounded silhouette is
                     // covered with the gutter. The video view returns above — its frame is already
