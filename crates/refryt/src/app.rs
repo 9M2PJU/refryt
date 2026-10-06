@@ -7406,9 +7406,14 @@ impl eframe::App for App {
                 )
                 .show(ui, |ui| {
                     ui.visuals_mut().widgets = widgets.clone();
-                    self.remember_panel_width(&ctx, PanelEdge::Sidebar);
                     ui::sidebar::sidebar(self, ui)
                 });
+            // After the panel is laid out, not inside it: egui stores a panel's width when the
+            // panel has been shown, so from inside, the release of a drag was seen a pass early
+            // and the width read was the one from before it. The correct width then only reached
+            // Settings on a later pass, and an app that went idle or was closed in between kept
+            // the old one.
+            self.remember_panel_width(&ctx, PanelEdge::Sidebar);
             ui.visuals_mut().widgets = widgets.clone();
 
             egui::Panel::top("topbar")
