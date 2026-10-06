@@ -287,12 +287,15 @@ pub fn skeleton_play_button(ui: &Ui, palette: &Palette, rect: Rect) {
 /// No pill behind the selected one — selection is carried by weight and colour alone, which is
 /// what keeps a rail of three from reading as a row of buttons. Hover still gets a fill, because
 /// a target that does not answer the pointer feels dead.
+///
+/// `compact` is the icon rail: the icon at the pill's centre and the name only as a tooltip.
 pub fn nav_item(
     ui: &mut Ui,
     palette: &Palette,
     icon: Icon,
     label: &str,
     selected: bool,
+    compact: bool,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         vec2(ui.available_width(), theme::NAV_HEIGHT),
@@ -319,11 +322,21 @@ pub fn nav_item(
             mix(palette.secondary, palette.text, t)
         };
         let nudge = press_offset(&response);
-        let icon_rect = Rect::from_center_size(
-            rect.left_center() + vec2(24.0, 0.0) + nudge,
-            vec2(22.0, 22.0),
-        );
+        // The icon rail has no room for the name: the icon sits at the pill's centre, which in a
+        // full-width pill is not where it goes (24 pt in), and the name moves into a tooltip.
+        let icon_at = if compact {
+            rect.center()
+        } else {
+            rect.left_center() + vec2(24.0, 0.0)
+        };
+        let icon_rect = Rect::from_center_size(icon_at + nudge, vec2(22.0, 22.0));
         icon.image(fg, 22.0).paint_at(ui, icon_rect);
+        if compact {
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            return response.on_hover_text(label);
+        }
 
         let font = if selected {
             theme::bold(15.0)

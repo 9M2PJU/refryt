@@ -1157,6 +1157,27 @@ impl PanelEdge {
     }
 }
 
+/// Write a panel's stored width: where egui's own record of it is changed, and the next pass lays
+/// the panel out at it.
+fn set_panel_width(ctx: &egui::Context, id: egui::Id, width: f32) {
+    use egui::containers::panel::PanelState;
+    let Some(state) = PanelState::load(ctx, id) else {
+        return;
+    };
+    ctx.data_mut(|d| {
+        d.insert_persisted(
+            id,
+            PanelState {
+                outer_rect: egui::Rect::from_min_size(
+                    state.outer_rect.min,
+                    egui::vec2(width, state.outer_rect.height()),
+                ),
+            },
+        );
+    });
+    ctx.request_repaint();
+}
+
 /// The width to put a panel back to, if any: what the listener chose, when the panel is more than a
 /// few points narrower than it. Never while the panel is `settling`, the drag that set its width
 /// has not finished or Settings does not hold the result yet: the old width is still the saved one
@@ -3869,17 +3890,7 @@ impl App {
             return;
         };
         if let Some(want) = restored_width(state.size().x, want, settling) {
-            ctx.data_mut(|d| {
-                d.insert_persisted(
-                    id,
-                    PanelState {
-                        outer_rect: egui::Rect::from_min_size(
-                            state.outer_rect.min,
-                            egui::vec2(want, state.outer_rect.height()),
-                        ),
-                    },
-                );
-            });
+            set_panel_width(ctx, id, want);
         }
     }
 
@@ -3904,7 +3915,16 @@ impl App {
         else {
             return;
         };
-        let width = (width * 2.0).round() / 2.0;
+        let mut width = (width * 2.0).round() / 2.0;
+        // The sidebar is the icon rail or at least its old minimum, never a width between where
+        // the names are cut to a few letters: let go in that gap and it settles at the nearer.
+        if matches!(edge, PanelEdge::Sidebar) {
+            let snapped = theme::snap_sidebar_width(width);
+            if (snapped - width).abs() >= 0.5 {
+                set_panel_width(ctx, id, snapped);
+            }
+            width = snapped;
+        }
         self.update_settings(ctx, |s| match edge {
             PanelEdge::Sidebar => s.sidebar_width = Some(width),
             PanelEdge::Queue => s.panel_width = Some(width),
@@ -7379,7 +7399,7 @@ impl eframe::App for App {
             let right_cap = (screen_w * 0.40).clamp(theme::UPNEXT_MIN, theme::UPNEXT_MAX);
             let (sidebar_max, right_max) = theme::panel_limits(
                 screen_w,
-                sidebar_pref.clamp(theme::SIDEBAR_MIN, theme::SIDEBAR_MAX),
+                sidebar_pref.clamp(theme::SIDEBAR_RAIL, theme::SIDEBAR_MAX),
                 right_open,
                 right_cap,
             );
@@ -7387,13 +7407,13 @@ impl eframe::App for App {
                 &ctx,
                 PanelEdge::Sidebar,
                 sidebar_pref,
-                theme::SIDEBAR_MIN..=sidebar_max,
+                theme::SIDEBAR_RAIL..=sidebar_max,
             );
             let widgets = ui.visuals().widgets.clone();
             quiet_panel_edges(ui);
             egui::Panel::left("sidebar")
                 .default_size(sidebar_pref.min(sidebar_max))
-                .size_range(theme::SIDEBAR_MIN..=sidebar_max)
+                .size_range(theme::SIDEBAR_RAIL..=sidebar_max)
                 .resizable(true)
                 .show_separator_line(false)
                 .frame(

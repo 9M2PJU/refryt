@@ -51,9 +51,31 @@ pub const ROW_NUMBER_W: f32 = 26.0;
 pub const ROW_NUMBER_GAP: f32 = 12.0;
 pub const PLAYER_BAR_HEIGHT: f32 = 88.0;
 pub const SIDEBAR_WIDTH: f32 = 280.0;
-/// How far the sidebar can be dragged either way.
+/// How far the sidebar can be dragged either way, as a sidebar with names in it.
 pub const SIDEBAR_MIN: f32 = 200.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
+/// The sidebar folded down to an icon rail: the nav icons and the playlists' covers, nothing else.
+/// Its card is 64 wide and the 8 pt padding leaves 48, the width of a nav pill with its icon
+/// 24 pt in, so the icon is centred without being moved, and room for a 44 pt cover.
+pub const SIDEBAR_RAIL: f32 = 72.0;
+/// Where a dragged sidebar stops being a sidebar and becomes the rail: halfway between the two.
+/// Below this it already draws the rail, and lets go as one.
+pub const SIDEBAR_SNAP_AT: f32 = (SIDEBAR_RAIL + SIDEBAR_MIN) / 2.0;
+
+/// Whether a sidebar `panel_w` wide, margin included, is drawn as the icon rail.
+pub fn sidebar_is_rail(panel_w: f32) -> bool {
+    panel_w < SIDEBAR_SNAP_AT
+}
+
+/// The width a dragged sidebar settles at when let go: the rail, or at least [`SIDEBAR_MIN`]. The
+/// widths between are where the names are cut to a few letters, so none is kept.
+pub fn snap_sidebar_width(w: f32) -> f32 {
+    if sidebar_is_rail(w) {
+        SIDEBAR_RAIL
+    } else {
+        w.max(SIDEBAR_MIN)
+    }
+}
 pub const UPNEXT_WIDTH: f32 = 288.0;
 /// The queue/lyrics panel's drag range. The floor is what the lyrics need to set a line without
 /// breaking every other word; the ceiling is further capped at 40% of the window.
@@ -158,6 +180,8 @@ pub const HEADER_TOP_PAD: f32 = PAGE_INSET_X;
 
 /// A rail row: cover, title, author.
 pub const RAIL_ROW_HEIGHT: f32 = 60.0;
+/// A row of the icon rail: just the cover, and a little air round it.
+pub const RAIL_ROW_HEIGHT_COMPACT: f32 = 52.0;
 /// Cover size on a rail row.
 pub const RAIL_ART_SIZE: f32 = 44.0;
 /// A sidebar nav row — Home, Search, Library.
@@ -722,6 +746,50 @@ mod tests {
 
     fn theme_sidebar() -> f32 {
         SIDEBAR_WIDTH
+    }
+
+    /// A sidebar is the rail or at least its old minimum: dragging snaps to one of the two, at
+    /// the halfway point, and what is drawn while dragging agrees with what it snaps to.
+    #[test]
+    fn a_dragged_sidebar_snaps_to_the_rail_or_to_its_minimum() {
+        assert_eq!(SIDEBAR_SNAP_AT, 136.0);
+        assert_eq!(snap_sidebar_width(SIDEBAR_RAIL), SIDEBAR_RAIL);
+        assert_eq!(snap_sidebar_width(100.0), SIDEBAR_RAIL);
+        assert_eq!(snap_sidebar_width(SIDEBAR_SNAP_AT - 0.5), SIDEBAR_RAIL);
+        assert_eq!(snap_sidebar_width(SIDEBAR_SNAP_AT), SIDEBAR_MIN);
+        assert_eq!(snap_sidebar_width(170.0), SIDEBAR_MIN);
+        assert_eq!(snap_sidebar_width(SIDEBAR_MIN), SIDEBAR_MIN);
+        assert_eq!(
+            snap_sidebar_width(280.0),
+            280.0,
+            "a roomy sidebar is left alone"
+        );
+        assert_eq!(snap_sidebar_width(SIDEBAR_MAX), SIDEBAR_MAX);
+        // Drawn as the rail exactly when it snaps to the rail.
+        for w in [SIDEBAR_RAIL, 90.0, 135.9, 136.0, 170.0, 200.0, 280.0, 400.0] {
+            assert_eq!(
+                sidebar_is_rail(w),
+                snap_sidebar_width(w) == SIDEBAR_RAIL,
+                "{w}"
+            );
+        }
+        // And it is never snapped to something the panel cannot be.
+        const { assert!(SIDEBAR_RAIL < SIDEBAR_SNAP_AT && SIDEBAR_SNAP_AT < SIDEBAR_MIN) };
+    }
+
+    /// The rail's content column holds a nav pill with its icon at the pill's own centre and a
+    /// whole cover, so neither has to be moved to fit.
+    #[test]
+    fn the_rail_holds_a_nav_pill_and_a_cover() {
+        let content = SIDEBAR_RAIL - GUTTER - 2.0 * CARD_INSET_X;
+        assert_eq!(content, 48.0);
+        assert!(RAIL_ART_SIZE <= content);
+        assert_eq!(
+            content / 2.0,
+            24.0,
+            "the icon's offset in a full-width nav pill"
+        );
+        const { assert!(RAIL_ROW_HEIGHT_COMPACT > RAIL_ART_SIZE) };
     }
 
     /// The glass treatment is for a see-through window only: opaque, every control fill, text

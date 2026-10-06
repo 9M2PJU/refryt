@@ -23,11 +23,15 @@ pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
     let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
     let _edge = widgets::CardEdge::new(ui, card, &app.palette);
     widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &app.palette);
+    // Folded down to the icon rail: icons and covers only. Decided from the width as it is drawn,
+    // so a sidebar being dragged narrower turns into the rail as it passes the snap point, and
+    // lets go as one.
+    let rail = theme::sidebar_is_rail(card.width() + theme::GUTTER);
     // Claimed first, so the scrolling middle gets whatever is left rather than pushing it off.
     if app.player_error.is_some() {
         egui::Panel::bottom("sidebar-footer")
             .frame(egui::Frame::NONE)
-            .show(ui, |ui| audio_warning(app, ui));
+            .show(ui, |ui| audio_warning(app, ui, rail));
     }
 
     ui.add_space(8.0);
@@ -39,12 +43,12 @@ pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
         (Route::Library, Icon::Library, "Library"),
     ] {
         let selected = app.current_route() == route;
-        if widgets::nav_item(ui, &app.palette, icon, label, selected).clicked() {
+        if widgets::nav_item(ui, &app.palette, icon, label, selected, rail).clicked() {
             app.navigate(route);
         }
     }
 
-    playlists(app, ui);
+    playlists(app, ui, rail);
     // The card's rounded corners, over everything the rail drew: nav rows and playlist rows
     // both run to the card's top and bottom edges now.
     widgets::paint_corner_notches(ui, card, theme::CARD_INSET_X, &app.palette);
@@ -52,10 +56,23 @@ pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
 
 /// Only shown when playback could not start: libmpv never came up, or an attempt stalled until
 /// its retries ran out. The rail does not reserve space for a message that almost never appears.
-fn audio_warning(app: &mut App, ui: &mut egui::Ui) {
+fn audio_warning(app: &mut App, ui: &mut egui::Ui, rail: bool) {
     let Some(err) = app.player_error.clone() else {
         return;
     };
+    if rail {
+        // No room for the message: a warning sign, with the message on hover.
+        ui.add_space(8.0);
+        ui.vertical_centered(|ui| {
+            let (rect, response) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
+            Icon::CircleAlert
+                .image(app.palette.danger, 22.0)
+                .paint_at(ui, Rect::from_center_size(rect.center(), vec2(22.0, 22.0)));
+            response.on_hover_text(format!("Audio unavailable: {err}"));
+        });
+        ui.add_space(8.0);
+        return;
+    }
     ui.add_space(10.0);
     ui.label(
         egui::RichText::new("AUDIO UNAVAILABLE")
@@ -77,31 +94,44 @@ fn audio_warning(app: &mut App, ui: &mut egui::Ui) {
 /// as a nav item and once over chips that duplicated the page that item opens — and the chips now
 /// live on the Library page where they belong. No divider either; the card's own edge is the
 /// separation, which is what the divider was doing badly.
-fn playlists(app: &mut App, ui: &mut egui::Ui) {
+fn playlists(app: &mut App, ui: &mut egui::Ui, rail: bool) {
     ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        // The + button's box, not the label's line, is the row's height — otherwise the
-        // button hangs below the label instead of centering against it.
-        ui.set_min_height(32.0);
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("Playlists")
-                .font(theme::semibold(13.0))
-                .color(app.palette.secondary),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if widgets::icon_button(ui, &app.palette, Icon::Plus, 18.0, false).clicked() {
-                // A toggle: the popup is a window, and the same press must be able to
-                // dismiss it.
-                let open = app.new_playlist.is_some();
-                app.new_playlist = if open { None } else { Some(String::new()) };
-                app.new_playlist_kind = crate::app::NewPlaylistKind::YouTube;
+    if rail {
+        // No heading to carry: just the + , centred over the covers.
+        ui.vertical_centered(|ui| {
+            let plus = widgets::icon_button(ui, &app.palette, Icon::Plus, 18.0, false);
+            if plus.on_hover_text("New playlist").clicked() {
+                toggle_new_playlist(app);
             }
         });
-    });
+    } else {
+        ui.horizontal(|ui| {
+            // The + button's box, not the label's line, is the row's height — otherwise the
+            // button hangs below the label instead of centering against it.
+            ui.set_min_height(32.0);
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Playlists")
+                    .font(theme::semibold(13.0))
+                    .color(app.palette.secondary),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::icon_button(ui, &app.palette, Icon::Plus, 18.0, false).clicked() {
+                    toggle_new_playlist(app);
+                }
+            });
+        });
+    }
     ui.add_space(4.0);
     new_playlist_popup(app, ui);
-    rail_list(app, ui);
+    rail_list(app, ui, rail);
+}
+
+/// A toggle: the popup is a window, and the same press must be able to dismiss it.
+fn toggle_new_playlist(app: &mut App) {
+    let open = app.new_playlist.is_some();
+    app.new_playlist = if open { None } else { Some(String::new()) };
+    app.new_playlist_kind = crate::app::NewPlaylistKind::YouTube;
 }
 
 /// The modal the **+** opens: the app dims behind a centered card — name field, Create,
@@ -233,9 +263,13 @@ struct RailRow<'a> {
     shape: ArtShape,
 }
 
-fn rail_list(app: &mut App, ui: &mut egui::Ui) {
+fn rail_list(app: &mut App, ui: &mut egui::Ui, rail: bool) {
     let count = app.library.playlists.len();
     if count == 0 {
+        // No sentence fits in the icon rail, and an empty one says enough by being empty.
+        if rail {
+            return;
+        }
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new("No playlists yet.")
@@ -268,7 +302,12 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui) {
                 local_tracks,
                 ..
             } = app;
-            virtual_rows(ui, theme::RAIL_ROW_HEIGHT, count, |ui, i| {
+            let row_height = if rail {
+                theme::RAIL_ROW_HEIGHT_COMPACT
+            } else {
+                theme::RAIL_ROW_HEIGHT
+            };
+            virtual_rows(ui, row_height, count, |ui, i| {
                 let p = &library.playlists.items[i];
                 let row = RailRow {
                     id: &p.id,
@@ -281,7 +320,11 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui) {
                 };
                 let art = art_texture(images, backend, ui.ctx(), row.thumbnail, ROW_ART_PT);
                 let selected = selected_id.as_deref() == Some(row.id);
-                let response = rail_row(ui, palette, &row, art, selected);
+                let response = if rail {
+                    rail_row_compact(ui, palette, &row, art, selected)
+                } else {
+                    rail_row(ui, palette, &row, art, selected)
+                };
                 // Drag a playlist to reorder the rail. The payload is this row's index; the
                 // drop lands on whichever row is under the pointer when the button is released.
                 if response.drag_started() {
@@ -389,6 +432,51 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+/// A row of the icon rail: the cover, centred, with the title and what it is as a tooltip. The pill
+/// for the selected and the hovered row is the same as the full row's.
+fn rail_row_compact(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    row: &RailRow<'_>,
+    art: Option<&egui::TextureHandle>,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), theme::RAIL_ROW_HEIGHT_COMPACT),
+        Sense::click_and_drag(),
+    );
+    if ui.is_rect_visible(rect) {
+        let t = widgets::lit(ui, &response);
+        if selected || t > 0.001 {
+            let fill = if selected {
+                palette.glass(palette.surface_active)
+            } else {
+                palette.glass_state(palette.surface_hover, t)
+            };
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(theme::RADIUS), fill);
+        }
+        let art_rect = Rect::from_center_size(
+            rect.center(),
+            vec2(theme::RAIL_ART_SIZE, theme::RAIL_ART_SIZE),
+        );
+        widgets::paint_art(ui, palette, art_rect, art, row.shape);
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    response.on_hover_text(rail_tooltip(row.title, &row.detail))
+}
+
+/// What a rail row says on hover: its title, and under it what it is when there is something to say.
+fn rail_tooltip(title: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        title.to_owned()
+    } else {
+        format!("{title}\n{detail}")
+    }
+}
+
 /// A rail row: cover, title, and what it is — the shape the reference uses, and the reason the
 /// rail is worth 280pt instead of 240.
 fn rail_row(
@@ -447,4 +535,17 @@ fn rail_row(
         }
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rail_tooltip;
+
+    /// What the icon rail says on hover: the title, and under it what the playlist is when there
+    /// is something to say; a bare title, not a title and an empty line, when there is not.
+    #[test]
+    fn a_rail_tooltip_is_the_title_and_the_detail_when_there_is_one() {
+        assert_eq!(rail_tooltip("Gym", "12 tracks"), "Gym\n12 tracks");
+        assert_eq!(rail_tooltip("Gym", ""), "Gym");
+    }
 }

@@ -42,7 +42,7 @@ Affiliation: refryt is an unofficial client. It is not affiliated with, endorsed
 - Playback. mpv plays the audio, with an audio quality setting, volume normalisation from YouTube's loudness data, and autoplay that continues when the queue runs out.
 - Brand accounts. If a Google account has more than one channel, the account menu at the top switches between them.
 - Desktop integration. A tray icon, start on boot, media keys and the system media controls (MPRIS on Linux, SMTC on Windows, Now Playing on macOS). Discord Rich Presence is available and off by default.
-- Resizable sidebars. Both sides can be dragged, and the widths are remembered.
+- Resizable sidebars. Both sides can be dragged, and the widths are remembered. The left one folds down to an icon rail with just the navigation icons and the playlist covers.
 
 ## Using refryt
 
