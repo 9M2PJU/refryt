@@ -7124,7 +7124,8 @@ impl eframe::App for App {
     }
 
     /// A test aid for debug builds: `REFRYT_CLICK="x,y,button@secs;…"` clicks at those window
-    /// points once each time comes, `button` being `primary` or `secondary` — how a screenshot
+    /// points once each time comes, `button` being `primary`, `secondary` or `hover` (the pointer
+    /// moves there and stays, no click) — how a screenshot
     /// run opens a right-click menu, which nothing outside the app can do on Wayland. A `button`
     /// of `scroll:<dy>` scrolls the wheel by that many points there instead (negative is down),
     /// and `drag:<x2>:<y2>` presses at the point, moves to the second one and releases there,
@@ -7172,6 +7173,11 @@ impl eframe::App for App {
                         out.push((x2, y2, primary, Act::Move, at + 0.25));
                         out.push((x2, y2, primary, Act::Release, at + 0.5));
                     }
+                    continue;
+                }
+                // Only move the pointer there and leave it: how a screenshot gets a tooltip.
+                if kind == Some("hover") {
+                    out.push((x, y, primary, Act::Move, at));
                     continue;
                 }
                 let button = match kind {

@@ -282,6 +282,33 @@ pub fn skeleton_play_button(ui: &Ui, palette: &Palette, rect: Rect) {
         );
 }
 
+/// A tooltip to the right of the pointer, centred on it vertically.
+///
+/// egui's own tooltip sits below the widget, which in the icon rail is the next icon: the rail is
+/// a column of small targets with nothing to its right, so the room is there and the pointer is
+/// where the eye already is. The gap clears the cursor's own shape.
+pub fn tooltip_right(
+    response: egui::Response,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let text = text.into();
+    let mut tooltip = egui::Tooltip::for_enabled(&response);
+    tooltip.popup = tooltip
+        .popup
+        .at_pointer()
+        .align(egui::RectAlign::RIGHT)
+        .gap(TOOLTIP_GAP);
+    tooltip.show(|ui| {
+        // As egui's own text tooltips: the width fixed, so the area does not shrink round it.
+        ui.set_max_width(ui.spacing().tooltip_width);
+        ui.add(egui::Label::new(text));
+    });
+    response
+}
+
+/// How far a [`tooltip_right`] sits from the pointer.
+const TOOLTIP_GAP: f32 = 14.0;
+
 /// A sidebar navigation entry: Home, Search, Library.
 ///
 /// No pill behind the selected one — selection is carried by weight and colour alone, which is
@@ -335,7 +362,7 @@ pub fn nav_item(
             if response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            return response.on_hover_text(label);
+            return tooltip_right(response, label);
         }
 
         let font = if selected {

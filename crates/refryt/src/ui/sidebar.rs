@@ -68,7 +68,7 @@ fn audio_warning(app: &mut App, ui: &mut egui::Ui, rail: bool) {
             Icon::CircleAlert
                 .image(app.palette.danger, 22.0)
                 .paint_at(ui, Rect::from_center_size(rect.center(), vec2(22.0, 22.0)));
-            response.on_hover_text(format!("Audio unavailable: {err}"));
+            widgets::tooltip_right(response, format!("Audio unavailable: {err}"));
         });
         ui.add_space(8.0);
         return;
@@ -100,7 +100,7 @@ fn playlists(app: &mut App, ui: &mut egui::Ui, rail: bool) {
         // No heading to carry: just the + , centred over the covers.
         ui.vertical_centered(|ui| {
             let plus = widgets::icon_button(ui, &app.palette, Icon::Plus, 18.0, false);
-            if plus.on_hover_text("New playlist").clicked() {
+            if widgets::tooltip_right(plus, "New playlist").clicked() {
                 toggle_new_playlist(app);
             }
         });
@@ -469,7 +469,7 @@ fn rail_row_compact(
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
     }
-    response.on_hover_text(rail_tooltip(row.title, &row.detail))
+    widgets::tooltip_right(response, rail_tooltip(row.title, &row.detail))
 }
 
 /// What a rail row says on hover: its title, and under it what it is when there is something to say.
