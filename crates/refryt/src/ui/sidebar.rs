@@ -271,11 +271,15 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui, rail: bool) {
             return;
         }
         ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("No playlists yet.")
-                .font(theme::regular(12.0))
-                .color(app.palette.dim),
-        );
+        // In line with the "Playlists" heading above it, which sits 6 pt in.
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("No playlists")
+                    .font(theme::regular(12.0))
+                    .color(app.palette.dim),
+            );
+        });
         return;
     }
 
