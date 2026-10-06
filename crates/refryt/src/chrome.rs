@@ -182,6 +182,7 @@ pub fn window_buttons(ui: &mut Ui, palette: &Palette) -> bool {
     }
     if window_button(ui, palette, Icon::Minus, false).clicked() {
         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+        crate::pacing::minimize_requested();
     }
     close_clicked
 }

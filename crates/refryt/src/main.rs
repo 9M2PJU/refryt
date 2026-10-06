@@ -234,12 +234,20 @@ fn main() -> eframe::Result {
 
     // On macOS the transparent request above only gives a see-through window. The blur is applied
     // later, from `App::ui`, once the window exists (`blur.rs`).
+    #[allow(unused_mut)]
+    let mut native_options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    // A test aid for debug builds: `REFRYT_NO_VSYNC=1` stops the swap from waiting for the screen,
+    // to tell a window that is blocked in the swap from one that is not being asked for frames.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("REFRYT_NO_VSYNC").is_some() {
+        native_options.glow_options.vsync = false;
+    }
     let result = eframe::run_native(
         "refryt",
-        eframe::NativeOptions {
-            viewport,
-            ..Default::default()
-        },
+        native_options,
         Box::new(move |cc| {
             Ok(Box::new(
                 app::App::new(

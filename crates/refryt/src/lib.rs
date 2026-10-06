@@ -35,6 +35,7 @@ pub mod local_playlists;
 pub mod media;
 pub mod memory;
 pub mod model;
+pub mod pacing;
 pub mod persist;
 pub mod playback;
 pub mod player;

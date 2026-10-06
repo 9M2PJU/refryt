@@ -7660,6 +7660,19 @@ impl eframe::App for App {
         // Same snapshot, said to Discord.
         self.publish_presence();
 
+        // After the tray, the title bar's buttons and the rest have had their say about this
+        // frame, and before its swap: a window that is on its way out must not wait for the
+        // screen (`pacing`).
+        if is_wayland() {
+            let (focused, pointer_inside) = ctx.input(|i| {
+                (
+                    i.viewport().focused.unwrap_or(true),
+                    i.pointer.has_pointer(),
+                )
+            });
+            crate::pacing::apply(focused, pointer_inside, self.hidden);
+        }
+
         // Repaint discipline. Exactly one of these, and only when something is actually moving:
         // a pending autocomplete debounce, or a progress bar that needs to advance. Search itself
         // is submit-driven and fires here once, on demand.
