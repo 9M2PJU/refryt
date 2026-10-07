@@ -2062,7 +2062,11 @@ impl App {
             upnext_open: queue,
             lyrics_open: lyrics,
             fs: if now_playing {
-                ui::fullscreen::State::opened(lyrics || settings.fullscreen_lyrics)
+                // A test aid: `--now-playing --queue` opens the fullscreen view with its queue
+                // drawer out, which nothing outside the app can click open.
+                let mut fs = ui::fullscreen::State::opened(lyrics || settings.fullscreen_lyrics);
+                fs.queue = queue;
+                fs
             } else {
                 ui::fullscreen::State::default()
             },
