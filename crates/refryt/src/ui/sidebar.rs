@@ -291,7 +291,8 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui, rail: bool) {
     let mut clicked = None;
     let mut reorder = None;
     let mut menu_action = None;
-    egui::ScrollArea::vertical()
+    let from = widgets::painted_so_far(ui);
+    let output = egui::ScrollArea::vertical()
         .id_salt("rail")
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -425,6 +426,7 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui, rail: bool) {
                 }
             });
         });
+    widgets::fade_scroll_edges(ui, from, &output, widgets::SCROLL_FADE);
     if let Some((from, to)) = reorder {
         app.move_playlist(from, to);
     }

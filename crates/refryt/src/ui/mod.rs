@@ -2864,7 +2864,9 @@ pub(crate) fn finish_grid(app: &mut crate::app::App, shelf: &Shelf, grid: GridOu
 ///   `scroll_to_top` for. Back and Forward deliberately do not set it. The flag is sticky
 ///   until a scroll area consumes it: a fresh fetch shows a loader first, and clearing the
 ///   flag on a loader frame would reopen the feed at the old offset once it arrives.
-pub(crate) fn page_scroll(app: &mut crate::app::App, salt: &str) -> egui::ScrollArea {
+///
+/// It also fades the page at an end with more of it past that end ([`PageScroll::show`]).
+pub(crate) fn page_scroll(app: &mut crate::app::App, salt: &str) -> PageScroll {
     let mut area = egui::ScrollArea::vertical()
         .id_salt(salt)
         .auto_shrink([false, false]);
@@ -2875,7 +2877,25 @@ pub(crate) fn page_scroll(app: &mut crate::app::App, salt: &str) -> egui::Scroll
     if let Some(offset) = app.autoscroll {
         area = area.vertical_scroll_offset(offset);
     }
-    area
+    PageScroll(area)
+}
+
+/// A page's scroll area, from [`page_scroll`].
+pub(crate) struct PageScroll(egui::ScrollArea);
+
+impl PageScroll {
+    /// Show the page in it, and fade it at an end with more page past that end: nothing at the
+    /// top of a page scrolled all the way up.
+    pub(crate) fn show<R>(
+        self,
+        ui: &mut egui::Ui,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::scroll_area::ScrollAreaOutput<R> {
+        let from = widgets::painted_so_far(ui);
+        let output = self.0.show(ui, add_contents);
+        widgets::fade_scroll_edges(ui, from, &output, widgets::SCROLL_FADE);
+        output
+    }
 }
 
 /// A page's own title at the top of the content card, e.g. "Settings" or "Your library".

@@ -60,71 +60,73 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     app.lyrics_active = active;
 
     let synced = lyrics.synced;
-    let clicked = area
-        .show(ui, |ui| {
-            // Inside the scroll: the title scrolls away with the lyrics rather than staying
-            // pinned.
-            title(ui, &p);
-            let mut clicked = None;
-            for (i, line) in lyrics.lines.iter().enumerate() {
-                // The gap goes before each line but the first, not after each: after the last
-                // one it was blank space below the lyrics, inside a card whose content runs to
-                // its bottom edge.
-                if i > 0 {
-                    ui.add_space(4.0);
-                }
-                let is_active = Some(i) == active;
-                let font = if is_active {
-                    theme::semibold(15.0)
-                } else {
-                    theme::regular(14.0)
-                };
-                let text = if line.text.is_empty() {
-                    "♪"
-                } else {
-                    &line.text
-                };
-                // Laid out before the colour is known: a synced line lights up under the
-                // pointer, which needs the row's rect first. The whole row is the target, so a
-                // short line is as easy to hit as a long one.
-                let galley = ui.painter().layout(
-                    text.to_owned(),
-                    font,
-                    egui::Color32::PLACEHOLDER,
-                    ui.available_width(),
-                );
-                let sense = if synced {
-                    egui::Sense::click()
-                } else {
-                    egui::Sense::hover()
-                };
-                let (rect, response) = ui
-                    .allocate_exact_size(egui::vec2(ui.available_width(), galley.size().y), sense);
-                let hovered = synced && response.hovered();
-                if hovered {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                let color = if is_active {
-                    p.accent
-                } else if hovered {
-                    p.text
-                } else {
-                    p.secondary
-                };
-                ui.painter().galley(rect.min, galley, color);
-                if synced && response.clicked() {
-                    clicked = Some(line.at_ms);
-                }
-                if is_active && scroll {
-                    ui.scroll_to_rect(
-                        rect.expand2(egui::vec2(0.0, 48.0)),
-                        Some(egui::Align::Center),
-                    );
-                }
+    let from = widgets::painted_so_far(ui);
+    let output = area.show(ui, |ui| {
+        // Inside the scroll: the title scrolls away with the lyrics rather than staying
+        // pinned.
+        title(ui, &p);
+        let mut clicked = None;
+        for (i, line) in lyrics.lines.iter().enumerate() {
+            // The gap goes before each line but the first, not after each: after the last
+            // one it was blank space below the lyrics, inside a card whose content runs to
+            // its bottom edge.
+            if i > 0 {
+                ui.add_space(4.0);
             }
-            clicked
-        })
-        .inner;
+            let is_active = Some(i) == active;
+            let font = if is_active {
+                theme::semibold(15.0)
+            } else {
+                theme::regular(14.0)
+            };
+            let text = if line.text.is_empty() {
+                "♪"
+            } else {
+                &line.text
+            };
+            // Laid out before the colour is known: a synced line lights up under the
+            // pointer, which needs the row's rect first. The whole row is the target, so a
+            // short line is as easy to hit as a long one.
+            let galley = ui.painter().layout(
+                text.to_owned(),
+                font,
+                egui::Color32::PLACEHOLDER,
+                ui.available_width(),
+            );
+            let sense = if synced {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            };
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), galley.size().y), sense);
+            let hovered = synced && response.hovered();
+            if hovered {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let color = if is_active {
+                p.accent
+            } else if hovered {
+                p.text
+            } else {
+                p.secondary
+            };
+            ui.painter().galley(rect.min, galley, color);
+            if synced && response.clicked() {
+                clicked = Some(line.at_ms);
+            }
+            if is_active && scroll {
+                ui.scroll_to_rect(
+                    rect.expand2(egui::vec2(0.0, 48.0)),
+                    Some(egui::Align::Center),
+                );
+            }
+        }
+        clicked
+    });
+    // The title scrolls with the words, so at the top of the lyrics nothing fades there.
+    widgets::fade_scroll_edges(ui, from, &output, widgets::SCROLL_FADE);
+    let clicked = output.inner;
     // A click on a synced line plays from where it starts.
     if let Some(at_ms) = clicked {
         app.seek_to(at_ms as f64 / 1000.0);

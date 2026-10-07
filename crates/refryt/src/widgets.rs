@@ -849,6 +849,279 @@ fn fade_slices(ui: &mut Ui, band: Rect, cut_at_start: bool, mut paint: impl FnMu
 }
 
 // ---------------------------------------------------------------------------------------------
+// Scroll-edge fades
+// ---------------------------------------------------------------------------------------------
+
+/// How far a scrolled list fades at an end with more of it past that end.
+pub(crate) const SCROLL_FADE: f32 = 24.0;
+
+/// Fade a scroll area's contents at each end that has more content past it: none at the top of a
+/// list scrolled all the way up, none at the bottom of one at its end. `from` is
+/// [`painted_so_far`] taken just before the scroll area was shown. Transparent, so on a
+/// see-through window the desktop shows through the fade, not a colour painted to look like it.
+/// The floating scroll bar is left as it is.
+pub(crate) fn fade_scroll_edges<R>(
+    ui: &Ui,
+    from: usize,
+    output: &egui::scroll_area::ScrollAreaOutput<R>,
+    band: f32,
+) {
+    let (above, below) = edge_fades(
+        (
+            output.state.offset.y,
+            output.content_size.y,
+            output.inner_rect.height(),
+        ),
+        band,
+    );
+    let scroll = &ui.spacing().scroll;
+    let strip = scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin;
+    fade_painted_except(
+        ui.ctx(),
+        ui.layer_id(),
+        from,
+        output.inner_rect,
+        EdgeFade::new(band, above),
+        EdgeFade::new(band, below),
+        output.inner_rect.right() - strip,
+    );
+}
+
+/// Whether a shape lies wholly in the strip right of `strip_left`, where the scroll bar is.
+fn in_bar_strip(bounds: Rect, strip_left: f32) -> bool {
+    bounds.min.x >= strip_left
+}
+
+/// Fade everything painted into `layer` since `from` toward the top and bottom of `rect`: see
+/// [`fade_painted_except`], with nothing left out.
+pub(crate) fn fade_painted(
+    ctx: &egui::Context,
+    layer: egui::LayerId,
+    from: usize,
+    rect: Rect,
+    above: EdgeFade,
+    below: EdgeFade,
+) {
+    fade_painted_except(ctx, layer, from, rect, above, below, f32::INFINITY);
+}
+
+/// How one end of a region fades: over `band` points from the edge inward, and by `strength`
+/// (0 not at all, 1 fully transparent at the edge).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EdgeFade {
+    band: f32,
+    strength: f32,
+}
+
+impl EdgeFade {
+    pub(crate) fn new(band: f32, strength: f32) -> Self {
+        Self {
+            band: band.max(0.0),
+            strength: strength.clamp(0.0, 1.0),
+        }
+    }
+
+    fn none(self) -> bool {
+        self.band <= 0.0 || self.strength <= 0.0
+    }
+}
+
+/// How much of what is drawn at height `y` survives: 1 in the middle, falling linearly to
+/// `1 - strength` at either edge of `top..bottom`.
+fn fade_factor(y: f32, top: f32, bottom: f32, above: EdgeFade, below: EdgeFade) -> f32 {
+    let end = |into: f32, fade: EdgeFade| {
+        if fade.none() {
+            1.0
+        } else {
+            1.0 - fade.strength * (1.0 - (into / fade.band).clamp(0.0, 1.0))
+        }
+    };
+    end(y - top, above) * end(bottom - y, below)
+}
+
+/// Where the next shape painted into `ui`'s layer will go, to hand to [`fade_painted`].
+pub(crate) fn painted_so_far(ui: &egui::Ui) -> usize {
+    ui.ctx()
+        .graphics(|g| g.get(ui.layer_id()).map_or(0, |l| l.next_idx().0))
+}
+
+/// Fade everything painted into `layer` since `from` toward the top and bottom of `rect`.
+///
+/// Real transparency: the shapes are tessellated and each vertex's colour (premultiplied, so its
+/// alpha with it) is scaled by how close it is to an edge, so what shows through is whatever is
+/// behind them. Triangles are first cut along the band's lines, so the linear ramp between those
+/// lines is exact however tall a triangle was (a row's fill, a cover).
+fn fade_painted_except(
+    ctx: &egui::Context,
+    layer: egui::LayerId,
+    from: usize,
+    rect: Rect,
+    above: EdgeFade,
+    below: EdgeFade,
+    strip_left: f32,
+) {
+    if above.none() && below.none() {
+        return;
+    }
+    let (top, bottom) = (rect.top(), rect.bottom());
+    let cuts: Vec<f32> = [
+        (!above.none()).then_some(top),
+        (!above.none()).then_some(top + above.band),
+        (!below.none()).then_some(bottom - below.band),
+        (!below.none()).then_some(bottom),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    // What lies wholly between the two bands is untouched, and is left as it is.
+    let untouched = Rect::from_min_max(
+        egui::pos2(
+            f32::NEG_INFINITY,
+            if above.none() {
+                f32::NEG_INFINITY
+            } else {
+                top + above.band
+            },
+        ),
+        egui::pos2(
+            f32::INFINITY,
+            if below.none() {
+                f32::INFINITY
+            } else {
+                bottom - below.band
+            },
+        ),
+    );
+    let shapes: Vec<(usize, egui::epaint::ClippedShape)> = ctx.graphics(|g| {
+        g.get(layer).map_or_else(Vec::new, |list| {
+            list.all_entries()
+                .enumerate()
+                .skip(from)
+                .filter(|(_, c)| !matches!(c.shape, egui::Shape::Noop))
+                .filter(|(_, c)| {
+                    let bounds = c.shape.visual_bounding_rect();
+                    !untouched.contains_rect(bounds) && !in_bar_strip(bounds, strip_left)
+                })
+                .map(|(i, c)| (i, c.clone()))
+                .collect()
+        })
+    });
+    if shapes.is_empty() {
+        return;
+    }
+    let ppp = ctx.pixels_per_point();
+    let mut faded = Vec::with_capacity(shapes.len());
+    for (i, clipped) in shapes {
+        let clip = clipped.clip_rect;
+        let mut meshes = Vec::new();
+        let mut callback = false;
+        for primitive in ctx.tessellate(vec![clipped], ppp) {
+            match primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => {
+                    let mut mesh = cut_mesh(&mesh, &cuts);
+                    for v in &mut mesh.vertices {
+                        let f = fade_factor(v.pos.y, top, bottom, above, below);
+                        v.color = v.color.gamma_multiply(f);
+                    }
+                    meshes.push(egui::Shape::mesh(mesh));
+                }
+                egui::epaint::Primitive::Callback(_) => callback = true,
+            }
+        }
+        // A paint callback cannot be faded, and is left exactly as it was.
+        if !callback {
+            faded.push((i, clip, egui::Shape::Vec(meshes)));
+        }
+    }
+    ctx.graphics_mut(|g| {
+        let list = g.entry(layer);
+        for (i, clip, shape) in faded {
+            list.set(egui::layers::ShapeIdx(i), clip, shape);
+        }
+    });
+}
+
+/// `mesh` with every triangle that crosses one of the horizontal lines `cuts` split along it, so
+/// no triangle spans a line: a colour set per vertex then varies across a band exactly as it does
+/// between its lines.
+fn cut_mesh(mesh: &egui::Mesh, cuts: &[f32]) -> egui::Mesh {
+    use egui::epaint::Vertex;
+    let mut out = egui::Mesh::with_texture(mesh.texture_id);
+    for tri in mesh.indices.as_chunks::<3>().0 {
+        let mut pieces: Vec<Vec<Vertex>> =
+            vec![tri.iter().map(|&i| mesh.vertices[i as usize]).collect()];
+        for &y in cuts {
+            let mut next = Vec::with_capacity(pieces.len() + 1);
+            for piece in pieces {
+                let (above, below) = split_polygon(&piece, y);
+                next.extend([above, below].into_iter().filter(|p| p.len() >= 3));
+            }
+            pieces = next;
+        }
+        for piece in pieces {
+            let base = out.vertices.len() as u32;
+            out.vertices.extend_from_slice(&piece);
+            for k in 1..piece.len() as u32 - 1 {
+                out.add_triangle(base, base + k, base + k + 1);
+            }
+        }
+    }
+    out
+}
+
+/// A convex polygon split by the horizontal line at `y`: the part above it and the part below,
+/// each still convex and in the same winding.
+fn split_polygon(
+    poly: &[egui::epaint::Vertex],
+    y: f32,
+) -> (Vec<egui::epaint::Vertex>, Vec<egui::epaint::Vertex>) {
+    let (mut above, mut below) = (Vec::new(), Vec::new());
+    for (k, &a) in poly.iter().enumerate() {
+        let b = poly[(k + 1) % poly.len()];
+        if a.pos.y < y {
+            above.push(a);
+        } else {
+            below.push(a);
+        }
+        if (a.pos.y < y) != (b.pos.y < y) {
+            let t = (y - a.pos.y) / (b.pos.y - a.pos.y);
+            let mid = lerp_vertex(a, b, t);
+            above.push(mid);
+            below.push(mid);
+        }
+    }
+    (above, below)
+}
+
+fn lerp_vertex(a: egui::epaint::Vertex, b: egui::epaint::Vertex, t: f32) -> egui::epaint::Vertex {
+    let channel = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    let (ca, cb) = (a.color.to_array(), b.color.to_array());
+    egui::epaint::Vertex {
+        pos: a.pos + (b.pos - a.pos) * t,
+        uv: a.uv + (b.uv - a.uv) * t,
+        color: Color32::from_rgba_premultiplied(
+            channel(ca[0], cb[0]),
+            channel(ca[1], cb[1]),
+            channel(ca[2], cb[2]),
+            channel(ca[3], cb[3]),
+        ),
+    }
+}
+
+/// How strongly each end of a scrolled list should fade: 0 with nothing past that end, rising to
+/// 1 once a full `fade` of list is hidden there. `scroll` is the offset, content height and
+/// viewport height; a list not yet measured fades nowhere.
+pub(crate) fn edge_fades(scroll: (f32, f32, f32), fade: f32) -> (f32, f32) {
+    let (offset, content, view) = scroll;
+    if content <= 0.0 || fade <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let above = (offset / fade).clamp(0.0, 1.0);
+    let below = ((content - offset - view) / fade).clamp(0.0, 1.0);
+    (above, below)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Card corners
 // ---------------------------------------------------------------------------------------------
 
@@ -4641,6 +4914,108 @@ pub fn volume_slider(ui: &mut Ui, palette: &Palette, volume: f64, unmute_to: f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fade runs from fully transparent at an edge to untouched a band in, scaled by how
+    /// strongly that end fades, and an end that does not fade is left alone.
+    #[test]
+    fn the_fade_ramps_from_the_edge_over_its_band() {
+        let full = EdgeFade::new(40.0, 1.0);
+        let off = EdgeFade::new(40.0, 0.0);
+        assert_eq!(fade_factor(0.0, 0.0, 400.0, full, full), 0.0);
+        assert_eq!(fade_factor(20.0, 0.0, 400.0, full, full), 0.5);
+        assert_eq!(fade_factor(40.0, 0.0, 400.0, full, full), 1.0);
+        assert_eq!(fade_factor(200.0, 0.0, 400.0, full, full), 1.0);
+        assert_eq!(fade_factor(390.0, 0.0, 400.0, full, full), 0.25);
+        assert_eq!(
+            fade_factor(0.0, 0.0, 400.0, off, full),
+            1.0,
+            "no fade at the top"
+        );
+        let half = EdgeFade::new(40.0, 0.5);
+        assert_eq!(fade_factor(0.0, 0.0, 400.0, half, off), 0.5);
+        assert!(EdgeFade::new(0.0, 1.0).none() && EdgeFade::new(40.0, 0.0).none());
+    }
+
+    /// A triangle crossing the band's lines is cut along them, so every piece lies between two
+    /// lines and keeps the area and texture mapping of the original.
+    #[test]
+    fn a_mesh_is_cut_along_the_fade_lines() {
+        let v = |x: f32, y: f32| egui::epaint::Vertex {
+            pos: egui::pos2(x, y),
+            uv: egui::pos2(x / 100.0, y / 100.0),
+            color: Color32::WHITE,
+        };
+        let mesh = egui::Mesh {
+            vertices: vec![v(0.0, 0.0), v(100.0, 0.0), v(0.0, 100.0)],
+            indices: vec![0, 1, 2],
+            ..Default::default()
+        };
+        let cuts = [10.0, 50.0];
+        let out = cut_mesh(&mesh, &cuts);
+        let area = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+            ((b - a).x * (c - a).y - (c - a).x * (b - a).y).abs() / 2.0
+        };
+        let mut total: f32 = 0.0;
+        for tri in out.indices.as_chunks::<3>().0 {
+            let [a, b, c] = [0, 1, 2].map(|k| out.vertices[tri[k] as usize]);
+            total += area(a.pos, b.pos, c.pos);
+            let (lo, hi) = (
+                a.pos.y.min(b.pos.y).min(c.pos.y),
+                a.pos.y.max(b.pos.y).max(c.pos.y),
+            );
+            for cut in cuts {
+                assert!(!(lo < cut - 1e-3 && hi > cut + 1e-3), "a piece spans {cut}");
+            }
+            for p in [a, b, c] {
+                assert!(
+                    (p.uv.x - p.pos.x / 100.0).abs() < 1e-4
+                        && (p.uv.y - p.pos.y / 100.0).abs() < 1e-4
+                );
+            }
+        }
+        assert!((total - 5000.0).abs() < 0.01, "area kept: {total}");
+    }
+
+    /// A list at its top does not fade there (the first row is seen in full), and one scrolled
+    /// to its end does not fade at the bottom.
+    #[test]
+    fn a_list_fades_only_toward_what_is_hidden() {
+        assert_eq!(
+            edge_fades((0.0, 800.0, 400.0), 36.0),
+            (0.0, 1.0),
+            "at the top"
+        );
+        assert_eq!(
+            edge_fades((400.0, 800.0, 400.0), 36.0),
+            (1.0, 0.0),
+            "at the end"
+        );
+        let (above, below) = edge_fades((18.0, 800.0, 400.0), 36.0);
+        assert!(
+            above > 0.0 && above < 1.0 && below == 1.0,
+            "easing in as it scrolls"
+        );
+        assert_eq!(
+            edge_fades((0.0, 300.0, 400.0), 36.0),
+            (0.0, 0.0),
+            "a short list"
+        );
+        assert_eq!(
+            edge_fades((0.0, 0.0, 0.0), 36.0),
+            (0.0, 0.0),
+            "not measured yet"
+        );
+    }
+
+    /// The scroll bar's strip is left alone, a row across the whole width is not.
+    #[test]
+    fn the_scroll_bar_is_left_out_of_the_fade() {
+        let strip_left = 290.0;
+        let bar = Rect::from_min_max(egui::pos2(292.0, 0.0), egui::pos2(298.0, 60.0));
+        let row = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(298.0, 56.0));
+        assert!(in_bar_strip(bar, strip_left));
+        assert!(!in_bar_strip(row, strip_left));
+    }
 
     /// A character no font has is painted as a replacement box, so it must measure as one: a
     /// title of them used to measure zero wide, skip truncation, and run out of its card.

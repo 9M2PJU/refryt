@@ -30,6 +30,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         area = area.vertical_scroll_offset(0.0);
         app.queue_scroll_reset = false;
     }
+    let from = widgets::painted_so_far(ui);
     let out = area.show(ui, |ui| {
         // The list runs to the card's top edge now; this is the header's own breathing room,
         // and it scrolls away with it — the same distance the content has from the sides.
@@ -137,6 +138,11 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         out.content_size.y,
         out.inner_rect.height(),
     );
+    // The card fades its list at an end with more of it past that end. Not in the fullscreen
+    // drawer, which fades the whole panel itself: twice would double it.
+    if !app.fs.open {
+        widgets::fade_scroll_edges(ui, from, &out, widgets::SCROLL_FADE);
+    }
     // The card's rounded corners, over everything the queue drew: the list runs to the card's
     // top and bottom edges now.
     // Not in the fullscreen drawer: it is a card on a tinted background, held in from its own
