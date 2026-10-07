@@ -303,6 +303,7 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
     #[cfg(not(target_os = "windows"))]
     let mut blur = app.settings.blur;
     let mut card_outline = app.settings.card_outline;
+    let mut scroll_fades = app.settings.scroll_fades;
     widgets::setting_group(ui, &p, Some("Window"), |ui, g| {
         #[cfg(not(target_os = "windows"))]
         {
@@ -384,6 +385,15 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
             g,
             ui,
             &p,
+            "setting-scroll-fades",
+            "Scroll Fades",
+            "Fades lists out at their edges. Recommended with transparency.",
+            &mut scroll_fades,
+        );
+        toggle_row(
+            g,
+            ui,
+            &p,
             "setting-adaptive-art-color",
             "Adaptive Header Colour",
             "Tints album and playlist headers to match the cover.",
@@ -403,6 +413,7 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
         s.light_theme = light_choice;
         s.adaptive_art_color = adaptive_art_color;
         s.card_outline = card_outline;
+        s.scroll_fades = scroll_fades;
     });
 }
 

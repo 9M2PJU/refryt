@@ -2877,11 +2877,11 @@ pub(crate) fn page_scroll(app: &mut crate::app::App, salt: &str) -> PageScroll {
     if let Some(offset) = app.autoscroll {
         area = area.vertical_scroll_offset(offset);
     }
-    PageScroll(area)
+    PageScroll(area, widgets::scroll_fade(&app.settings))
 }
 
-/// A page's scroll area, from [`page_scroll`].
-pub(crate) struct PageScroll(egui::ScrollArea);
+/// A page's scroll area, from [`page_scroll`], and how far it fades at its ends.
+pub(crate) struct PageScroll(egui::ScrollArea, f32);
 
 impl PageScroll {
     /// Show the page in it, and fade it at an end with more page past that end: nothing at the
@@ -2893,7 +2893,7 @@ impl PageScroll {
     ) -> egui::scroll_area::ScrollAreaOutput<R> {
         let from = widgets::painted_so_far(ui);
         let output = self.0.show(ui, add_contents);
-        widgets::fade_scroll_edges(ui, from, &output, widgets::SCROLL_FADE);
+        widgets::fade_scroll_edges(ui, from, &output, self.1);
         output
     }
 }

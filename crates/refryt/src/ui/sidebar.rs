@@ -426,7 +426,7 @@ fn rail_list(app: &mut App, ui: &mut egui::Ui, rail: bool) {
                 }
             });
         });
-    widgets::fade_scroll_edges(ui, from, &output, widgets::SCROLL_FADE);
+    widgets::fade_scroll_edges(ui, from, &output, widgets::scroll_fade(&app.settings));
     if let Some((from, to)) = reorder {
         app.move_playlist(from, to);
     }

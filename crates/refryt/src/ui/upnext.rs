@@ -141,7 +141,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     // The card fades its list at an end with more of it past that end. Not in the fullscreen
     // drawer, which fades the whole panel itself: twice would double it.
     if !app.fs.open {
-        widgets::fade_scroll_edges(ui, from, &out, widgets::SCROLL_FADE);
+        widgets::fade_scroll_edges(ui, from, &out, widgets::scroll_fade(&app.settings));
     }
     // The card's rounded corners, over everything the queue drew: the list runs to the card's
     // top and bottom edges now.

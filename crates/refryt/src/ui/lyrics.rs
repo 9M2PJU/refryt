@@ -125,7 +125,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         clicked
     });
     // The title scrolls with the words, so at the top of the lyrics nothing fades there.
-    widgets::fade_scroll_edges(ui, from, &output, widgets::SCROLL_FADE);
+    widgets::fade_scroll_edges(ui, from, &output, widgets::scroll_fade(&app.settings));
     let clicked = output.inner;
     // A click on a synced line plays from where it starts.
     if let Some(at_ms) = clicked {

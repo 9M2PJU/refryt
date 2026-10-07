@@ -853,7 +853,21 @@ fn fade_slices(ui: &mut Ui, band: Rect, cut_at_start: bool, mut paint: impl FnMu
 // ---------------------------------------------------------------------------------------------
 
 /// How far a scrolled list fades at an end with more of it past that end.
-pub(crate) const SCROLL_FADE: f32 = 24.0;
+pub(crate) const SCROLL_FADE: f32 = 48.0;
+
+/// How far a card's scrolled lists fade with these settings: [`SCROLL_FADE`], or not at all
+/// when Scroll Fades is off.
+pub(crate) fn scroll_fade(settings: &crate::settings::Settings) -> f32 {
+    if settings.scroll_fades {
+        SCROLL_FADE
+    } else {
+        0.0
+    }
+}
+
+/// How many straight pieces an eased fade's curve is drawn in: colours only vary linearly across
+/// a triangle, so the mesh is cut this many times over the band and the curve is exact at each cut.
+const EASE_STEPS: usize = 6;
 
 /// Fade a scroll area's contents at each end that has more content past it: none at the top of a
 /// list scrolled all the way up, none at the bottom of one at its end. `from` is
@@ -881,8 +895,8 @@ pub(crate) fn fade_scroll_edges<R>(
         ui.layer_id(),
         from,
         output.inner_rect,
-        EdgeFade::new(band, above),
-        EdgeFade::new(band, below),
+        EdgeFade::eased(band, above),
+        EdgeFade::eased(band, below),
         output.inner_rect.right() - strip,
     );
 }
@@ -906,11 +920,12 @@ pub(crate) fn fade_painted(
 }
 
 /// How one end of a region fades: over `band` points from the edge inward, and by `strength`
-/// (0 not at all, 1 fully transparent at the edge).
+/// (0 not at all, 1 fully transparent at the edge), in a straight ramp or an eased one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct EdgeFade {
     band: f32,
     strength: f32,
+    eased: bool,
 }
 
 impl EdgeFade {
@@ -918,7 +933,32 @@ impl EdgeFade {
         Self {
             band: band.max(0.0),
             strength: strength.clamp(0.0, 1.0),
+            eased: false,
         }
+    }
+
+    /// A fade that leaves the edge and arrives at full strength gently (smoothstep), rather than
+    /// in a straight ramp that reads as a soft cut at a short band.
+    pub(crate) fn eased(band: f32, strength: f32) -> Self {
+        Self {
+            eased: true,
+            ..Self::new(band, strength)
+        }
+    }
+
+    /// Where, measured in from the edge, the mesh is cut so the ramp is drawn exactly.
+    fn cuts(self) -> impl Iterator<Item = f32> {
+        let steps = if self.none() {
+            0
+        } else if self.eased {
+            EASE_STEPS
+        } else {
+            1
+        };
+        let band = self.band;
+        (0..=steps)
+            .filter(move |_| steps > 0)
+            .map(move |k| band * k as f32 / steps as f32)
     }
 
     fn none(self) -> bool {
@@ -927,13 +967,19 @@ impl EdgeFade {
 }
 
 /// How much of what is drawn at height `y` survives: 1 in the middle, falling linearly to
-/// `1 - strength` at either edge of `top..bottom`.
+/// `1 - strength` at either edge of `top..bottom` (along a smoothstep for an eased fade).
 fn fade_factor(y: f32, top: f32, bottom: f32, above: EdgeFade, below: EdgeFade) -> f32 {
     let end = |into: f32, fade: EdgeFade| {
         if fade.none() {
             1.0
         } else {
-            1.0 - fade.strength * (1.0 - (into / fade.band).clamp(0.0, 1.0))
+            let t = (into / fade.band).clamp(0.0, 1.0);
+            let t = if fade.eased {
+                t * t * (3.0 - 2.0 * t)
+            } else {
+                t
+            };
+            1.0 - fade.strength * (1.0 - t)
         }
     };
     end(y - top, above) * end(bottom - y, below)
@@ -964,15 +1010,11 @@ fn fade_painted_except(
         return;
     }
     let (top, bottom) = (rect.top(), rect.bottom());
-    let cuts: Vec<f32> = [
-        (!above.none()).then_some(top),
-        (!above.none()).then_some(top + above.band),
-        (!below.none()).then_some(bottom - below.band),
-        (!below.none()).then_some(bottom),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let cuts: Vec<f32> = above
+        .cuts()
+        .map(|d| top + d)
+        .chain(below.cuts().map(|d| bottom - d))
+        .collect();
     // What lies wholly between the two bands is untouched, and is left as it is.
     let untouched = Rect::from_min_max(
         egui::pos2(
@@ -4934,6 +4976,34 @@ mod tests {
         let half = EdgeFade::new(40.0, 0.5);
         assert_eq!(fade_factor(0.0, 0.0, 400.0, half, off), 0.5);
         assert!(EdgeFade::new(0.0, 1.0).none() && EdgeFade::new(40.0, 0.0).none());
+    }
+
+    /// An eased fade meets the straight one at the ends and the middle, but leaves the edge and
+    /// reaches full strength flat; its mesh is cut at every step so the curve is drawn, not a line.
+    #[test]
+    fn an_eased_fade_leaves_and_arrives_gently() {
+        let eased = EdgeFade::eased(36.0, 1.0);
+        let off = EdgeFade::new(36.0, 0.0);
+        let at = |y: f32| fade_factor(y, 0.0, 400.0, eased, off);
+        assert_eq!(at(0.0), 0.0);
+        assert_eq!(at(18.0), 0.5);
+        assert_eq!(at(36.0), 1.0);
+        assert!(
+            at(6.0) < 6.0 / 36.0,
+            "fainter than a straight ramp near the edge"
+        );
+        assert!(
+            at(30.0) > 30.0 / 36.0,
+            "stronger than a straight ramp near the band's end"
+        );
+        let cuts: Vec<f32> = eased.cuts().collect();
+        assert_eq!(cuts.len(), EASE_STEPS + 1);
+        assert_eq!((cuts[0], cuts[EASE_STEPS]), (0.0, 36.0));
+        assert_eq!(
+            EdgeFade::new(36.0, 1.0).cuts().collect::<Vec<_>>(),
+            [0.0, 36.0]
+        );
+        assert_eq!(off.cuts().count(), 0, "no fade, no cuts");
     }
 
     /// A triangle crossing the band's lines is cut along them, so every piece lies between two

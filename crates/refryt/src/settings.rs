@@ -257,6 +257,10 @@ pub struct Settings {
     pub blur: bool,
     /// A thin edge around each card, solid window or see-through.
     pub card_outline: bool,
+    /// Fade a scrolled list out at an end with more of it past that end, in the cards (not the
+    /// fullscreen player, which always fades). Off by default; it is worth most on a see-through
+    /// window, where a list otherwise stops at a hard line over the desktop.
+    pub scroll_fades: bool,
     /// Tint an album/playlist header with a colour pulled from its own cover art, instead of
     /// the scheme's fixed accent. Off falls back to the accent everywhere, unconditionally.
     pub adaptive_art_color: bool,
@@ -325,6 +329,7 @@ impl Default for Settings {
             opacity: Opacity::default(),
             blur: true,
             card_outline: true,
+            scroll_fades: false,
             adaptive_art_color: true,
             quality: Quality::default(),
             autoplay: true,
@@ -573,6 +578,20 @@ mod tests {
         };
         let back: Settings = serde_json::from_slice(&serde_json::to_vec(&off).unwrap()).unwrap();
         assert!(!back.card_outline);
+    }
+
+    /// Scroll fades are off for anyone whose file predates the setting, and a choice to turn them
+    /// on survives a save.
+    #[test]
+    fn scroll_fades_default_off_and_remember_on() {
+        let old: Settings = serde_json::from_str(r#"{"opacity":0.5}"#).unwrap();
+        assert!(!old.scroll_fades);
+        let on = Settings {
+            scroll_fades: true,
+            ..Settings::default()
+        };
+        let back: Settings = serde_json::from_slice(&serde_json::to_vec(&on).unwrap()).unwrap();
+        assert!(back.scroll_fades);
     }
 
     #[test]
