@@ -5487,6 +5487,9 @@ impl App {
         self.queue = tracks;
         // A new queue has different tracks; the shuffle seen-set does not carry over.
         self.shuffle_seen.clear();
+        // Nor does a restored position: it is keyed by index, and the new queue's song at that
+        // index would open where the last session's song left off.
+        self.resume = None;
         // A brand new queue, so the panel should show its start — matching what the queue
         // panel's own row click already does for the in-queue case. Set here rather than in
         // `play_index_restore` itself, which is also what natural end-of-track auto-advance and
@@ -5743,6 +5746,8 @@ impl App {
                 self.queue = queue;
                 self.radio = radio;
                 self.shuffle_seen.clear();
+                // The position belonged to the queue being left, as in `replace_queue`.
+                self.resume = None;
                 self.play_index_restore(index);
             }
             // Nothing remembered: a plain positional step, like any transport — except under
