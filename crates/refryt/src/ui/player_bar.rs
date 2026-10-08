@@ -399,12 +399,8 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     // The user's volume, not `player.volume()`: the Audio Normaliser folds the track's gain into
     // the live value.
     let volume = if app.muted { 0.0 } else { app.last_volume };
-    if let Some(v) = widgets::volume_slider(&mut vui, &p, volume, app.last_volume)
-        && let Some(pl) = &mut app.player
-    {
-        app.last_volume = v;
-        app.muted = v <= 0.0;
-        pl.set_volume(v);
+    if let Some(v) = widgets::volume_slider(&mut vui, &p, volume, app.last_volume) {
+        app.set_user_volume(v);
     }
     vui.add_space(8.0);
     if widgets::icon_button(&mut vui, &p, Icon::ListMusic, 16.0, app.upnext_open).clicked() {

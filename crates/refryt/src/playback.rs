@@ -149,8 +149,12 @@ pub struct Store {
     pub repeat: Option<RepeatKind>,
     #[serde(default)]
     pub shuffle: bool,
+    /// The last audible volume: muting leaves it as it was, to come back to.
     #[serde(default)]
     pub volume: f64,
+    /// Whether the volume was muted. An older file without it reads as not.
+    #[serde(default)]
+    pub muted: bool,
     /// Whether the in-app video view was open. Only ever restored for a track that has a video.
     #[serde(default)]
     pub video_open: bool,
@@ -259,5 +263,20 @@ mod tests {
         let json = serde_json::to_string(&store).unwrap();
         let back: Store = serde_json::from_str(&json).unwrap();
         assert!(back.video_open);
+    }
+
+    /// A mute rides the store beside the volume it will come back to, and an older file
+    /// without the field reads as not muted.
+    #[test]
+    fn a_mute_round_trips_and_defaults_to_off() {
+        let mut store: Store = serde_json::from_str(
+            r#"{"version":1,"queue":[],"position":0.0,"shuffle":false,"volume":40.0}"#,
+        )
+        .unwrap();
+        assert!(!store.muted);
+        store.muted = true;
+        let back: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+        assert!(back.muted);
+        assert_eq!(back.volume, 40.0);
     }
 }

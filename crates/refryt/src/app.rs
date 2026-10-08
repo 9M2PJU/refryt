@@ -158,6 +158,17 @@ fn previous_restarts(position: f64) -> bool {
     position >= PREVIOUS_RESTART_AFTER.as_secs_f64()
 }
 
+/// The remembered volume and mute after the volume is set to `set`, from `last`: an audible
+/// volume is remembered and unmutes, and silence mutes but keeps `last`, so an unmute or the next
+/// launch comes back to it rather than to nothing. Pure for the test.
+fn volume_after(last: f64, set: f64) -> (f64, bool) {
+    if set > 0.5 {
+        (set, false)
+    } else {
+        (last, true)
+    }
+}
+
 /// Which mix row is the seed, when the mix should be adopted under the song already playing
 /// rather than started from the top: the seed must be the loaded track, playback must have
 /// actually started, and the mix must carry the seed itself. Pure so the rule is testable.
@@ -2537,14 +2548,7 @@ impl App {
                         player.seek(to);
                     }
                 }
-                playwire::Event::SetVolume(v) => {
-                    let volume = (v * 100.0).clamp(0.0, 100.0);
-                    self.last_volume = volume;
-                    self.muted = volume <= 0.0;
-                    if let Some(player) = self.player.as_mut() {
-                        player.set_volume(volume);
-                    }
-                }
+                playwire::Event::SetVolume(v) => self.set_user_volume(v * 100.0),
                 playwire::Event::SetShuffle(on) => self.shuffle = on,
                 playwire::Event::SetRepeat(repeat) => {
                     self.repeat = match repeat {
@@ -2737,6 +2741,7 @@ impl App {
         if store.volume > 0.5 {
             self.last_volume = store.volume;
         }
+        self.muted = store.muted;
         // Anything past a couple of seconds is worth resuming; the very start is not.
         self.resume = (store.position > 1.0)
             .then(|| self.current.map(|i| (i, store.position)))
@@ -2765,6 +2770,7 @@ impl App {
             repeat: Some(self.repeat.into()),
             shuffle: self.shuffle,
             volume: self.last_volume,
+            muted: self.muted,
             video_open: self.video_open,
         })
     }
@@ -2811,6 +2817,7 @@ impl App {
         self.repeat.hash(&mut h);
         self.shuffle.hash(&mut h);
         self.last_volume.to_bits().hash(&mut h);
+        self.muted.hash(&mut h);
         self.video_open.hash(&mut h);
         h.finish()
     }
@@ -5634,9 +5641,19 @@ impl App {
         };
     }
 
+    /// Set the volume from the slider or the desktop's media controls. Silence is a mute: the
+    /// last audible volume stays, to come back to on unmute and on the next launch.
+    pub(crate) fn set_user_volume(&mut self, volume: f64) {
+        let volume = volume.clamp(0.0, 100.0);
+        (self.last_volume, self.muted) = volume_after(self.last_volume, volume);
+        if let Some(player) = self.player.as_mut() {
+            player.set_volume(if self.muted { 0.0 } else { self.last_volume });
+        }
+    }
+
     /// Mute at the current volume, or restore whatever it was — the same "remember, then put
-    /// back" the volume slider itself uses (`player_bar.rs` only overwrites `last_volume` when
-    /// the new value is above silent, so muting from here never clobbers it with 0).
+    /// back" the volume slider uses ([`Self::set_user_volume`] never overwrites `last_volume`
+    /// with silence).
     pub(crate) fn toggle_mute(&mut self) {
         self.muted = !self.muted;
         let volume = if self.muted { 0.0 } else { self.last_volume };
@@ -8638,6 +8655,22 @@ mod tests {
         assert!(!previous_restarts(1.999));
         assert!(previous_restarts(2.0));
         assert!(previous_restarts(10.0));
+    }
+
+    /// Muting, from the speaker icon, a drag to the end or the desktop's controls, keeps the
+    /// volume to come back to; only an audible volume replaces it.
+    #[test]
+    fn silence_mutes_and_keeps_the_volume_to_come_back_to() {
+        assert_eq!(volume_after(40.0, 0.0), (40.0, true));
+        assert_eq!(
+            volume_after(40.0, 0.3),
+            (40.0, true),
+            "too quiet to hear is a mute"
+        );
+        assert_eq!(volume_after(40.0, 65.0), (65.0, false));
+        let (last, muted) = volume_after(40.0, 0.0);
+        assert!(muted);
+        assert_eq!(volume_after(last, last), (40.0, false), "the icon's unmute");
     }
 
     /// A forward move is remembered and `Previous` steps back to it, newest first; when nothing
