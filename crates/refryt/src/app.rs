@@ -2604,7 +2604,9 @@ impl App {
             },
             repeat: self.repeat,
             shuffle: self.shuffle,
-            can_previous: self.current.is_some_and(|c| c > 0),
+            // Previous restarts the track, or brings back a queue this one replaced, so the
+            // first track of a queue can go back too.
+            can_previous: self.current.is_some(),
             can_next: !self.queue.is_empty(),
         };
         if self.media_key.as_ref().is_some_and(|k| {
@@ -2735,6 +2737,10 @@ impl App {
         }
         self.queue = store.queue.into_iter().map(|t| t.into_track()).collect();
         self.current = store.current.filter(|i| *i < self.queue.len());
+        // The radio is not saved; the restored queue is taken as chosen, and gets a river like
+        // any hand-picked one, or Autoplay stops at its end. It is asked for once the queue first
+        // plays (see the autoplay step), not here.
+        self.radio = Radio::pending(&self.queue);
         self.now.track = self.current.and_then(|i| self.queue.get(i).cloned());
         self.repeat = store.repeat.map(Into::into).unwrap_or(RepeatMode::Off);
         self.shuffle = store.shuffle;
@@ -5621,11 +5627,15 @@ impl App {
             return;
         }
         match self.next_index() {
+            // Next landing on the track already playing — a one-track queue under Repeat All, or
+            // a shuffle with nothing else left — replays it. `play_index` would take that for a
+            // click on the loaded track and pause it.
+            Some(next) if self.current == Some(next) => self.play_index_restore(next),
             Some(next) => self.play_index(next),
             // At the end with Repeat One, "next" replays the current track.
             None if self.repeat == RepeatMode::One => {
                 if let Some(current) = self.current {
-                    self.play_index(current);
+                    self.play_index_restore(current);
                 }
             }
             None => {}
@@ -5706,11 +5716,9 @@ impl App {
                     return None;
                 }
                 // Every track has played: start the shuffle over, keeping the current one out
-                // of the first pick so it does not immediately repeat.
+                // of the first pick so it does not immediately repeat. Only out of that pick:
+                // marked seen, it would sit out the whole new round as well.
                 self.shuffle_seen.clear();
-                if let Some(t) = self.queue.get(current) {
-                    self.shuffle_seen.insert(t.video_id.clone());
-                }
                 let all: Vec<usize> = (0..self.queue.len())
                     .filter(|&i| i != current && (!loops_chosen || is_chosen(i)))
                     .collect();
@@ -5962,7 +5970,20 @@ impl App {
             radio.chosen.insert(track.video_id.clone());
         }
         match self.radio.as_ref().and_then(|r| r.tail_start(&self.queue)) {
-            Some(i) => self.queue.insert(i, track),
+            Some(i) => {
+                self.queue.insert(i, track);
+                // Playing inside the river's tail, the insert lands above the playing track:
+                // everything from `i` moved down a row, and the indices into the queue with it.
+                if self.current.is_some_and(|c| c >= i) {
+                    self.current = self.current.map(|c| c + 1);
+                    self.play_history.forget_within_queue();
+                    if let Some((index, position)) = self.resume
+                        && index >= i
+                    {
+                        self.resume = Some((index + 1, position));
+                    }
+                }
+            }
             None => self.queue.push(track),
         }
     }
@@ -7714,7 +7735,10 @@ impl eframe::App for App {
         // extended at the low-water mark. Nothing is fetched while the setting is off, nor under
         // Repeat All, which loops the chosen tracks instead (YouTube Music does the same).
         if !self.radio_loading {
-            let wants = self.settings.autoplay && self.repeat != RepeatMode::All;
+            // Not before anything has played this session: a restored queue waits for play.
+            let wants = self.settings.autoplay
+                && self.repeat != RepeatMode::All
+                && self.play_generation > 0;
             let call = self
                 .radio
                 .as_ref()
