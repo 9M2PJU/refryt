@@ -2841,6 +2841,126 @@ impl App {
         )
     }
 
+    /// The transport, once a pass: see [`eframe::App::logic`] for why it is not in `ui`.
+    fn transport_step(&mut self, ctx: &egui::Context) {
+        // Advance the queue when mpv runs out of file. A click in the last frame's panels that
+        // loaded, paused or seeked is read here, a frame later.
+        let state = self.read_player_state();
+        self.player_state = state;
+        // Kept in sync here rather than at every `toggle_pause`/`set_paused` call site — mpv is
+        // the single source of truth for this, and every row/card's play-vs-pause glyph reads
+        // it off `now` rather than reaching for the player directly.
+        self.now.paused = state.paused;
+        // Restore the saved position once its track is loaded, and keep `playback.json` fresh.
+        self.poll_playback(&state);
+        if self.playback_started {
+            self.stall.observe(state.position);
+        }
+        if self.playback_started && state.idle && !self.now.resolving {
+            self.playback_started = false;
+            match self.stall.on_idle(Instant::now()) {
+                // Repeat One replays the track that just ended; anything else advances normally.
+                IdleEnd::Ended => {
+                    if self.repeat == RepeatMode::One {
+                        if let Some(current) = self.current {
+                            self.play_index(current);
+                        }
+                    } else {
+                        self.skip(1);
+                    }
+                }
+                IdleEnd::Retry(delay) => {
+                    tracing::warn!(
+                        position = state.position,
+                        duration = state.duration,
+                        retry = self.stall.retries,
+                        ?delay,
+                        "playback went idle without ever playing; reloading the track"
+                    );
+                }
+                IdleEnd::GiveUp => {
+                    tracing::error!(
+                        track = %self.now.track.as_ref().map_or("?", |t| t.title.as_str()),
+                        "playback never started after the retries; leaving the queue where it is"
+                    );
+                    self.player_error =
+                        Some("Playback did not start. Check the audio output device.".to_owned());
+                    self.toast_error("Playback did not start");
+                }
+            }
+        }
+        // A stalled attempt is reloaded here once its backoff has passed. `play_index_restore`,
+        // not `play_index`: a retry is not a play, and must not write the history.
+        if self.stall.take_due(Instant::now())
+            && let Some(index) = self.current
+        {
+            if let Some(start) = self.stall.start_position() {
+                self.resume = Some((index, start));
+            }
+            self.play_index_restore(index);
+        }
+
+        // Autoplay: one `next` call returns ~50 tracks. A hand-picked queue seeds its tail as
+        // soon as it starts, so the tail is there from the beginning; an open river is
+        // extended at the low-water mark. Nothing is fetched while the setting is off, nor under
+        // Repeat All, which loops the chosen tracks instead (YouTube Music does the same).
+        if !self.radio_loading {
+            // Not before anything has played this session: a restored queue waits for play.
+            let wants = self.settings.autoplay
+                && self.repeat != RepeatMode::All
+                && self.play_generation > 0;
+            let call = self
+                .radio
+                .as_ref()
+                .and_then(|radio| river_call(radio, self.current, &self.queue, wants));
+            if let Some(call) = call {
+                self.radio_loading = true;
+                match call {
+                    RiverCall::Seed { seed } => {
+                        // The guard compares the pending river's seed: record what was asked
+                        // for, which is the queue's tail as it stands now, not when it started.
+                        if let Some(radio) = &mut self.radio {
+                            radio.seed = seed.clone();
+                        }
+                        self.backend.seed_mix(seed);
+                    }
+                    RiverCall::Follow { token, reseed } => {
+                        self.backend.extend_mix(token, reseed);
+                    }
+                }
+            }
+        }
+
+        // Hand the OS widget the current transport. After the advance/autoplay above, so a track
+        // that just changed is what the OS shows.
+        self.publish_media();
+        // Same snapshot, said to Discord.
+        self.publish_presence();
+
+        // The next wake-up, which is what keeps this running while the window is hidden: eframe
+        // calls `logic` then only when a repaint has been asked for. Loading asks for no frames of
+        // its own here: the skeletons and the loading ring each ask for theirs while they are on
+        // screen, and background work shows nothing.
+        if self.playback_started && !state.paused {
+            let hidden = self.hidden
+                || ctx.input(|i| {
+                    let v = i.viewport();
+                    v.occluded.unwrap_or(false) || v.minimized.unwrap_or(false)
+                });
+            ctx.request_repaint_after(playing_repaint_after(PlayingTick {
+                position: state.position,
+                duration: state.duration,
+                seen_playing: self.stall.played_any,
+                next_lyric: self.next_lyric_at(state.position),
+                hidden,
+            }));
+        }
+        // A pending stall reload needs a frame at its due time; nothing else will ask for one.
+        if let Some(at) = self.stall.pending_at() {
+            ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
+        }
+    }
+
     /// Act on a restored position once its track is actually playing, and save the transport
     /// every few seconds so a crash or a kill loses little.
     fn poll_playback(&mut self, state: &crate::player::PlayerState) {
@@ -7274,6 +7394,25 @@ impl eframe::App for App {
         Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
 
+    /// Everything the app does that is not drawing: backend events, the tray and media keys,
+    /// and the transport (the end of a song, a stalled load, autoplay). eframe calls this before
+    /// every [`Self::ui`], and on its own while the window is hidden, where it runs no `ui` at
+    /// all. Windows and macOS count a minimized window as hidden: with this work in `ui`, a
+    /// minimized window played its song out and stopped there, and answered no media key.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_events(ctx);
+        self.probe_while_offline(ctx);
+        self.poll_tray(ctx);
+        self.poll_media(ctx);
+        // A second plain launch asked the running instance to show itself (see `instance`).
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        if crate::instance::poll() {
+            tracing::info!("second launch: showing the window");
+            self.show_window(ctx);
+        }
+        self.transport_step(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.stats.begin_frame();
@@ -7281,18 +7420,7 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::F2)) {
             self.stats.enabled = !self.stats.enabled;
         }
-        self.handle_events(&ctx);
-        self.probe_while_offline(&ctx);
-        self.poll_tray(&ctx);
-        self.poll_media(&ctx);
         self.reload_custom_themes(&ctx);
-        self.player_state = self.read_player_state();
-        // A second plain launch asked the running instance to show itself (see `instance`).
-        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        if crate::instance::poll() {
-            tracing::info!("second launch: showing the window");
-            self.show_window(&ctx);
-        }
         // Login started this run: it is on screen now, so this is the moment to ask. Wayland
         // maps an autostarted window behind whatever already has focus and refuses to raise a
         // window that did not ask; asking on the first frame is also the best chance of getting
@@ -7672,100 +7800,7 @@ impl eframe::App for App {
             chrome::resize_handles(ui);
         }
 
-        // Advance the queue when mpv runs out of file. Read fresh: a click in the panels above
-        // may have loaded, paused or seeked since the top of the frame.
-        let state = self.read_player_state();
-        self.player_state = state;
-        // Kept in sync here rather than at every `toggle_pause`/`set_paused` call site — mpv is
-        // the single source of truth for this, and every row/card's play-vs-pause glyph reads
-        // it off `now` rather than reaching for the player directly.
-        self.now.paused = state.paused;
-        // Restore the saved position once its track is loaded, and keep `playback.json` fresh.
-        self.poll_playback(&state);
         self.sync_lyrics();
-        if self.playback_started {
-            self.stall.observe(state.position);
-        }
-        if self.playback_started && state.idle && !self.now.resolving {
-            self.playback_started = false;
-            match self.stall.on_idle(Instant::now()) {
-                // Repeat One replays the track that just ended; anything else advances normally.
-                IdleEnd::Ended => {
-                    if self.repeat == RepeatMode::One {
-                        if let Some(current) = self.current {
-                            self.play_index(current);
-                        }
-                    } else {
-                        self.skip(1);
-                    }
-                }
-                IdleEnd::Retry(delay) => {
-                    tracing::warn!(
-                        position = state.position,
-                        duration = state.duration,
-                        retry = self.stall.retries,
-                        ?delay,
-                        "playback went idle without ever playing; reloading the track"
-                    );
-                }
-                IdleEnd::GiveUp => {
-                    tracing::error!(
-                        track = %self.now.track.as_ref().map_or("?", |t| t.title.as_str()),
-                        "playback never started after the retries; leaving the queue where it is"
-                    );
-                    self.player_error =
-                        Some("Playback did not start. Check the audio output device.".to_owned());
-                    self.toast_error("Playback did not start");
-                }
-            }
-        }
-        // A stalled attempt is reloaded here once its backoff has passed. `play_index_restore`,
-        // not `play_index`: a retry is not a play, and must not write the history.
-        if self.stall.take_due(Instant::now())
-            && let Some(index) = self.current
-        {
-            if let Some(start) = self.stall.start_position() {
-                self.resume = Some((index, start));
-            }
-            self.play_index_restore(index);
-        }
-
-        // Autoplay: one `next` call returns ~50 tracks. A hand-picked queue seeds its tail as
-        // soon as it starts, so the tail is there from the beginning; an open river is
-        // extended at the low-water mark. Nothing is fetched while the setting is off, nor under
-        // Repeat All, which loops the chosen tracks instead (YouTube Music does the same).
-        if !self.radio_loading {
-            // Not before anything has played this session: a restored queue waits for play.
-            let wants = self.settings.autoplay
-                && self.repeat != RepeatMode::All
-                && self.play_generation > 0;
-            let call = self
-                .radio
-                .as_ref()
-                .and_then(|radio| river_call(radio, self.current, &self.queue, wants));
-            if let Some(call) = call {
-                self.radio_loading = true;
-                match call {
-                    RiverCall::Seed { seed } => {
-                        // The guard compares the pending river's seed: record what was asked
-                        // for, which is the queue's tail as it stands now, not when it started.
-                        if let Some(radio) = &mut self.radio {
-                            radio.seed = seed.clone();
-                        }
-                        self.backend.seed_mix(seed);
-                    }
-                    RiverCall::Follow { token, reseed } => {
-                        self.backend.extend_mix(token, reseed);
-                    }
-                }
-            }
-        }
-
-        // Hand the OS widget the current transport. After the advance/autoplay above, so a track
-        // that just changed is what the OS shows.
-        self.publish_media();
-        // Same snapshot, said to Discord.
-        self.publish_presence();
 
         // After the tray, the title bar's buttons and the rest have had their say about this
         // frame, and before its swap: a window that is on its way out must not wait for the
@@ -7785,28 +7820,9 @@ impl eframe::App for App {
         // is submit-driven and fires here once, on demand.
         let suggest_due = self.poll_suggestions(&ctx);
         self.poll_search();
+        // The playing song's own wake-ups are asked for in `transport_step`, hidden or not.
         if let Some(due) = suggest_due {
             ctx.request_repaint_after(due);
-        } else {
-            // Loading asks for no frames of its own here: the skeletons and the loading ring each
-            // ask for theirs while they are on screen, and background work shows nothing.
-            if self.playback_started && !state.paused {
-                let hidden = ctx.input(|i| {
-                    let v = i.viewport();
-                    v.occluded.unwrap_or(false) || v.minimized.unwrap_or(false)
-                });
-                ctx.request_repaint_after(playing_repaint_after(PlayingTick {
-                    position: state.position,
-                    duration: state.duration,
-                    seen_playing: self.stall.played_any,
-                    next_lyric: self.next_lyric_at(state.position),
-                    hidden,
-                }));
-            }
-        }
-        // A pending stall reload needs a frame at its due time; nothing else will ask for one.
-        if let Some(at) = self.stall.pending_at() {
-            ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
         }
 
         // `scroll_to_top` is NOT cleared here: it is consumed by `page_scroll` itself, so a
