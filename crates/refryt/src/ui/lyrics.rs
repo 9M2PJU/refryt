@@ -16,6 +16,10 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     widgets::clip_card_content(ui, card, theme::CARD_INSET_X, &p);
 
     if app.lyrics_loading {
+        // The card is as wide as what it holds, and the skeleton's ragged lines reach only part
+        // of the way: without this the card's fill stopped short of its right edge. The loaded
+        // lyrics fill it through their scroll area.
+        ui.set_min_width(ui.available_width());
         title(ui, &p);
         ui.horizontal(|ui| {
             ui.add_space(2.0);
