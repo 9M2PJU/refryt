@@ -3790,6 +3790,8 @@ impl App {
                 v.fullscreen.unwrap_or(false),
             )
         });
+        // macOS's simple fullscreen is not a winit fullscreen; see `window_fullscreen`.
+        let fullscreen = fullscreen || crate::window_fullscreen::is(ctx);
         let Some(size) = size else { return };
         if size.x >= min_w - 0.5 || maximized || fullscreen {
             self.window_fit_tries = WINDOW_FIT_TRIES;
@@ -3820,7 +3822,7 @@ impl App {
         if self.fullscreen_check == FullscreenCheck::Done {
             return;
         }
-        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let fullscreen = crate::window_fullscreen::is(ctx);
         let player_has_it = self.fs.open || self.fs.manages_window;
         let (next, action) = fullscreen_step(
             self.fullscreen_check,
@@ -3833,7 +3835,7 @@ impl App {
             FullscreenAction::Nothing => {}
             FullscreenAction::Leave => {
                 tracing::info!("the window was restored fullscreen; leaving it");
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                crate::window_fullscreen::set(ctx, false);
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
             FullscreenAction::Wait => ctx.request_repaint_after(Duration::from_millis(100)),
@@ -5756,11 +5758,11 @@ impl App {
         if self.now.track.is_none() || self.fs.open {
             return;
         }
-        let was_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let was_fullscreen = crate::window_fullscreen::is(ctx);
         tracing::debug!(was_fullscreen, "fullscreen view: entering");
         self.fs = ui::fullscreen::State::entering(self.settings.fullscreen_lyrics, was_fullscreen);
         if !self.fs.window_was_fullscreen {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            crate::window_fullscreen::set(ctx, true);
         }
     }
 
@@ -5771,7 +5773,7 @@ impl App {
             return;
         }
         if self.fs.manages_window && !self.fs.window_was_fullscreen {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            crate::window_fullscreen::set(ctx, false);
         }
         self.fs.open = false;
         self.fs.queue = false;
@@ -7168,7 +7170,7 @@ impl eframe::App for App {
         self.leave_restored_fullscreen(&ctx);
         // A fullscreen window is as square as a maximised one: nothing of the shell's own edge
         // shows, and there is nothing to resize.
-        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let fullscreen = crate::window_fullscreen::is(&ctx);
         let maximized = Self::is_maximized(&ctx) || fullscreen || self.fs.open;
         // Square on Windows, where the shell is opaque: the outer corner pixels of a rounded
         // rect are never painted, and with transparency off that shows the window's own
@@ -7236,7 +7238,7 @@ impl eframe::App for App {
                 if Instant::now() < self.fs.grace_until {
                     // Still waiting for the window to take fullscreen.
                     ctx.request_repaint_after(Duration::from_millis(200));
-                } else if !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+                } else if !crate::window_fullscreen::is(&ctx) {
                     tracing::debug!("fullscreen view: the window left fullscreen");
                     self.fs.open = false;
                     self.fs.queue = false;

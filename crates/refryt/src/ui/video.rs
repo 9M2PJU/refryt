@@ -21,15 +21,13 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     // The surface is a transport control, like the player bar's play button: click to pause,
     // double-click for fullscreen, Escape back out of it.
     let response = ui.interact(rect, ui.id().with("video-surface"), egui::Sense::click());
-    let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+    let fullscreen = crate::window_fullscreen::is(ui.ctx());
     if response.double_clicked() {
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+        crate::window_fullscreen::set(ui.ctx(), !fullscreen);
     } else if response.clicked() {
         app.toggle_playback();
     } else if fullscreen && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        crate::window_fullscreen::set(ui.ctx(), false);
     }
 }
 

@@ -52,6 +52,7 @@ pub mod video;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod webview_login;
 pub mod widgets;
+pub mod window_fullscreen;
 
 use std::sync::Arc;
 
