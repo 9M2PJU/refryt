@@ -408,6 +408,9 @@ fn home_is_stale(loaded_at: Option<Instant>, now: Instant) -> bool {
 /// you were; pausing, seeking, skipping and quitting all save at once.
 const POSITION_SAVE_EVERY: Duration = Duration::from_secs(30);
 
+/// How often the playback state is compared with what `playback.json` holds.
+const PLAYBACK_CHECK_EVERY: Duration = Duration::from_secs(1);
+
 /// What `playback.json` was last written with, for [`playback_save_due`].
 struct SavedPlayback {
     fingerprint: u64,
@@ -2732,6 +2735,12 @@ impl App {
         let Some(store) = crate::playback::load() else {
             return;
         };
+        // The volume first: it is kept with no queue as well, so a volume set before anything
+        // was ever queued (a fresh install) survives a relaunch.
+        if store.volume > 0.5 {
+            self.last_volume = store.volume;
+        }
+        self.muted = store.muted;
         if store.queue.is_empty() {
             return;
         }
@@ -2744,10 +2753,6 @@ impl App {
         self.now.track = self.current.and_then(|i| self.queue.get(i).cloned());
         self.repeat = store.repeat.map(Into::into).unwrap_or(RepeatMode::Off);
         self.shuffle = store.shuffle;
-        if store.volume > 0.5 {
-            self.last_volume = store.volume;
-        }
-        self.muted = store.muted;
         // Anything past a couple of seconds is worth resuming; the very start is not.
         self.resume = (store.position > 1.0)
             .then(|| self.current.map(|i| (i, store.position)))
@@ -2757,12 +2762,9 @@ impl App {
         self.video_open = store.video_open && self.now.track.as_ref().is_some_and(|t| t.wide);
     }
 
-    /// The queue and transport, as the on-disk store shape — `None` when there is nothing worth
-    /// persisting.
+    /// The queue and transport, as the on-disk store shape. Written with an empty queue too, for
+    /// the volume; nothing empties a queue once it has tracks, so this never overwrites one.
     fn playback_store(&self) -> Option<crate::playback::Store> {
-        if self.queue.is_empty() {
-            return None;
-        }
         let position = self.saved_position();
         Some(crate::playback::Store {
             version: 1,
@@ -2830,9 +2832,6 @@ impl App {
 
     /// Whether `playback.json` no longer says what is true: see [`playback_save_due`].
     fn playback_stale(&self) -> bool {
-        if self.queue.is_empty() {
-            return false;
-        }
         playback_save_due(
             self.playback_saved.as_ref(),
             self.playback_fingerprint(),
@@ -2852,7 +2851,7 @@ impl App {
         // it off `now` rather than reaching for the player directly.
         self.now.paused = state.paused;
         // Restore the saved position once its track is loaded, and keep `playback.json` fresh.
-        self.poll_playback(&state);
+        self.poll_playback(ctx, &state);
         if self.playback_started {
             self.stall.observe(state.position);
         }
@@ -2963,7 +2962,7 @@ impl App {
 
     /// Act on a restored position once its track is actually playing, and save the transport
     /// every few seconds so a crash or a kill loses little.
-    fn poll_playback(&mut self, state: &crate::player::PlayerState) {
+    fn poll_playback(&mut self, ctx: &egui::Context, state: &crate::player::PlayerState) {
         if let Some((index, position)) = self.resume {
             if self.current != Some(index) {
                 // The queue moved on; the saved position belongs to a track no longer loaded.
@@ -2975,11 +2974,17 @@ impl App {
                 self.resume = None;
             }
         }
-        if self.last_playback_check.elapsed() >= Duration::from_secs(1) {
+        let since_check = self.last_playback_check.elapsed();
+        if since_check >= PLAYBACK_CHECK_EVERY {
             self.last_playback_check = Instant::now();
             if self.playback_stale() {
                 self.save_playback();
             }
+        } else if self.playback_stale() {
+            // Changed inside the throttle: an idle app paints no later frame to save it on, and
+            // a change from the desktop (shuffle, volume) would wait for the next one, or be lost
+            // to a kill before it. Ask for the pass that saves it.
+            ctx.request_repaint_after(PLAYBACK_CHECK_EVERY - since_check);
         }
         if self.liked_dirty && self.last_liked_save.elapsed() >= Duration::from_secs(5) {
             self.save_liked_if_dirty();
