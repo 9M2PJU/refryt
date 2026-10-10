@@ -7,14 +7,25 @@
 <p align="center">A native YouTube Music client for Linux, Windows and macOS.</p>
 
 <p align="center">
+  <a href="https://github.com/gridoe/refryt/releases/latest"><img src="https://img.shields.io/github/v/release/gridoe/refryt" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/licence-GPL--3.0--or--later-blue" alt="Licence: GPL-3.0-or-later"></a>
+  <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey" alt="Platforms: Linux, Windows, macOS">
+</p>
+
+<p align="center">
   <a href="assets/screenshots/home-classic.png"><img src="assets/screenshots/home-classic.png" width="49%" alt="Home in the classic dark theme"></a>
   <a href="assets/screenshots/home-catppuccin-frappe-blur.png"><img src="assets/screenshots/home-catppuccin-frappe-blur.png" width="49%" alt="Home with the Catppuccin Frappe scheme at 100% transparency on Wayland"></a>
 </p>
+
+<details>
+<summary>More screenshots</summary>
 
 <p align="center">
   <a href="assets/screenshots/macos-home-classic-blur.png"><img src="assets/screenshots/macos-home-classic-blur.png" width="49%" alt="Home on macOS in the classic dark theme at full transparency with background blur"></a>
   <a href="assets/screenshots/macos-fullscreen-player.png"><img src="assets/screenshots/macos-fullscreen-player.png" width="49%" alt="The fullscreen player on macOS with synced lyrics, transparent with background blur"></a>
 </p>
+
+</details>
 
 refryt is a desktop client for YouTube Music written in Rust. There is no browser engine behind it. Playback goes through mpv, and the app talks to YouTube through the same internal API the website uses.
 
@@ -22,6 +33,43 @@ refryt is a desktop client for YouTube Music written in Rust. There is no browse
 - 22 themes, with optional window transparency and background blur.
 - Memory use is typically between 100 and 300 MB, depending on the session.
 - Packages for Linux (AppImage and Flatpak), Windows (installer and zip) and macOS (Apple Silicon DMG).
+
+> [!NOTE]
+> Only the Linux builds have had daily use. The Windows and macOS builds have had much less testing.
+
+## Install
+
+Packages are on the [releases page](https://github.com/gridoe/refryt/releases). Each release has a `refryt-<version>-SHA256SUMS.txt`, and `sha256sum -c` against it checks the downloads.
+
+### macOS
+
+1. Download `refryt-<version>-macos-arm64.dmg`. It is built for Apple Silicon only.
+2. Open the image and drag Refryt to Applications.
+3. The app is signed ad hoc and not notarised, so macOS refuses the first launch. Run `xattr -cr /Applications/Refryt.app` once, or allow the app in System Settings under Privacy & Security.
+
+libmpv and yt-dlp are bundled in the app.
+
+### Linux, AppImage
+
+1. Download `refryt-<version>-x86_64.AppImage`.
+2. Make it executable with `chmod +x` and run it.
+
+From a source checkout, `./scripts/appimage-install.sh install` copies the AppImage to `~/.local/bin` and adds a launcher entry and icons, and `./scripts/appimage-install.sh uninstall` removes them. Uninstalling leaves `~/.config/refryt` and the downloads in place.
+
+### Linux, Flatpak
+
+1. Download `refryt-<version>-x86_64.flatpak`. It is not on Flathub, so it is installed from the file.
+2. Run `flatpak install --user refryt-<version>-x86_64.flatpak`. Flatpak offers to fetch the GNOME 49 runtime the first time.
+3. Start it with `flatpak run io.github.gridoe.refryt`.
+
+mpv and yt-dlp are included. Inside the sandbox the browser import and the Launch on Startup setting are hidden, because neither can work there.
+
+### Windows
+
+1. Download `refryt-<version>-windows-x86_64-setup.exe` and run it. It installs to Program Files, adds a Start menu entry and registers an uninstaller. The installer is unsigned, so SmartScreen warns on the first run.
+2. Alternatively, download `refryt-<version>-windows-x86_64.zip`, extract the whole folder and run `refryt.exe`. The executable needs the DLLs next to it.
+
+To build any of these from source, see [Build from source](#build-from-source).
 
 ## Disclaimer
 
@@ -104,39 +152,7 @@ The project is before 1.0 and changes quickly.
 
 Podcasts are not supported. YouTube changes its internal API without notice, and a change can break playback or a page until a fix is released, usually within a few days.
 
-## Install
-
-Packages are on the [releases page](https://github.com/gridoe/refryt/releases).
-
-### macOS
-
-1. Download `refryt-<version>-macos-arm64.dmg`. It is built for Apple Silicon only.
-2. Open the image and drag Refryt to Applications.
-3. The app is signed ad hoc and not notarised, so macOS refuses the first launch. Run `xattr -cr /Applications/Refryt.app` once, or allow the app in System Settings under Privacy & Security.
-
-libmpv and yt-dlp are bundled in the app.
-
-### Linux, AppImage
-
-1. Download `refryt-<version>-x86_64.AppImage`.
-2. Make it executable with `chmod +x` and run it.
-
-From a source checkout, `./scripts/appimage-install.sh install` copies the AppImage to `~/.local/bin` and adds a launcher entry and icons, and `./scripts/appimage-install.sh uninstall` removes them. Uninstalling leaves `~/.config/refryt` and the downloads in place.
-
-### Linux, Flatpak
-
-1. Download `refryt-<version>-x86_64.flatpak`. It is not on Flathub, so it is installed from the file.
-2. Run `flatpak install --user refryt-<version>-x86_64.flatpak`. Flatpak offers to fetch the GNOME 49 runtime the first time.
-3. Start it with `flatpak run io.github.gridoe.refryt`.
-
-mpv and yt-dlp are included. Inside the sandbox the browser import and the Launch on Startup setting are hidden, because neither can work there.
-
-### Windows
-
-1. Download `refryt-<version>-windows-x86_64-setup.exe` and run it. It installs to Program Files, adds a Start menu entry and registers an uninstaller. The installer is unsigned, so SmartScreen warns on the first run.
-2. Alternatively, download `refryt-<version>-windows-x86_64.zip`, extract the whole folder and run `refryt.exe`. The executable needs the DLLs next to it.
-
-To build any of these from source, see the next section.
+Bugs go to the [issue tracker](https://github.com/gridoe/refryt/issues). The log in the config folder usually shows what went wrong.
 
 ## Build from source
 
