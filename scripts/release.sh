@@ -15,7 +15,13 @@
 #
 #   scripts/release.sh publish <version> --notes FILE [--without-macos] [--yes]
 #       Verifies, then tags v<version>, pushes main and the tag, and creates the GitHub release
-#       with the artifacts attached. Prints what it would do unless --yes is given.
+#       with the artifacts attached, then its checksums. Prints what it would do unless --yes is
+#       given.
+#
+#   scripts/release.sh checksums <version> [--yes]
+#       Downloads the published release's files and writes refryt-<version>-SHA256SUMS.txt for
+#       them; with --yes it is attached to the release, replacing an older one. Run it again after
+#       adding the macOS image, so the sums cover it too. Works on the Mac as well.
 #
 # Nothing here builds: run `just appimage`, `./scripts/build-windows.sh`, `just flatpak` (and
 # `./scripts/build-macos.sh` on the Mac) after `prep` and before `verify`.
@@ -265,11 +271,51 @@ cmd_publish() {
     "${tag_cmd[@]}"
     "${push_cmd[@]}"
     "${release_cmd[@]}"
+    cmd_checksums "$v" --yes
+}
+
+# A SHA-256 of each published file, so a download can be checked with `sha256sum -c`. Read from
+# the release itself rather than dist/: the macOS image is added from another machine, and the
+# sums must cover what people actually download.
+cmd_checksums() {
+    local v="${1:-}"; shift || true
+    local yes=0
+    for a in "$@"; do
+        case "$a" in
+            --yes) yes=1 ;;
+            *) die "unknown option $a" ;;
+        esac
+    done
+    valid_version "$v" || die "usage: release.sh checksums <version> [--yes]"
+    command -v gh > /dev/null || die "gh is needed to read the release"
+    local sums="refryt-$v-SHA256SUMS.txt" tmp
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+    # The files in one folder, the sums in another: written beside them, the sums file would be
+    # created before the list is read and end up hashing itself.
+    mkdir "$tmp/files" "$tmp/out"
+    gh release download "v$v" --dir "$tmp/files" --pattern 'refryt-*' > /dev/null
+    rm -f "$tmp/files/$sums"
+    [ -n "$(ls -A "$tmp/files")" ] || die "release v$v has no files"
+    if command -v sha256sum > /dev/null; then
+        (cd "$tmp/files" && sha256sum refryt-*) > "$tmp/out/$sums"
+    else
+        (cd "$tmp/files" && shasum -a 256 refryt-*) > "$tmp/out/$sums"
+    fi
+    cat "$tmp/out/$sums"
+    if [ "$yes" != 1 ]; then
+        echo
+        echo "dry run: not attached. Run again with --yes to attach $sums to v$v."
+        return 0
+    fi
+    gh release upload "v$v" "$tmp/out/$sums" --clobber
+    echo "attached $sums to v$v"
 }
 
 case "${1:-}" in
     prep) shift; cmd_prep "$@" ;;
     verify) shift; cmd_verify "$@" ;;
     publish) shift; cmd_publish "$@" ;;
-    *) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    checksums) shift; cmd_checksums "$@" ;;
+    *) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

@@ -177,7 +177,10 @@ with the private local patch applied (that patch is a build for one machine and
 never part of a release). `verify` checks that each file in `dist/` exists, was built after
 `HEAD`'s commit (an older one is stale), and has the right things in it. A missing macOS image is
 a warning, since it can only come from a Mac. `publish` runs `verify` again, then tags `v<version>`,
-pushes `main` and the tag, and creates the release with every artifact attached.
+pushes `main` and the tag, and creates the release with every artifact attached, then a
+`refryt-<version>-SHA256SUMS.txt` for them. A macOS image uploaded later from the Mac needs the
+sums redone: `./scripts/release.sh checksums <version> --yes` reads the published files, from any
+machine, and replaces the old sums file.
 
 There's no CI yet, so the gate in `prep` (fmt, clippy `-D warnings`, the tests, and with `--perf`
 the memory and frame-time gates) is the only thing standing between a change and a release.
