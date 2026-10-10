@@ -39,6 +39,7 @@ pub mod pacing;
 pub mod persist;
 pub mod playback;
 pub mod player;
+pub mod queue;
 pub mod settings;
 pub mod stats;
 pub mod theme;

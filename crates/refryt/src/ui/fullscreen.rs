@@ -979,7 +979,7 @@ fn controls(app: &mut App, ui: &mut egui::Ui, m: &Metrics, bottom: Rect, top: Re
             .max_rect(row)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    if widgets::icon_button(&mut cui, &p, Icon::Shuffle, m.icon, app.shuffle).clicked() {
+    if widgets::icon_button(&mut cui, &p, Icon::Shuffle, m.icon, app.q.is_shuffled()).clicked() {
         app.toggle_shuffle();
     }
     let mut skip = 0isize;

@@ -54,10 +54,9 @@ fn seek_width(width: f32, cluster_left: f32, total_w: f32, center_x: f32) -> f32
 pub(crate) fn clock(app: &App) -> (f64, f64) {
     let state = app.player_state;
     let restored = (!app.playback_started)
-        .then_some(app.resume)
-        .flatten()
-        .filter(|(i, _)| Some(*i) == app.current);
-    let position = restored.map(|(_, p)| p).unwrap_or(state.position);
+        .then(|| app.q.resume_here())
+        .flatten();
+    let position = restored.unwrap_or(state.position);
     let duration = if state.duration > 0.0 {
         state.duration
     } else {
@@ -319,7 +318,7 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
 
-    if widgets::icon_button(&mut cui, &p, Icon::Shuffle, 16.0, app.shuffle).clicked() {
+    if widgets::icon_button(&mut cui, &p, Icon::Shuffle, 16.0, app.q.is_shuffled()).clicked() {
         app.toggle_shuffle();
     }
     let mut skip_delta = 0isize;

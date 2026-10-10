@@ -16,8 +16,12 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     // too. Not in the fullscreen drawer, which is no card (see the notches below).
     let card = widgets::card_rect(ui.available_rect_before_wrap(), theme::CARD_INSET);
     let _edge = (!app.fs.open).then(|| widgets::CardEdge::new(ui, card, &app.palette));
-    let start = app.current.map(|i| i + 1).unwrap_or(0);
-    if start >= app.queue.len() {
+    // What plays after the track playing, in the order it will: the rest of the list, or the
+    // shuffle's order, which is drawn when shuffle goes on and then holds.
+    let upcoming = app
+        .q
+        .upcoming(app.repeat, app.radio.as_ref().map(|r| &r.chosen));
+    if upcoming.is_empty() {
         centered(app, ui, "Empty queue");
         return;
     }
@@ -40,7 +44,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         let signed_in = app.signed_in();
         // Where the algorithm's tracks begin, for the "Radio" tail those rows carry. Computed
         // before the destructure below, which borrows `app`'s fields.
-        let radio_tail = app.radio.as_ref().and_then(|r| r.tail_start(&app.queue));
+        let radio_tail = app.q.tail_start(app.radio.as_ref().map(|r| &r.chosen));
         let clicked = {
             let App {
                 palette,
@@ -49,7 +53,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                 stats,
                 liked,
                 now,
-                queue,
+                q,
                 library,
                 ..
             } = app;
@@ -60,9 +64,10 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                 backend,
                 stats,
                 liked,
-                queue.len() - start,
+                upcoming.len(),
                 |i| {
-                    let t = &queue[start + i];
+                    let index = upcoming[i];
+                    let t = &q.tracks()[index];
                     // No album names: this is what happens next, not where each song is
                     // from.
                     let subtitle = track_subtitle_no_album(t);
@@ -76,7 +81,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                         duration: t.duration,
                         // The subtitle's tail slot: the algorithm's tracks read "Radio" where
                         // the listener's own keep their play count.
-                        plays: if radio_tail.is_some_and(|tail| start + i >= tail) {
+                        plays: if radio_tail.is_some_and(|tail| index >= tail) {
                             Some("Radio")
                         } else {
                             t.plays.as_deref()
@@ -94,7 +99,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                             playlist_id: None,
                             playlists: &library.playlists.items,
                             signed_in,
-                            queue_index: Some(start + i),
+                            queue_index: Some(index),
                         }),
                         like: t.like,
                         // The queue is a list of what happens next, not a place to
@@ -114,7 +119,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
             app.row_action(action);
         }
         let i = match clicked.click {
-            Some(ListClick::Row(i)) => start + i,
+            Some(ListClick::Row(i)) => upcoming[i],
             Some(ListClick::Link(route)) => {
                 app.navigate(route);
                 return;
@@ -125,7 +130,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
         // every other way of moving through the queue. Clicking the row already playing just
         // pauses/resumes it (see `play_index`) — nothing new to show, so the scroll position
         // is left alone rather than jumping to the top under you.
-        let already_here = app.current == Some(i);
+        let already_here = app.q.current() == Some(i);
         app.play_index(i);
         if !already_here {
             app.queue_scroll_reset = true;
@@ -181,8 +186,7 @@ fn header(app: &App, ui: &mut egui::Ui, label: &str) {
 
 /// The track the transport is on, above the list of what follows it.
 fn now_playing(app: &mut App, ui: &mut egui::Ui) {
-    let Some(i) = app.current else { return };
-    let Some(track) = app.queue.get(i).cloned() else {
+    let Some(track) = app.q.current_track().cloned() else {
         return;
     };
     header(app, ui, "Now playing");

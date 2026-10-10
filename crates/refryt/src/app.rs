@@ -4,7 +4,6 @@
 //! (Back / Forward in the titlebar). This file holds the state and the wiring: what the route
 //! currently is, what has been fetched for it, and how playback advances.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +14,7 @@ use crate::chrome;
 use crate::images::Images;
 use crate::model::{Entry, LikeStatus, SearchResults, SearchScope, Track};
 use crate::player::{NowPlaying, Player};
+use crate::queue::{PlayQueue, Rewind, Slot};
 use crate::stats::Stats;
 use crate::theme::{self, Palette};
 use crate::ui;
@@ -72,13 +72,6 @@ fn playing_repaint_after(t: PlayingTick) -> Duration {
     Duration::from_secs_f64(wait.clamp(0.05, slow))
 }
 
-/// How many "previous" steps the transport remembers within one queue. Enough to retrace a few
-/// songs, not the whole session. The entries are `(index, queue length)` — cheap — because the
-/// songs themselves are still in the queue; only the autoplay tail added since needs dropping.
-const PLAY_HISTORY: usize = 12;
-/// How many replaced queues are kept for `Previous` to bring back, so starting an album does not
-/// erase the playlist you were in.
-const QUEUE_HISTORY: usize = 5;
 /// How far into a track the transport's Previous restarts it rather than stepping back to the
 /// previous one: within this window of the start a press goes back a track, so consecutive
 /// presses walk backwards, while past it the press returns to the top of the current track.
@@ -96,13 +89,6 @@ pub(crate) struct LocalViewCache {
     pub(crate) path: Vec<String>,
     pub(crate) view: std::sync::Arc<crate::ui::library::LocalView>,
 }
-
-/// How many already-played tracks are kept sitting before `current` before the oldest are
-/// dropped. Autoplay's radio river only ever appends (`append_new`), so an unbounded played
-/// prefix is the one way the queue — and the state `save_playback` serializes every few seconds —
-/// grows without limit over a long session. Generous enough that trimming is never something a
-/// listener could notice by scrolling the queue up.
-const MAX_PLAYED_PREFIX: usize = 200;
 
 /// How long the startup splash may hold the shell back, counted from process start. Generous
 /// against a slow session check and a slow first feed, but a hard stop for the one case neither
@@ -123,32 +109,6 @@ const STALL_BACKOFF: [Duration; MAX_STALL_RETRIES as usize] = [
 /// reports the `start` seek target as the position, so a resumed track that never advanced would
 /// otherwise look exactly like one that played.
 const PLAYED_EPSILON: f64 = 0.25;
-
-/// A step back within the current queue: where the transport was, and how long the queue was.
-/// Restoring truncates any autoplay tail appended after that point.
-struct PlayPoint {
-    index: usize,
-    queue_len: usize,
-}
-
-/// The queue in force before another replaced it, for `Previous` across a queue change.
-struct QueuePoint {
-    queue: Vec<Track>,
-    index: usize,
-    radio: Option<Radio>,
-}
-
-/// Where [`App::previous`] should rewind to.
-enum Rewind {
-    /// Within the current queue: drop anything past `queue_len`, then play `index`.
-    WithinQueue { index: usize, queue_len: usize },
-    /// A queue that was replaced: restore it wholesale.
-    PreviousQueue {
-        queue: Vec<Track>,
-        index: usize,
-        radio: Option<Radio>,
-    },
-}
 
 /// What the transport does at the end of the queue.
 /// Whether a Previous press restarts the current track instead of stepping back to the previous
@@ -439,28 +399,6 @@ fn playback_save_due(
     (position - expected).abs() > 3.0 || (!paused && elapsed >= POSITION_SAVE_EVERY)
 }
 
-/// Where Repeat All wraps: at the end of the tracks the listener chose, so a radio tail appended
-/// before Repeat All went on is looped past rather than played. Playing inside that tail
-/// already, the whole queue is the loop.
-fn loop_end(radio: Option<&Radio>, queue: &[Track], current: usize) -> usize {
-    radio
-        .and_then(|r| r.tail_start(queue))
-        .filter(|&tail| current < tail)
-        .unwrap_or(queue.len())
-}
-
-/// The next index in a queue when not shuffling: the following track, wrapping to the start only
-/// under Repeat All. `None` means the transport stops (or, for Repeat One, replays).
-fn sequential_next(current: usize, len: usize, repeat_all: bool) -> Option<usize> {
-    if current + 1 < len {
-        Some(current + 1)
-    } else if repeat_all && len > 0 {
-        Some(0)
-    } else {
-        None
-    }
-}
-
 /// A seed for the shuffle LCG: the clock mixed with the process id, so two starts differ.
 fn rng_seed() -> u64 {
     let nanos = std::time::SystemTime::now()
@@ -514,68 +452,6 @@ pub(crate) struct PlaylistEditor {
     pub description: String,
     /// The title before editing, so a refused save can be reverted.
     pub original_title: String,
-}
-
-/// The transport's hidden "previous" history: recent positions in the current queue, and whole
-/// queues replaced since. Bounded on both ends so a long session cannot grow it without limit.
-///
-/// Split out from [`App`] so the rewind rules are unit-testable without an egui context.
-#[derive(Default)]
-struct PlayHistory {
-    played: VecDeque<PlayPoint>,
-    queues: VecDeque<QueuePoint>,
-}
-
-impl PlayHistory {
-    /// Remember the track being left. Called for a forward move only — not for `Previous`, or
-    /// the two would ping-pong.
-    fn remember(&mut self, index: usize, queue_len: usize) {
-        self.played.push_back(PlayPoint { index, queue_len });
-        while self.played.len() > PLAY_HISTORY {
-            self.played.pop_front();
-        }
-    }
-
-    /// A track was deleted from the live queue by hand (`RowAction::RemoveFromQueue`), not by
-    /// playing forward through it. Every remembered within-queue point's `index`/`queue_len` was
-    /// captured against the queue's *old* shape, and shifting them to match the new one correctly
-    /// (a removal can land before, at, or after any given point, each needing different handling)
-    /// is not worth the complexity a manual, one-off edit like this creates: it's simpler, and no
-    /// less honest, to treat a manual edit the same as `leaving_queue` already treats a brand new
-    /// queue — Previous stops rewinding past the moment of the edit rather than risk rewinding to
-    /// the wrong track.
-    fn forget_within_queue(&mut self) {
-        self.played.clear();
-    }
-
-    /// One queue is being replaced by another: keep the whole old queue, and clear the
-    /// within-queue points, which index the queue now gone.
-    fn leaving_queue(&mut self, queue: Vec<Track>, index: usize, radio: Option<Radio>) {
-        self.queues.push_back(QueuePoint {
-            queue,
-            index,
-            radio,
-        });
-        while self.queues.len() > QUEUE_HISTORY {
-            self.queues.pop_front();
-        }
-        self.played.clear();
-    }
-
-    /// The next restore point, newest first: a position in this queue, else the queue before it.
-    fn rewind(&mut self) -> Option<Rewind> {
-        if let Some(point) = self.played.pop_back() {
-            return Some(Rewind::WithinQueue {
-                index: point.index,
-                queue_len: point.queue_len,
-            });
-        }
-        self.queues.pop_back().map(|point| Rewind::PreviousQueue {
-            queue: point.queue,
-            index: point.index,
-            radio: point.radio,
-        })
-    }
 }
 
 /// Where the app is looking right now. `Search` carries no payload: the editable query lives in
@@ -940,14 +816,6 @@ impl Radio {
             chosen: tracks.iter().map(|t| t.video_id.clone()).collect(),
         })
     }
-
-    /// Where the river's tail begins: the first queued track the listener did not choose.
-    /// `None` while every track is theirs.
-    pub(crate) fn tail_start(&self, queue: &[Track]) -> Option<usize> {
-        queue
-            .iter()
-            .position(|t| !self.chosen.contains(&t.video_id))
-    }
 }
 
 /// The nearest song (not video) at or before `from`, falling back to whatever sits at `from`
@@ -1047,10 +915,13 @@ enum RiverCall {
 /// Decide whether the river wants a page, borrowing its state rather than cloning it — the
 /// chosen list is as long as the queue. A pending river seeds as soon as its queue starts
 /// (YouTube Music shows the autoplay tail from the beginning), while an open river is followed
-/// at the low-water mark.
+/// at the low-water mark: once fewer than [`RADIO_LOW_WATER`] tracks are `remaining` to play,
+/// counted in play order, since under shuffle the playing track's place in the list says nothing
+/// about how much is left.
 fn river_call(
     radio: &Radio,
     current: Option<usize>,
+    remaining: usize,
     queue: &[Track],
     autoplay: bool,
 ) -> Option<RiverCall> {
@@ -1062,7 +933,7 @@ fn river_call(
         River::Pending => Some(RiverCall::Seed {
             seed: nearest_song_id(queue, queue.len().checked_sub(1)?)?,
         }),
-        River::Open(token) if current + RADIO_LOW_WATER >= queue.len() => Some(RiverCall::Follow {
+        River::Open(token) if remaining < RADIO_LOW_WATER => Some(RiverCall::Follow {
             token: token.clone(),
             reseed: nearest_song_id(queue, current)?,
         }),
@@ -1095,20 +966,6 @@ struct Toast {
 
 /// How close to the end of the queue autoplay starts fetching more.
 const RADIO_LOW_WATER: usize = 10;
-
-/// Append the tracks the queue does not already hold, by video id. A reseed returns the
-/// seed itself as its first track, and continuations may overlap the tail — either way the
-/// queue must not repeat itself. Returns how many were added.
-fn append_new(queue: &mut Vec<Track>, fresh: &[Track]) -> usize {
-    let mut added = 0;
-    for t in fresh {
-        if !queue.iter().any(|q| q.video_id == t.video_id) {
-            queue.push(t.clone());
-            added += 1;
-        }
-    }
-    added
-}
 
 /// Apply a playlist sort in place, keeping "Default" (and "Reverse") honest.
 ///
@@ -1579,11 +1436,10 @@ pub struct App {
     pub(crate) mood_playlists_params: Option<String>,
 
     pub(crate) now: NowPlaying,
-    /// The playable list the transport operates on. Search results, an artist's top songs and
-    /// an album's tracks each become the queue when one of them is started.
-    pub(crate) queue: Vec<Track>,
-    /// Index into `queue`.
-    pub(crate) current: Option<usize>,
+    /// The playable list the transport operates on, the track playing, its restored position,
+    /// the shuffle order and the way back: see [`crate::queue`]. Search results, an artist's top
+    /// songs and an album's tracks each become the queue when one of them is started.
+    pub(crate) q: PlayQueue,
     /// Set once we have asked mpv to play, so we can tell "not started yet" from "track ended".
     pub(crate) playback_started: bool,
     /// Distinguishes a finished track from an attempt that never produced audio; see [`StallGuard`].
@@ -1600,17 +1456,8 @@ pub struct App {
     play_is_video: bool,
     /// Autoplay river state, opened by Start Mix. `None` for a hand-picked queue.
     pub(crate) radio: Option<Radio>,
-    /// Hidden "previous" history for the transport. Bounded; see [`PlayHistory`].
-    play_history: PlayHistory,
     /// What the transport does at the end of the queue.
     pub(crate) repeat: RepeatMode,
-    /// Shuffle: next picks an unplayed track at random instead of the following one.
-    pub(crate) shuffle: bool,
-    /// Video ids played since shuffle began (or since the last wrap), so shuffle does not
-    /// repeat before the queue is exhausted. Cleared when shuffle is toggled.
-    shuffle_seen: std::collections::HashSet<String>,
-    /// LCG state for the shuffle pick — no `rand` dependency for one choice.
-    rng: u64,
     /// A river extension is in flight. Guards the low-water trigger, which runs every frame.
     radio_loading: bool,
     /// The Up Next panel is open.
@@ -1678,9 +1525,6 @@ pub struct App {
     history_loaded_epoch: u64,
     /// The volume to restore on unmute. Updated whenever you set a nonzero volume.
     pub(crate) last_volume: f64,
-    /// A restored position to seek to once the track loads: `(queue index, seconds)`. Consumed
-    /// the first time that track is actually playing, and dropped if the queue moves elsewhere.
-    pub(crate) resume: Option<(usize, f64)>,
     /// What `playback.json` was last written with, reduced to what decides whether it is stale.
     /// `None` until the first write.
     playback_saved: Option<SavedPlayback>,
@@ -2060,18 +1904,13 @@ impl App {
             mood_playlists_error: None,
             mood_playlists_params: None,
             now: NowPlaying::default(),
-            queue: Vec::new(),
-            current: None,
+            q: PlayQueue::new(rng_seed()),
             playback_started: false,
             stall: StallGuard::default(),
             play_generation: 0,
             play_is_video: false,
             radio: None,
-            play_history: PlayHistory::default(),
             repeat: RepeatMode::Off,
-            shuffle: false,
-            shuffle_seen: std::collections::HashSet::new(),
-            rng: rng_seed(),
             radio_loading: false,
             upnext_open: queue,
             lyrics_open: lyrics,
@@ -2118,7 +1957,6 @@ impl App {
             history_epoch: 1,
             history_loaded_epoch: 0,
             last_volume: 70.0,
-            resume: None,
             playback_saved: None,
             page_loading_since: None,
             resolving_since: None,
@@ -2552,7 +2390,7 @@ impl App {
                     }
                 }
                 playwire::Event::SetVolume(v) => self.set_user_volume(v * 100.0),
-                playwire::Event::SetShuffle(on) => self.shuffle = on,
+                playwire::Event::SetShuffle(on) => self.set_shuffle(on),
                 playwire::Event::SetRepeat(repeat) => {
                     self.repeat = match repeat {
                         playwire::Repeat::Off => RepeatMode::Off,
@@ -2584,10 +2422,7 @@ impl App {
         let position = if self.playback_started {
             state.position
         } else {
-            self.resume
-                .filter(|(i, _)| Some(*i) == self.current)
-                .map(|(_, p)| p)
-                .unwrap_or(state.position)
+            self.q.resume_here().unwrap_or(state.position)
         };
         let Some(media) = self.media.as_mut() else {
             return;
@@ -2606,11 +2441,11 @@ impl App {
                 self.last_volume.round() as i32
             },
             repeat: self.repeat,
-            shuffle: self.shuffle,
+            shuffle: self.q.is_shuffled(),
             // Previous restarts the track, or brings back a queue this one replaced, so the
             // first track of a queue can go back too.
-            can_previous: self.current.is_some(),
-            can_next: !self.queue.is_empty(),
+            can_previous: self.q.current().is_some(),
+            can_next: !self.q.is_empty(),
         };
         if self.media_key.as_ref().is_some_and(|k| {
             k.scalars == scalars
@@ -2659,10 +2494,7 @@ impl App {
         let position = if self.playback_started {
             state.position
         } else {
-            self.resume
-                .filter(|(i, _)| Some(*i) == self.current)
-                .map(|(_, p)| p)
-                .unwrap_or(state.position)
+            self.q.resume_here().unwrap_or(state.position)
         };
         let Some(track) = self.now.track.as_ref() else {
             // Nothing to show: withdraw, but only if something was ever announced.
@@ -2744,19 +2576,22 @@ impl App {
         if store.queue.is_empty() {
             return;
         }
-        self.queue = store.queue.into_iter().map(|t| t.into_track()).collect();
-        self.current = store.current.filter(|i| *i < self.queue.len());
+        let tracks: Vec<Track> = store.queue.into_iter().map(|t| t.into_track()).collect();
         // The radio is not saved; the restored queue is taken as chosen, and gets a river like
         // any hand-picked one, or Autoplay stops at its end. It is asked for once the queue first
         // plays (see the autoplay step), not here.
-        self.radio = Radio::pending(&self.queue);
-        self.now.track = self.current.and_then(|i| self.queue.get(i).cloned());
+        self.radio = Radio::pending(&tracks);
+        // Anything past a couple of seconds is worth resuming; the very start is not. The
+        // shuffle order is not saved: a shuffled session draws a fresh one.
+        self.q.restore_session(
+            tracks,
+            store.current,
+            (store.position > 1.0).then_some(store.position),
+            store.shuffle,
+            self.radio.as_ref().map(|r| &r.chosen),
+        );
+        self.now.track = self.q.current_track().cloned();
         self.repeat = store.repeat.map(Into::into).unwrap_or(RepeatMode::Off);
-        self.shuffle = store.shuffle;
-        // Anything past a couple of seconds is worth resuming; the very start is not.
-        self.resume = (store.position > 1.0)
-            .then(|| self.current.map(|i| (i, store.position)))
-            .flatten();
         // The video view only comes back for a track that has a video to show; the flag can be
         // stale against a queue that has since moved to an audio-only track.
         self.video_open = store.video_open && self.now.track.as_ref().is_some_and(|t| t.wide);
@@ -2769,14 +2604,15 @@ impl App {
         Some(crate::playback::Store {
             version: 1,
             queue: self
-                .queue
+                .q
+                .tracks()
                 .iter()
                 .map(crate::playback::PersistedTrack::from_track)
                 .collect(),
-            current: self.current,
+            current: self.q.current(),
             position,
             repeat: Some(self.repeat.into()),
-            shuffle: self.shuffle,
+            shuffle: self.q.is_shuffled(),
             volume: self.last_volume,
             muted: self.muted,
             video_open: self.video_open,
@@ -2800,7 +2636,7 @@ impl App {
         if self.playback_started {
             self.player_state.position
         } else {
-            self.resume.map(|(_, p)| p).unwrap_or(0.0)
+            self.q.resume().map(|(_, p)| p).unwrap_or(0.0)
         }
     }
 
@@ -2818,12 +2654,12 @@ impl App {
     fn playback_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        for track in &self.queue {
+        for track in self.q.tracks() {
             track.video_id.hash(&mut h);
         }
-        self.current.hash(&mut h);
+        self.q.current().hash(&mut h);
         self.repeat.hash(&mut h);
-        self.shuffle.hash(&mut h);
+        self.q.is_shuffled().hash(&mut h);
         self.last_volume.to_bits().hash(&mut h);
         self.muted.hash(&mut h);
         self.video_open.hash(&mut h);
@@ -2861,7 +2697,7 @@ impl App {
                 // Repeat One replays the track that just ended; anything else advances normally.
                 IdleEnd::Ended => {
                     if self.repeat == RepeatMode::One {
-                        if let Some(current) = self.current {
+                        if let Some(current) = self.q.current() {
                             self.play_index(current);
                         }
                     } else {
@@ -2891,10 +2727,10 @@ impl App {
         // A stalled attempt is reloaded here once its backoff has passed. `play_index_restore`,
         // not `play_index`: a retry is not a play, and must not write the history.
         if self.stall.take_due(Instant::now())
-            && let Some(index) = self.current
+            && let Some(index) = self.q.current()
         {
             if let Some(start) = self.stall.start_position() {
-                self.resume = Some((index, start));
+                self.q.set_resume(Some((index, start)));
             }
             self.play_index_restore(index);
         }
@@ -2908,10 +2744,12 @@ impl App {
             let wants = self.settings.autoplay
                 && self.repeat != RepeatMode::All
                 && self.play_generation > 0;
-            let call = self
-                .radio
-                .as_ref()
-                .and_then(|radio| river_call(radio, self.current, &self.queue, wants));
+            let remaining = self
+                .q
+                .remaining(self.repeat, self.radio.as_ref().map(|r| &r.chosen));
+            let call = self.radio.as_ref().and_then(|radio| {
+                river_call(radio, self.q.current(), remaining, self.q.tracks(), wants)
+            });
             if let Some(call) = call {
                 self.radio_loading = true;
                 match call {
@@ -2963,15 +2801,15 @@ impl App {
     /// Act on a restored position once its track is actually playing, and save the transport
     /// every few seconds so a crash or a kill loses little.
     fn poll_playback(&mut self, ctx: &egui::Context, state: &crate::player::PlayerState) {
-        if let Some((index, position)) = self.resume {
-            if self.current != Some(index) {
+        if let Some((index, position)) = self.q.resume() {
+            if self.q.current() != Some(index) {
                 // The queue moved on; the saved position belongs to a track no longer loaded.
-                self.resume = None;
+                self.q.set_resume(None);
             } else if self.playback_started && state.duration > 0.0 {
                 if let Some(player) = self.player.as_ref() {
                     player.seek(position);
                 }
-                self.resume = None;
+                self.q.set_resume(None);
             }
         }
         let since_check = self.last_playback_check.elapsed();
@@ -3139,8 +2977,10 @@ impl App {
 
     /// Reload the current track in the mode the video toggle is now in, keeping the position.
     fn reload_current(&mut self) {
-        let Some(index) = self.current else { return };
-        let Some(track) = self.queue.get(index).cloned() else {
+        let Some(index) = self.q.current() else {
+            return;
+        };
+        let Some(track) = self.q.get(index).cloned() else {
             return;
         };
         let position = self
@@ -3163,7 +3003,7 @@ impl App {
         // The position rides the load itself (`start`), applied once every track — including a
         // video's external audio — is open; a seek after the load moved only the video.
         let start_at = (position > 1.0).then_some(position);
-        self.resume = start_at.map(|p| (index, p));
+        self.q.set_resume(start_at.map(|p| (index, p)));
         self.play_generation = self.start_track(track, handle, volume, start_at);
     }
 
@@ -3171,8 +3011,8 @@ impl App {
     pub(crate) fn toggle_playback(&mut self) {
         match (&self.player, self.playback_started) {
             (Some(pl), true) => pl.toggle_pause(),
-            (Some(_), false) if !self.queue.is_empty() => {
-                self.play_index(self.current.unwrap_or(0))
+            (Some(_), false) if !self.q.is_empty() => {
+                self.play_index(self.q.current().unwrap_or_else(|| self.q.first()))
             }
             _ => {}
         }
@@ -5234,30 +5074,25 @@ impl App {
                         let now_id = self.now.track.as_ref().map(|t| t.video_id.as_str());
                         mix_seed_index(self.playback_started, now_id, &seed, &queue.tracks)
                     };
+                    // A mix opens a flowing river, where a hand-picked start opens a latent one.
+                    // No token means the mix itself was one page long.
+                    let radio = Some(Radio {
+                        state: queue.next.map_or(River::Dead, River::Open),
+                        chosen: std::iter::once(seed.clone()).collect(),
+                        seed: seed.clone(),
+                    });
                     if let Some(seed_index) = seed_index {
                         tracing::info!(%seed, "start mix: keeping the playing track");
-                        self.replace_queue(queue.tracks);
-                        self.current = Some(seed_index);
+                        self.replace_queue(queue.tracks, seed_index, radio);
+                        self.q.set_current(seed_index);
                         // The mix's own row carries fresher state than the one now playing (its
                         // rating came with the mix); the audio is the same file either way.
-                        if let Some(t) = self.queue.get(seed_index).cloned() {
+                        if let Some(t) = self.q.get(seed_index).cloned() {
                             self.now.track = Some(t);
                         }
-                        self.radio = Some(Radio {
-                            state: queue.next.map_or(River::Dead, River::Open),
-                            chosen: std::iter::once(seed.clone()).collect(),
-                            seed,
-                        });
                         self.prefetch_next();
                     } else {
-                        self.start_from(queue.tracks, 0);
-                        // Set after `start_from`: a hand-picked start opens a latent river, a mix
-                        // opens a flowing one. No token means the mix itself was one page long.
-                        self.radio = Some(Radio {
-                            state: queue.next.map_or(River::Dead, River::Open),
-                            chosen: std::iter::once(seed.clone()).collect(),
-                            seed,
-                        });
+                        self.start_queue(queue.tracks, 0, radio);
                     }
                 }
                 Event::MixFailed { seed, error } => {
@@ -5276,12 +5111,14 @@ impl App {
                             .as_ref()
                             .is_some_and(|r| r.state == River::Pending && r.seed == seed);
                     if fresh {
-                        let added = append_new(&mut self.queue, &queue.tracks);
+                        let added = self
+                            .q
+                            .append_radio(&queue.tracks, self.radio.as_ref().map(|r| &r.chosen));
                         tracing::debug!(added, "seeded the autoplay tail");
                         if let Some(radio) = &mut self.radio {
                             radio.state = landed(added, queue.next);
                         }
-                        self.trim_played_prefix();
+                        self.q.trim_played_prefix();
                     }
                 }
                 Event::MixSeedFailed { seed, error } => {
@@ -5325,7 +5162,9 @@ impl App {
                             .as_ref()
                             .is_some_and(|r| matches!(&r.state, River::Open(t) if t == &token));
                     if fresh {
-                        let added = append_new(&mut self.queue, &queue.tracks);
+                        let added = self
+                            .q
+                            .append_radio(&queue.tracks, self.radio.as_ref().map(|r| &r.chosen));
                         tracing::debug!(added, "extended the radio river");
                         if let Some(radio) = &mut self.radio {
                             // A page that adds nothing ends the river. Keeping its token would
@@ -5334,7 +5173,7 @@ impl App {
                             // hold would be requested forever, one round trip at a time.
                             radio.state = landed(added, queue.next);
                         }
-                        self.trim_played_prefix();
+                        self.q.trim_played_prefix();
                     }
                 }
                 Event::MixMoreFailed { token, error } => {
@@ -5600,34 +5439,30 @@ impl App {
         // follows, rather than restarting it from the top. The whole-list comparison matters:
         // a mix seeded from the song playing now opens with that song, and matching the track
         // alone made Start Mix just toggle playback, leaving the queue untouched.
-        if self.current == Some(index) && same_queue(&self.queue, &tracks) {
+        if self.q.current() == Some(index) && same_queue(self.q.tracks(), &tracks) {
             self.toggle_playback();
             return;
         }
-        self.replace_queue(tracks);
-        // Every hand-picked queue carries a latent river; `Event::MixLoaded` overwrites it
-        // with a flowing one. The Autoplay setting decides whether either is asked for a
-        // page, so switching it on mid-queue works.
-        self.radio = Radio::pending(&self.queue);
+        // Every hand-picked queue carries a latent river; `Event::MixLoaded` opens a flowing one
+        // instead. The Autoplay setting decides whether either is asked for a page, so switching
+        // it on mid-queue works.
+        let radio = Radio::pending(&tracks);
+        self.start_queue(tracks, index, radio);
+    }
+
+    /// Make `tracks` the queue, with `radio` as its river, and play `index`.
+    fn start_queue(&mut self, tracks: Vec<Track>, index: usize, radio: Option<Radio>) {
+        self.replace_queue(tracks, index, radio);
         self.play_index_restore(index);
     }
 
     /// Swap the queue under whatever is (or is not) playing, without loading anything. The old
-    /// queue is remembered for `Previous`, and the panel is asked to show the new queue's start.
-    fn replace_queue(&mut self, tracks: Vec<Track>) {
-        // Leaving one queue for another: keep the whole old queue so `Previous` can bring it
-        // back. The within-queue history indexes the old queue, so it is cleared here.
-        if let Some(current) = self.current {
-            let old = std::mem::take(&mut self.queue);
-            self.play_history
-                .leaving_queue(old, current, self.radio.take());
-        }
-        self.queue = tracks;
-        // A new queue has different tracks; the shuffle seen-set does not carry over.
-        self.shuffle_seen.clear();
-        // Nor does a restored position: it is keyed by index, and the new queue's song at that
-        // index would open where the last session's song left off.
-        self.resume = None;
+    /// queue and its river are remembered for `Previous`, and the panel is asked to show the new
+    /// queue's start. `start` is the track about to play, which a shuffle draws first.
+    fn replace_queue(&mut self, tracks: Vec<Track>, start: usize, radio: Option<Radio>) {
+        let old = std::mem::replace(&mut self.radio, radio);
+        self.q
+            .replace(tracks, old, start, self.radio.as_ref().map(|r| &r.chosen));
         // A brand new queue, so the panel should show its start — matching what the queue
         // panel's own row click already does for the in-queue case. Set here rather than in
         // `play_index_restore` itself, which is also what natural end-of-track auto-advance and
@@ -5658,17 +5493,17 @@ impl App {
         // same convention `start_from` follows for the same reason. `playback_started` matters:
         // a restored queue arrives with `current` set but nothing loaded, and that case must
         // fall through and actually load the track rather than toggle (which would recurse).
-        if self.current == Some(index) && self.playback_started {
+        if self.q.current() == Some(index) && self.playback_started {
             self.toggle_playback();
             return;
         }
-        self.record_play();
+        self.q.remember_current();
         self.play_index_restore(index);
     }
 
     /// `play_index` without touching the history — for `Previous` itself and a fresh queue.
     fn play_index_restore(&mut self, index: usize) {
-        let Some(track) = self.queue.get(index).cloned() else {
+        let Some(track) = self.q.get(index).cloned() else {
             return;
         };
         let Some(player) = self.player.as_mut() else {
@@ -5687,54 +5522,24 @@ impl App {
         };
         // A retry that worked clears the note an earlier failure put up.
         self.player_error = None;
-        self.current = Some(index);
+        self.q.set_current(index);
         self.playback_started = false;
         // A restored queue — or a scrub before play — carries a position for this very track;
         // it rides the load as a per-file `start`, and is consumed here so a later frame does
         // not seek the newly opened file a second time.
-        let start_at = self.resume.filter(|(i, _)| *i == index).map(|(_, p)| p);
-        if start_at.is_some() {
-            self.resume = None;
-        }
+        let start_at = self.q.take_resume_for(index);
         self.play_generation = self.start_track(track, handle, volume, start_at);
     }
 
-    /// Remember the track the transport is leaving, so `Previous` can rewind to it.
-    fn record_play(&mut self) {
-        let Some(current) = self.current else { return };
-        self.play_history.remember(current, self.queue.len());
-    }
-
-    /// Drop the oldest already-played tracks once there are more than `MAX_PLAYED_PREFIX` of
-    /// them sitting before `current` — see that constant's own doc comment for why. Called after
-    /// autoplay appends more tracks (`Event::MixSeeded`/`MixMore`), the only place the queue grows
-    /// without a listener-driven bound.
-    fn trim_played_prefix(&mut self) {
-        let Some(current) = self.current else { return };
-        let Some(drop) = current.checked_sub(MAX_PLAYED_PREFIX) else {
-            return;
-        };
-        if drop == 0 {
-            return;
-        }
-        self.queue.drain(..drop);
-        self.current = Some(current - drop);
-        // Every remembered position just shifted by `drop` — see
-        // `PlayHistory::forget_within_queue`'s own doc comment for why starting fresh is simpler
-        // and no less honest than shifting each one to match.
-        self.play_history.forget_within_queue();
-        if let Some((index, position)) = self.resume {
-            self.resume = index.checked_sub(drop).map(|i| (i, position));
-        }
-    }
-
+    /// Ask for the next track's stream ahead of time. Under shuffle too: the order is drawn when
+    /// shuffle goes on, so the next track is known.
     fn prefetch_next(&self) {
-        // Under shuffle the next track is chosen at advance time; there is nothing stable to
-        // prefetch, and guessing would fetch art and audio that never plays.
-        if self.shuffle {
-            return;
-        }
-        if let Some(next) = self.current.and_then(|i| self.queue.get(i + 1)) {
+        let chosen = self.radio.as_ref().map(|r| &r.chosen);
+        if let Some(next) = self
+            .q
+            .peek_next(self.repeat, chosen)
+            .and_then(|i| self.q.get(i))
+        {
             // The video view will hand the next track to `play_video`, which needs the video
             // resolver's URLs — an audio resolve would be thrown away. An audio-only track still
             // gets the audio resolve, since that is what it will play.
@@ -5751,15 +5556,18 @@ impl App {
             self.previous();
             return;
         }
-        match self.next_index() {
+        let next = self
+            .q
+            .next(self.repeat, self.radio.as_ref().map(|r| &r.chosen));
+        match next {
             // Next landing on the track already playing — a one-track queue under Repeat All, or
             // a shuffle with nothing else left — replays it. `play_index` would take that for a
             // click on the loaded track and pause it.
-            Some(next) if self.current == Some(next) => self.play_index_restore(next),
+            Some(next) if self.q.current() == Some(next) => self.play_index_restore(next),
             Some(next) => self.play_index(next),
             // At the end with Repeat One, "next" replays the current track.
             None if self.repeat == RepeatMode::One => {
-                if let Some(current) = self.current {
+                if let Some(current) = self.q.current() {
                     self.play_index_restore(current);
                 }
             }
@@ -5797,81 +5605,18 @@ impl App {
         }
     }
 
-    /// Turn shuffle on or off. On, the current track is marked played so it is not picked again
-    /// before the rest of the queue; off, the seen set is dropped.
+    /// Turn shuffle on or off: see [`Self::set_shuffle`].
     pub(crate) fn toggle_shuffle(&mut self) {
-        self.shuffle = !self.shuffle;
-        self.shuffle_seen.clear();
-        if self.shuffle
-            && let Some(t) = self.current.and_then(|i| self.queue.get(i))
-        {
-            self.shuffle_seen.insert(t.video_id.clone());
-        }
+        self.set_shuffle(!self.q.is_shuffled());
     }
 
-    /// The next queue index: the following track, or a random unplayed one under shuffle.
-    /// Wraps only under Repeat All; `None` means the transport should stop.
-    fn next_index(&mut self) -> Option<usize> {
-        let current = self.current?;
-        if self.shuffle && self.queue.len() > 1 {
-            if let Some(t) = self.queue.get(current) {
-                self.shuffle_seen.insert(t.video_id.clone());
-            }
-            let mut cand: Vec<usize> = (0..self.queue.len())
-                .filter(|&i| i != current && !self.shuffle_seen.contains(&self.queue[i].video_id))
-                .collect();
-            // Exhaust the tracks the listener actually chose before spilling into whatever
-            // autoplay appended — otherwise shuffle drifts into radio content the moment the
-            // river tops the queue up, long before the playlist's own tracks are done.
-            let repeat_all = self.repeat == RepeatMode::All;
-            let is_chosen = |i: usize| {
-                self.radio
-                    .as_ref()
-                    .is_none_or(|radio| radio.chosen.contains(&self.queue[i].video_id))
-            };
-            // Under Repeat All the loop is the chosen tracks alone, so once they have all played
-            // the shuffle starts over rather than drifting into a tail appended earlier.
-            let loops_chosen = repeat_all && (0..self.queue.len()).any(is_chosen);
-            let chosen: Vec<usize> = cand.iter().copied().filter(|&i| is_chosen(i)).collect();
-            if !chosen.is_empty() || loops_chosen {
-                cand = chosen;
-            }
-            if cand.is_empty() {
-                if !repeat_all {
-                    return None;
-                }
-                // Every track has played: start the shuffle over, keeping the current one out
-                // of the first pick so it does not immediately repeat. Only out of that pick:
-                // marked seen, it would sit out the whole new round as well.
-                self.shuffle_seen.clear();
-                let all: Vec<usize> = (0..self.queue.len())
-                    .filter(|&i| i != current && (!loops_chosen || is_chosen(i)))
-                    .collect();
-                if all.is_empty() {
-                    return Some(current);
-                }
-                let r = self.next_rng();
-                return Some(all[(r >> 33) as usize % all.len()]);
-            }
-            let r = self.next_rng();
-            return Some(cand[(r >> 33) as usize % cand.len()]);
-        }
-        let repeat_all = self.repeat == RepeatMode::All;
-        let len = if repeat_all {
-            loop_end(self.radio.as_ref(), &self.queue, current)
-        } else {
-            self.queue.len()
-        };
-        sequential_next(current, len, repeat_all)
-    }
-
-    /// One LCG step, seeded from the clock at startup — enough for a shuffle pick.
-    fn next_rng(&mut self) -> u64 {
-        self.rng = self
-            .rng
-            .wrapping_mul(0x5851f42d4c957f2d)
-            .wrapping_add(0x14057b7ef767814f);
-        self.rng
+    /// Turn shuffle on or off. On, the rest of the queue is drawn into an order that then holds,
+    /// so Up next shows it and the next track is preloaded; off, the list order goes on from the
+    /// track playing.
+    pub(crate) fn set_shuffle(&mut self, on: bool) {
+        self.q
+            .set_shuffle(on, self.radio.as_ref().map(|r| &r.chosen));
+        self.prefetch_next();
     }
 
     /// Go back: first within the track, then within this queue, then to the queue that preceded
@@ -5883,9 +5628,14 @@ impl App {
         if self.restart_current() {
             return;
         }
-        match self.play_history.rewind() {
+        // Under shuffle, the track before this one in the order it is playing in.
+        if let Some(index) = self.q.previous_in_order() {
+            self.play_index_restore(index);
+            return;
+        }
+        match self.q.rewind() {
             Some(Rewind::WithinQueue { index, queue_len }) => {
-                self.queue.truncate(queue_len);
+                self.q.truncate(queue_len);
                 self.play_index_restore(index);
             }
             Some(Rewind::PreviousQueue {
@@ -5893,20 +5643,17 @@ impl App {
                 index,
                 radio,
             }) => {
-                self.queue = queue;
                 self.radio = radio;
-                self.shuffle_seen.clear();
-                // The position belonged to the queue being left, as in `replace_queue`.
-                self.resume = None;
+                self.q
+                    .restore_queue(queue, index, self.radio.as_ref().map(|r| &r.chosen));
                 self.play_index_restore(index);
             }
             // Nothing remembered: a plain positional step, like any transport — except under
-            // shuffle, where array order carries no relationship to play order, so there is
-            // nothing honest to step back to. Say nothing rather than fabricate a random-
-            // looking jump.
+            // shuffle, where list order is not the order things played in, so there is nothing
+            // honest to step back to.
             None => {
-                if !self.shuffle
-                    && let Some(current) = self.current
+                if !self.q.is_shuffled()
+                    && let Some(current) = self.q.current()
                     && current > 0
                 {
                     self.play_index_restore(current - 1);
@@ -5920,7 +5667,7 @@ impl App {
     /// session) has no mpv position, so its saved resume position stands in, exactly as
     /// `publish_media` substitutes it.
     fn restart_current(&mut self) -> bool {
-        let Some(current) = self.current else {
+        let Some(current) = self.q.current() else {
             return false;
         };
         let position = if self.playback_started {
@@ -5929,10 +5676,7 @@ impl App {
                 .map(|p| p.state().position)
                 .unwrap_or(0.0)
         } else {
-            self.resume
-                .filter(|(i, _)| Some(*i) == self.current)
-                .map(|(_, p)| p)
-                .unwrap_or(0.0)
+            self.q.resume_here().unwrap_or(0.0)
         };
         if !previous_restarts(position) {
             return false;
@@ -5946,7 +5690,7 @@ impl App {
             // moves only the video (see `player::set_start`), so restarting one means loading it
             // again from the top. A restored, not-yet-loaded track is the same: it has to load,
             // and starting over makes its saved position wrong.
-            self.resume = None;
+            self.q.set_resume(None);
             self.play_index_restore(current);
         }
         true
@@ -5960,8 +5704,8 @@ impl App {
             if let Some(pl) = &self.player {
                 pl.seek(seconds);
             }
-        } else if let Some(index) = self.current {
-            self.resume = Some((index, seconds));
+        } else if let Some(index) = self.q.current() {
+            self.q.set_resume(Some((index, seconds)));
         }
     }
 
@@ -6070,16 +5814,19 @@ impl App {
         self.backend.fetch_lyrics(track);
     }
 
-    /// Queue `track` to play next: inserted after the current one, without disturbing what is
-    /// playing. The already-resolved next track is now the wrong one, so it is prefetched
-    /// again — same rule as jumping through the Up Next panel.
+    /// Put `track` straight after the playing one, in the list and in a shuffle's order.
     pub(crate) fn play_next(&mut self, track: Track) {
-        match self.current {
+        match self.q.current() {
             Some(i) => {
-                self.queue.insert(i + 1, track.clone());
                 if let Some(radio) = &mut self.radio {
-                    radio.chosen.insert(track.video_id);
+                    radio.chosen.insert(track.video_id.clone());
                 }
+                self.q.insert(
+                    i + 1,
+                    track,
+                    Slot::Next(0),
+                    self.radio.as_ref().map(|r| &r.chosen),
+                );
                 self.prefetch_next();
             }
             // Nothing playing yet: next is meaningless, so this becomes a plain append.
@@ -6089,28 +5836,14 @@ impl App {
 
     /// Append `track` to the end of the queue, without disturbing what is playing. With a
     /// river's tail already queued, "the end" is before it: the listener's additions come after
-    /// the songs they chose and before the algorithm's.
+    /// the songs they chose and before the algorithm's, in a shuffle's order as well.
     pub(crate) fn add_to_queue(&mut self, track: Track) {
         if let Some(radio) = &mut self.radio {
             radio.chosen.insert(track.video_id.clone());
         }
-        match self.radio.as_ref().and_then(|r| r.tail_start(&self.queue)) {
-            Some(i) => {
-                self.queue.insert(i, track);
-                // Playing inside the river's tail, the insert lands above the playing track:
-                // everything from `i` moved down a row, and the indices into the queue with it.
-                if self.current.is_some_and(|c| c >= i) {
-                    self.current = self.current.map(|c| c + 1);
-                    self.play_history.forget_within_queue();
-                    if let Some((index, position)) = self.resume
-                        && index >= i
-                    {
-                        self.resume = Some((index + 1, position));
-                    }
-                }
-            }
-            None => self.queue.push(track),
-        }
+        let chosen = self.radio.as_ref().map(|r| &r.chosen);
+        let at = self.q.tail_start(chosen).unwrap_or(self.q.len());
+        self.q.insert(at, track, Slot::BeforeRadio, chosen);
     }
 
     /// Whether there is a confirmed session. Every write — rating, the library, playlists —
@@ -6298,14 +6031,18 @@ impl App {
             }
             RowAction::PagePlayNext(tracks) => {
                 let n = tracks.len();
-                match self.current {
-                    Some(mut i) => {
-                        for t in tracks {
-                            i += 1;
+                match self.q.current() {
+                    Some(i) => {
+                        for (k, t) in tracks.into_iter().enumerate() {
                             if let Some(radio) = &mut self.radio {
                                 radio.chosen.insert(t.video_id.clone());
                             }
-                            self.queue.insert(i, t);
+                            self.q.insert(
+                                i + 1 + k,
+                                t,
+                                Slot::Next(k),
+                                self.radio.as_ref().map(|r| &r.chosen),
+                            );
                         }
                         self.prefetch_next();
                     }
@@ -6380,27 +6117,9 @@ impl App {
             RowAction::DeletePlaylist(id) => self.request_delete_playlist(id),
             RowAction::UnsavePlaylist(id) => self.backend.unsave_playlist(id),
             RowAction::RemoveFromQueue(i) => {
-                // The "Now playing" row never carries this menu, but a defensive guard here
-                // costs nothing and keeps the transport from ever removing what it is on.
-                if self.current != Some(i) && i < self.queue.len() {
-                    self.queue.remove(i);
-                    if let Some(current) = self.current
-                        && i < current
-                    {
-                        self.current = Some(current - 1);
-                    }
-                    // The removed slot's index no longer means what it did to either of these —
-                    // see `PlayHistory::forget_within_queue`'s own doc comment for why history
-                    // is dropped outright rather than shifted.
-                    self.play_history.forget_within_queue();
-                    if let Some((index, position)) = self.resume {
-                        if index == i {
-                            self.resume = None;
-                        } else if index > i {
-                            self.resume = Some((index - 1, position));
-                        }
-                    }
-                }
+                // The "Now playing" row never carries this menu; the queue refuses to remove
+                // the playing track anyway, and moves everything that indexes it.
+                self.q.remove(i);
             }
         }
     }
@@ -6954,7 +6673,7 @@ impl App {
         if let Some(t) = self.now.track.as_ref() {
             f(t);
         }
-        for t in &self.queue {
+        for t in self.q.tracks() {
             f(t);
         }
         for t in self
@@ -7049,7 +6768,8 @@ impl App {
     /// A track's rating, from the first copy that holds it. Everything is kept in sync by
     /// [`Self::set_like`], so any copy answers for all of them.
     fn like_of(&self, video_id: &str) -> LikeStatus {
-        self.queue
+        self.q
+            .tracks()
             .iter()
             .find(|t| t.video_id == video_id)
             .map(|t| t.like)
@@ -7074,7 +6794,7 @@ impl App {
         if let Some(t) = self.now.track.as_mut() {
             set(t);
         }
-        for t in &mut self.queue {
+        for t in self.q.tracks_mut() {
             set(t);
         }
         for t in self
@@ -7204,7 +6924,7 @@ impl App {
         if let Some(t) = self.now.track.as_mut() {
             set(t);
         }
-        for t in &mut self.queue {
+        for t in self.q.tracks_mut() {
             set(t);
         }
         for t in self
@@ -8329,22 +8049,6 @@ mod tests {
         }
     }
 
-    /// A reseed returns the seed as its first track and continuations may overlap the tail —
-    /// either way the queue must not repeat itself.
-    #[test]
-    fn extending_the_river_never_repeats_a_track() {
-        let mut queue = vec![track("a"), track("b")];
-        let added = append_new(&mut queue, &[track("b"), track("c"), track("c")]);
-        assert_eq!(added, 1);
-        assert_eq!(
-            queue
-                .iter()
-                .map(|t| t.video_id.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "b", "c"]
-        );
-    }
-
     fn queue_ids(ids: &[&str]) -> Vec<Track> {
         ids.iter().map(|s| track(s)).collect()
     }
@@ -8651,46 +8355,6 @@ mod tests {
         assert_eq!(items[0].id, "c", "an empty order changes nothing");
     }
 
-    /// The plain transport: step forward, wrap only under Repeat All, and stop otherwise.
-    #[test]
-    fn sequential_next_wraps_only_for_repeat_all() {
-        assert_eq!(sequential_next(0, 3, false), Some(1));
-        assert_eq!(
-            sequential_next(2, 3, false),
-            None,
-            "end without repeat stops"
-        );
-        assert_eq!(sequential_next(2, 3, true), Some(0), "Repeat All wraps");
-        assert_eq!(sequential_next(0, 1, false), None);
-        assert_eq!(
-            sequential_next(0, 1, true),
-            Some(0),
-            "a single track repeats"
-        );
-        assert_eq!(
-            sequential_next(0, 0, true),
-            None,
-            "an empty queue never advances"
-        );
-    }
-
-    /// Repeat All loops the chosen tracks, not the radio tail after them — unless the listener
-    /// is already inside that tail, where the whole queue is the loop.
-    #[test]
-    fn repeat_all_wraps_at_the_radio_tail() {
-        let queue = vec![track("a"), track("b"), track("t1"), track("t2")];
-        let r = radio(River::Open("tok".into()), "b", &["a", "b"]);
-        assert_eq!(loop_end(Some(&r), &queue, 1), 2);
-        assert_eq!(
-            sequential_next(1, loop_end(Some(&r), &queue, 1), true),
-            Some(0)
-        );
-        assert_eq!(loop_end(Some(&r), &queue, 2), 4, "inside the tail");
-        assert_eq!(loop_end(None, &queue, 1), 4, "no radio");
-        let all = radio(River::Pending, "t2", &["a", "b", "t1", "t2"]);
-        assert_eq!(loop_end(Some(&all), &queue, 1), 4, "every track chosen");
-    }
-
     /// Previous restarts the track once it is underway, and only steps back within the first
     /// few seconds — so pressing it repeatedly walks backwards from the start.
     #[test]
@@ -8718,96 +8382,6 @@ mod tests {
         assert_eq!(volume_after(last, last), (40.0, false), "the icon's unmute");
     }
 
-    /// A forward move is remembered and `Previous` steps back to it, newest first; when nothing
-    /// is left the history reports nothing so the caller can fall back to a positional step.
-    #[test]
-    fn history_pops_the_newest_position_first() {
-        let mut h = PlayHistory::default();
-        h.remember(0, 5);
-        h.remember(1, 5);
-        assert!(matches!(
-            h.rewind(),
-            Some(Rewind::WithinQueue {
-                index: 1,
-                queue_len: 5
-            })
-        ));
-        assert!(matches!(
-            h.rewind(),
-            Some(Rewind::WithinQueue { index: 0, .. })
-        ));
-        assert!(h.rewind().is_none(), "emptied history must report nothing");
-    }
-
-    /// A manual `RemoveFromQueue` drops the within-queue rewind points — they indexed a queue
-    /// shape that edit just changed — but leaves whole-queue history (`leaving_queue`) alone,
-    /// since that's an independent, already-frozen snapshot the edit cannot touch.
-    #[test]
-    fn removing_a_queue_entry_forgets_only_the_within_queue_points() {
-        let mut h = PlayHistory::default();
-        h.leaving_queue(queue_ids(&["a", "b"]), 0, None);
-        h.remember(1, 5);
-        h.remember(2, 5);
-        h.forget_within_queue();
-        match h.rewind() {
-            Some(Rewind::PreviousQueue { index, .. }) => assert_eq!(index, 0),
-            _ => panic!("expected the earlier whole queue to survive"),
-        }
-    }
-
-    /// A replaced queue is only reached after the points in the current one, and the points
-    /// that indexed the queue now gone were cleared when it was replaced.
-    #[test]
-    fn a_replaced_queue_comes_back_after_the_current_ones() {
-        let mut h = PlayHistory::default();
-        h.remember(3, 9);
-        h.leaving_queue(queue_ids(&["a", "b"]), 1, None);
-        h.remember(2, 5);
-        assert!(matches!(
-            h.rewind(),
-            Some(Rewind::WithinQueue { index: 2, .. })
-        ));
-        match h.rewind() {
-            Some(Rewind::PreviousQueue { queue, index, .. }) => {
-                assert_eq!(index, 1);
-                assert_eq!(
-                    queue
-                        .iter()
-                        .map(|t| t.video_id.as_str())
-                        .collect::<Vec<_>>(),
-                    ["a", "b"]
-                );
-            }
-            _ => panic!("expected the replaced queue"),
-        }
-        assert!(h.rewind().is_none());
-    }
-
-    /// Both stacks are bounded: old entries fall off the front rather than growing forever.
-    #[test]
-    fn history_is_bounded() {
-        let mut h = PlayHistory::default();
-        for i in 0..(PLAY_HISTORY + 5) {
-            h.remember(i, 100);
-        }
-        let mut seen = Vec::new();
-        while let Some(Rewind::WithinQueue { index, .. }) = h.rewind() {
-            seen.push(index);
-        }
-        assert_eq!(seen.len(), PLAY_HISTORY);
-        assert_eq!(seen.first(), Some(&16), "the newest point is first");
-        assert_eq!(seen.last(), Some(&5), "the oldest points fell off");
-
-        for i in 0..(QUEUE_HISTORY + 3) {
-            h.leaving_queue(queue_ids(&[&i.to_string()]), 0, None);
-        }
-        let mut queues = 0;
-        while let Some(Rewind::PreviousQueue { .. }) = h.rewind() {
-            queues += 1;
-        }
-        assert_eq!(queues, QUEUE_HISTORY);
-    }
-
     fn radio(state: River, seed: &str, chosen: &[&str]) -> Radio {
         Radio {
             state,
@@ -8823,12 +8397,12 @@ mod tests {
         let queue = vec![track("a"), track("b"), track("c")];
         let r = radio(River::Pending, "c", &["a", "b", "c"]);
         for current in [0, 1, 2] {
-            match river_call(&r, Some(current), &queue, true) {
+            match river_call(&r, Some(current), queue.len() - current - 1, &queue, true) {
                 Some(RiverCall::Seed { seed }) => assert_eq!(seed, "c"),
                 _ => panic!("pending river should seed at position {current}"),
             }
         }
-        assert!(river_call(&r, None, &queue, true).is_none());
+        assert!(river_call(&r, None, queue.len(), &queue, true).is_none());
     }
 
     /// An open river follows its token only once the queue is within the low-water mark; a dead
@@ -8837,8 +8411,8 @@ mod tests {
     fn an_open_river_follows_only_at_the_low_water_mark() {
         let queue: Vec<Track> = (0..20).map(|i| track(&i.to_string())).collect();
         let open = radio(River::Open("tok".into()), "v", &[]);
-        assert!(river_call(&open, Some(5), &queue, true).is_none());
-        match river_call(&open, Some(10), &queue, true) {
+        assert!(river_call(&open, Some(5), 14, &queue, true).is_none());
+        match river_call(&open, Some(10), 9, &queue, true) {
             Some(RiverCall::Follow { token, reseed }) => {
                 assert_eq!(token, "tok");
                 assert_eq!(reseed, "10");
@@ -8846,7 +8420,7 @@ mod tests {
             _ => panic!("expected a follow at the low-water mark"),
         }
         let dead = radio(River::Dead, "v", &[]);
-        assert!(river_call(&dead, Some(19), &queue, true).is_none());
+        assert!(river_call(&dead, Some(19), 0, &queue, true).is_none());
     }
 
     /// One gate over every river: the setting stops a pending seed and an open follow alike.
@@ -8854,9 +8428,9 @@ mod tests {
     fn the_autoplay_setting_gates_every_river() {
         let queue = vec![track("a")];
         let pending = radio(River::Pending, "a", &["a"]);
-        assert!(river_call(&pending, Some(0), &queue, false).is_none());
+        assert!(river_call(&pending, Some(0), 0, &queue, false).is_none());
         let open = radio(River::Open("tok".into()), "a", &[]);
-        assert!(river_call(&open, Some(0), &queue, false).is_none());
+        assert!(river_call(&open, Some(0), 0, &queue, false).is_none());
     }
 
     /// A page only keeps the river flowing while it adds something and hands back a token.
@@ -8872,17 +8446,19 @@ mod tests {
     #[test]
     fn the_tail_starts_at_the_first_track_the_listener_did_not_choose() {
         let queue = vec![track("a"), track("b"), track("t1"), track("t2")];
+        let mut q = PlayQueue::new(1);
+        q.restore_session(queue.clone(), Some(0), None, false, None);
         let mut r = radio(River::Open("tok".into()), "b", &["a", "b"]);
-        assert_eq!(r.tail_start(&queue), Some(2));
+        assert_eq!(q.tail_start(Some(&r.chosen)), Some(2));
         r.chosen.insert("t1".into());
         r.chosen.insert("t2".into());
-        assert_eq!(r.tail_start(&queue), None);
+        assert_eq!(q.tail_start(Some(&r.chosen)), None);
 
         // And the pending constructor records the queue as chosen, so nothing marks it Radio.
         let pending = Radio::pending(&queue).expect("non-empty queue");
         assert_eq!(pending.state, River::Pending);
         assert_eq!(pending.seed, "t2");
-        assert_eq!(pending.tail_start(&queue), None);
+        assert_eq!(q.tail_start(Some(&pending.chosen)), None);
     }
 
     /// History refreshes once per visit, not once per app run: the entry bumps the epoch, the
