@@ -1079,8 +1079,19 @@ pub(crate) struct DuplicatePrompt {
 }
 
 /// A playlist's count line ("52 tracks", "4,782 songs") moved by `delta`, keeping YouTube's own
-/// wording. Text with no number in it comes back unchanged.
+/// wording. English nouns follow the number ("1 song", "2 songs"), and an empty "No tracks"
+/// counts up from nothing; text in another language keeps its noun as it was, and text with no
+/// number in it otherwise comes back unchanged.
 fn bump_count(text: &str, delta: i64) -> String {
+    for noun in ["tracks", "songs"] {
+        if text == format!("No {noun}") {
+            return if delta > 0 {
+                bump_count(&format!("0 {noun}"), delta)
+            } else {
+                text.to_owned()
+            };
+        }
+    }
     let Some(start) = text.find(|c: char| c.is_ascii_digit()) else {
         return text.to_owned();
     };
@@ -1106,7 +1117,48 @@ fn bump_count(text: &str, delta: i64) -> String {
     } else {
         n.to_string()
     };
-    format!("{}{shown}{}", &text[..start], &text[start + len..])
+    let rest = &text[start + len..];
+    let rest = match rest {
+        " track" | " tracks" => {
+            if n == 1 {
+                " track"
+            } else {
+                " tracks"
+            }
+        }
+        " song" | " songs" => {
+            if n == 1 {
+                " song"
+            } else {
+                " songs"
+            }
+        }
+        other => other,
+    };
+    format!("{}{shown}{rest}", &text[..start])
+}
+
+/// Move `playlist_id`'s count by `delta` in every copy of it on screen: its open page and its row
+/// in the library list, which the sidebar and the Library page both draw. Pure, for the test.
+fn bump_counts_in(
+    page: Option<&mut crate::model::Playlist>,
+    rows: &mut [crate::model::PlaylistRef],
+    playlist_id: &str,
+    delta: i64,
+) {
+    let bare = crate::model::bare_playlist_id;
+    let id = bare(playlist_id);
+    let bump = |count: &mut Option<String>| {
+        if let Some(text) = count.as_deref() {
+            *count = Some(bump_count(text, delta));
+        }
+    };
+    if let Some(page) = page.filter(|p| bare(&p.id) == id) {
+        bump(&mut page.track_count);
+    }
+    for row in rows.iter_mut().filter(|r| bare(&r.id) == id) {
+        bump(&mut row.track_count);
+    }
 }
 
 /// The local half of a playlist drag-reorder: move `items[from]` to sit immediately before
@@ -3613,6 +3665,17 @@ impl App {
     /// Suggestions, the song moves out of them and into the list. A playlist that is not open but
     /// was the last one opened is forgotten, so going back to it fetches it fresh rather than
     /// showing the copy from before the save.
+    /// Move a playlist's count by `delta` wherever it shows, at the moment an add or a removal is
+    /// asked for rather than when YouTube confirms it: a refusal moves it back.
+    fn bump_playlist_counts(&mut self, playlist_id: &str, delta: i64) {
+        bump_counts_in(
+            self.playlist.as_mut(),
+            &mut self.library.playlists.items,
+            playlist_id,
+            delta,
+        );
+    }
+
     fn note_saved_to_playlist(&mut self, playlist_id: &str, video_id: &str) {
         let bare = crate::model::bare_playlist_id;
         let open = self
@@ -3646,9 +3709,7 @@ impl App {
         let Some(pl) = self.playlist.as_mut() else {
             return;
         };
-        if let Some(text) = pl.track_count.as_deref() {
-            pl.track_count = Some(bump_count(text, 1));
-        }
+        // The count went up when the add was asked for (`bump_playlist_counts`).
         // Only onto a list that is all here: appended to a partial one, it would sit in the
         // middle once the next page arrived after it.
         if pl.tracks.next.is_none()
@@ -3675,7 +3736,8 @@ impl App {
     pub(crate) fn add_duplicate_anyway(&mut self) {
         if let Some(p) = self.playlist_duplicate.take() {
             self.backend
-                .add_to_playlist(p.playlist_id, p.video_id, true);
+                .add_to_playlist(p.playlist_id.clone(), p.video_id, true);
+            self.bump_playlist_counts(&p.playlist_id, 1);
         }
     }
 
@@ -5299,6 +5361,9 @@ impl App {
                     total,
                 } => {
                     tracing::debug!(%playlist_id, added, duplicates, total, "bulk save landed");
+                    // The count went up by `total` when the save was asked for; whatever was
+                    // not added comes back off.
+                    self.bump_playlist_counts(&playlist_id, added as i64 - total as i64);
                     if duplicates > 0 && added + duplicates == total {
                         self.toast(&match (added, duplicates) {
                             (0, 1) => "Already in that playlist".to_owned(),
@@ -5329,6 +5394,8 @@ impl App {
                     message,
                 } => {
                     tracing::debug!(%playlist_id, %video_id, "already in the playlist; asking");
+                    // Not added (yet): "Add anyway" asks again, and counts it again.
+                    self.bump_playlist_counts(&playlist_id, -1);
                     self.playlist_duplicate = Some(DuplicatePrompt {
                         playlist_id,
                         video_id,
@@ -5341,6 +5408,7 @@ impl App {
                     error,
                 } => {
                     tracing::warn!(%playlist_id, %video_id, %error, "save to playlist refused");
+                    self.bump_playlist_counts(&playlist_id, -1);
                     self.toast_error("Could not save to that playlist");
                 }
                 Event::PlaylistRemoved {
@@ -5348,14 +5416,8 @@ impl App {
                     video_id,
                 } => {
                     tracing::debug!(%playlist_id, %video_id, "removed from playlist");
+                    // The count went down when the removal was asked for.
                     self.toast("Removed from playlist");
-                    if let Some(pl) = self.playlist.as_mut().filter(|p| {
-                        crate::model::bare_playlist_id(&p.id)
-                            == crate::model::bare_playlist_id(&playlist_id)
-                    }) && let Some(text) = pl.track_count.as_deref()
-                    {
-                        pl.track_count = Some(bump_count(text, -1));
-                    }
                 }
                 Event::PlaylistRemoveFailed {
                     playlist_id,
@@ -5367,6 +5429,9 @@ impl App {
                     // as already loading and would no-op.
                     tracing::warn!(%playlist_id, %video_id, %error, "remove refused; reloading");
                     self.toast_error("Could not remove that song");
+                    // The open page reloads below with YouTube's own count; the library list
+                    // has no reload of its own, so the removal is taken back there.
+                    self.bump_playlist_counts(&playlist_id, 1);
                     if self.playlist.as_ref().is_some_and(|p| p.id == playlist_id) {
                         self.playlist = None;
                         self.playlist_for = None;
@@ -5977,6 +6042,7 @@ impl App {
                     self.toast_error("Sign in to edit playlists");
                     return;
                 }
+                self.bump_playlist_counts(&playlist_id, 1);
                 self.backend.add_to_playlist(playlist_id, video_id, false);
             }
             RowAction::RemoveFromPlaylist {
@@ -6010,6 +6076,7 @@ impl App {
                 // Optimistic: the row leaves at once; a refusal cannot put it back, so that
                 // case refetches the page instead of guessing.
                 self.remove_playlist_row(&playlist_id, &video_id);
+                self.bump_playlist_counts(&playlist_id, -1);
                 self.backend
                     .remove_from_playlist(playlist_id, video_id, set_video_id);
             }
@@ -6084,6 +6151,7 @@ impl App {
                     return;
                 }
                 let n = video_ids.len();
+                self.bump_playlist_counts(&playlist_id, n as i64);
                 self.backend.add_many_to_playlist(playlist_id, video_ids);
                 // Says the work started; the bulk event's verdict overwrites it.
                 self.toast(&format!("Saving {n} songs to {title}…"));
@@ -7807,7 +7875,64 @@ mod tests {
         assert_eq!(bump_count("4,782 songs", 1), "4,783 songs");
         assert_eq!(bump_count("1,000 songs", -1), "999 songs");
         assert_eq!(bump_count("0 songs", -1), "0 songs");
-        assert_eq!(bump_count("No tracks", 1), "No tracks");
+        assert_eq!(bump_count("No tracks", -1), "No tracks");
+        assert_eq!(bump_count("Playlist", 1), "Playlist");
+    }
+
+    /// English nouns follow the number, and an empty playlist counts up from "No …".
+    #[test]
+    fn a_count_line_keeps_singular_and_plural_right() {
+        assert_eq!(bump_count("1 song", 1), "2 songs");
+        assert_eq!(bump_count("2 songs", -1), "1 song");
+        assert_eq!(bump_count("1 track", -1), "0 tracks");
+        assert_eq!(bump_count("No tracks", 1), "1 track");
+        assert_eq!(bump_count("No songs", 3), "3 songs");
+        assert_eq!(
+            bump_count("12 canciones", 1),
+            "13 canciones",
+            "another language keeps its noun"
+        );
+    }
+
+    /// An add moves the count on the open page and on the playlist's row in the library list,
+    /// which the sidebar shows, matching the bare id either way; other playlists are left alone.
+    #[test]
+    fn a_count_moves_on_the_page_and_in_the_sidebar() {
+        let mut page = crate::model::Playlist {
+            id: "VLPLabc".to_owned(),
+            title: String::new(),
+            description: None,
+            author: String::new(),
+            author_id: None,
+            year: None,
+            duration_text: None,
+            track_count: Some("4 songs".to_owned()),
+            thumbnail: None,
+            editable: true,
+            in_library: false,
+            library_add: None,
+            library_remove: None,
+            saveable: false,
+            tracks: crate::model::Paged::new(Vec::new(), None),
+            source: crate::model::PlaylistSource::YouTube,
+            extras: None,
+        };
+        let mut rows = vec![pref("PLabc"), pref("PLother")];
+        rows[0].track_count = Some("4 tracks".to_owned());
+        rows[1].track_count = Some("9 tracks".to_owned());
+        bump_counts_in(Some(&mut page), &mut rows, "PLabc", 1);
+        assert_eq!(page.track_count.as_deref(), Some("5 songs"));
+        assert_eq!(rows[0].track_count.as_deref(), Some("5 tracks"));
+        assert_eq!(rows[1].track_count.as_deref(), Some("9 tracks"));
+        // A refused add takes it back.
+        bump_counts_in(Some(&mut page), &mut rows, "VLPLabc", -1);
+        assert_eq!(page.track_count.as_deref(), Some("4 songs"));
+        assert_eq!(rows[0].track_count.as_deref(), Some("4 tracks"));
+        // With another page open, the sidebar row still moves.
+        page.id = "PLother".to_owned();
+        bump_counts_in(Some(&mut page), &mut rows, "PLabc", 2);
+        assert_eq!(rows[0].track_count.as_deref(), Some("6 tracks"));
+        assert_eq!(page.track_count.as_deref(), Some("4 songs"));
     }
 
     #[test]
