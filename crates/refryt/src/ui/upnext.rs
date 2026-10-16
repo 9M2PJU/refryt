@@ -194,6 +194,7 @@ fn now_playing(app: &mut App, ui: &mut egui::Ui) {
     // `spec_rows` call at index 0, so without this their title/artist links resolve to the
     // exact same widget id (`ui.id()` is the same parent for both — they're sequential calls on
     // the same `Ui`, not separately salted children) and neither one's link reliably works.
+    let signed_in = app.signed_in();
     let clicked = ui
         .push_id("now-playing", |ui| {
             let App {
@@ -203,6 +204,7 @@ fn now_playing(app: &mut App, ui: &mut egui::Ui) {
                 stats,
                 liked,
                 now,
+                library,
                 ..
             } = app;
             let subtitle = track_subtitle_no_album(&track);
@@ -223,10 +225,15 @@ fn now_playing(app: &mut App, ui: &mut egui::Ui) {
                 shape: ArtShape::Square,
                 hide_art: false,
                 thumbnail: track.thumbnail.as_ref(),
-                // No menu on the current track: everything it offers is already in the player
-                // bar, and a menu here would be the only row in the panel that could remove
-                // itself.
-                menu: None,
+                // The same menu as the rows below, without Remove from Queue: the playing track
+                // is not removed from under itself.
+                menu: Some(widgets::RowMenu {
+                    track: &track,
+                    playlist_id: None,
+                    playlists: &library.playlists.items,
+                    signed_in,
+                    queue_index: None,
+                }),
                 like: track.like,
                 show_rating: false,
                 quiet_like: false,

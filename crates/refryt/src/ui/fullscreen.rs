@@ -20,6 +20,11 @@ use crate::theme;
 use crate::ui::RowAction;
 use crate::widgets::{self, EdgeFade, edge_fades, fade_painted, painted_so_far};
 
+/// How far the lyrics fade out at the top and bottom of their column, at scale 1. Long and eased,
+/// so the last line still showing has nearly gone by the column's edge: a short straight ramp left
+/// it at half strength there, which read as a cut rather than a fade.
+const LYRICS_FADE: f32 = 220.0;
+
 /// How long the controls stay up after the last sign of life from the mouse or keyboard.
 const HIDE_AFTER: Duration = Duration::from_secs(3);
 /// Where the active line rests, as a fraction of the lyrics column's height from its top.
@@ -432,7 +437,6 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
         if video {
             // A music video plays where the cover would, at its own 16:9.
             let radius = CornerRadius::same(12);
-            cover_shadow(ui, cover, radius);
             ui.painter().rect_filled(cover, radius, Color32::BLACK);
             crate::ui::video::paint_frame(app, ui, cover, radius);
             if ui
@@ -456,7 +460,6 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
                 crate::ui::art_texture(&mut app.images, &app.backend, &ctx, art_url.as_ref(), 56.0)
                     .cloned()
             });
-            cover_shadow(ui, cover, CornerRadius::same(12));
             widgets::paint_art(ui, &p, cover, texture.as_ref(), widgets::ArtShape::Square);
         }
     }
@@ -563,18 +566,6 @@ fn test_screen() -> Option<Rect> {
 #[cfg(not(debug_assertions))]
 fn test_screen() -> Option<Rect> {
     None
-}
-
-fn cover_shadow(ui: &egui::Ui, cover: Rect, radius: CornerRadius) {
-    ui.painter().add(
-        egui::epaint::Shadow {
-            offset: [0, 14],
-            blur: 44,
-            spread: 0,
-            color: Color32::from_black_alpha(120),
-        }
-        .as_shape(cover, radius),
-    );
 }
 
 /// The two ends of the background's wash: the cover's tint over the window colour at the top,
@@ -783,7 +774,7 @@ fn lyrics_column(
                 }
             });
         // The same band the timed lyrics melt over.
-        let fade = 90.0 * m.scale;
+        let fade = LYRICS_FADE * m.scale;
         let (above, below) = edge_fades(
             (
                 output.state.offset.y,
@@ -797,8 +788,8 @@ fn lyrics_column(
             child.layer_id(),
             from,
             output.inner_rect,
-            EdgeFade::new(fade, above),
-            EdgeFade::new(fade, below),
+            EdgeFade::eased(fade, above),
+            EdgeFade::eased(fade, below),
         );
         return;
     }
@@ -844,7 +835,7 @@ fn lyrics_column(
     let anchor = rect.top() + rect.height() * ANCHOR;
     let view = app.fs.scroll + app.fs.manual;
     let painter = ui.painter().with_clip_rect(visible);
-    let melt = 90.0 * m.scale;
+    let melt = LYRICS_FADE * m.scale;
     let from = painted_so_far(ui);
     let mut clicked = None;
     for (i, galley) in galleys.iter().enumerate() {
@@ -876,8 +867,8 @@ fn lyrics_column(
         ui.layer_id(),
         from,
         rect,
-        EdgeFade::new(melt, 1.0),
-        EdgeFade::new(melt, 1.0),
+        EdgeFade::eased(melt, 1.0),
+        EdgeFade::eased(melt, 1.0),
     );
     if let Some(at_ms) = clicked {
         app.seek_to(at_ms as f64 / 1000.0);
@@ -910,8 +901,8 @@ fn queue_region(app: &mut App, ui: &mut egui::Ui, m: &Metrics, rect: Rect, t: f3
         child.layer_id(),
         from,
         rect,
-        EdgeFade::new(fade, above),
-        EdgeFade::new(fade, below),
+        EdgeFade::eased(fade, above),
+        EdgeFade::eased(fade, below),
     );
 }
 
