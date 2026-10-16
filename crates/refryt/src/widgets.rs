@@ -4770,7 +4770,9 @@ fn menu_row(
 /// A seek bar. Returns the position to seek to, in seconds, when the user scrubs.
 ///
 /// Drawn rather than composed from egui widgets so the hit area can be taller than the visible
-/// 4px line — a hairline you have to hit exactly is miserable to use.
+/// 4px line — a hairline you have to hit exactly is miserable to use. `labels` hangs the elapsed
+/// time left of the bar and the duration right of it; the compact player bar's edge-to-edge line
+/// has no room beside it for either.
 pub fn seek_bar(
     ui: &mut Ui,
     palette: &Palette,
@@ -4778,6 +4780,7 @@ pub fn seek_bar(
     fraction: f32,
     duration: f64,
     position: f64,
+    labels: bool,
 ) -> Option<f64> {
     let hit = bar.expand2(vec2(0.0, 8.0));
     let response = ui.interact(hit, egui::Id::new("ytm-seek"), Sense::click_and_drag());
@@ -4805,7 +4808,7 @@ pub fn seek_bar(
         );
     }
 
-    if duration > 0.0 {
+    if labels && duration > 0.0 {
         for (x, align, secs) in [
             (
                 bar.min.x - 10.0,

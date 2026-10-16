@@ -33,6 +33,16 @@ const SEEK_DY: f32 = 22.0;
 /// label must clear this, or a narrow window paints the video toggle over the number.
 const CONTROL_CLUSTER_W: f32 = 14.0 + 76.0 + 8.0 + 30.0 + 8.0 + 30.0 + 8.0 + 30.0;
 
+/// The least room the full layout must leave the title and credits, or the bar goes compact:
+/// past this the window-centred transport, the seek bar with its labels and the right-hand
+/// cluster crowd out the song — a window snapped to half of a portrait screen painted Queue
+/// over Repeat and the thumbs over the title. The compact bar keeps previous/play/next beside
+/// the volume, runs the seek bar edge to edge along its top without labels, and leaves shuffle
+/// and repeat to their shortcuts (Ctrl+S, Ctrl+R) and the fullscreen player.
+const FULL_FIELD_MIN: f32 = 80.0;
+/// The compact bar's right-hand cluster: the inset and the volume slider with its mute icon.
+const COMPACT_CLUSTER_W: f32 = 14.0 + 76.0 + 8.0 + 30.0;
+
 /// The seek bar's width: grows with the window from the transport's own width up to 420pt,
 /// and never so wide that the duration label hanging right of it reaches the control cluster.
 ///
@@ -46,6 +56,18 @@ fn seek_width(width: f32, cluster_left: f32, total_w: f32, center_x: f32) -> f32
     (width * 0.5 - 250.0)
         .clamp(TRANSPORT_W, 420.0)
         .min(2.0 * room.max(0.0))
+}
+
+/// How wide the title and credits field is in the full layout of a bar `width` wide: from the
+/// cover to the transport, or to the elapsed label hanging left of the seek bar, whichever is
+/// nearer, less the thumbs. The same clearances `player_bar` lays the full bar out with.
+fn full_field_w(width: f32, thumbs_w: f32, total_w: f32) -> f32 {
+    let center = width / 2.0;
+    let bar_w = seek_width(width, width - CONTROL_CLUSTER_W, total_w, center);
+    let title_x = 14.0 + BAR_ART_PT + 12.0;
+    (center - TRANSPORT_W / 2.0 - 8.0).min(center - bar_w / 2.0 - 10.0 - total_w - 22.0)
+        - thumbs_w
+        - title_x
 }
 
 /// Where playback is and how long the song runs, for the seek bar. A restored, not-yet-loaded
@@ -108,7 +130,6 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     // the credits the whole room instead of almost none. No thumb width when signed
     // out: the thumbs do not draw, so the title keeps the room.
     let thumbs_w = if app.signed_in() { 72.0 } else { 0.0 };
-    let transport_start = rect.center().x - TRANSPORT_W / 2.0;
     // The seek bar is wider than the transport, and its elapsed-time label hangs left of
     // the bar at subtitle height — the title has to clear the label, not just the buttons,
     // or long titles sit underneath it. The total stands in for the elapsed (at least as
@@ -119,13 +140,50 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         &widgets::fmt_duration(state.duration as u64),
         &theme::regular(11.0),
     );
-    let bar_w = seek_width(
-        rect.width(),
-        rect.right() - CONTROL_CLUSTER_W,
-        total_w,
-        rect.center().x,
-    );
-    let bar_min_x = rect.center().x - bar_w / 2.0;
+    let compact = full_field_w(rect.width(), thumbs_w, total_w) < FULL_FIELD_MIN;
+    // The transport row's own width — 30 pt icon buttons around the 40 pt play button and the
+    // gaps between: four icons in full, two compact (no shuffle or repeat).
+    let icons = if compact { 2.0 } else { 4.0 };
+    let row_w = icons * TRANSPORT_ICON_BOX + PLAY_DIAMETER + icons * ui.spacing().item_spacing.x;
+    let cluster_w = if compact {
+        COMPACT_CLUSTER_W
+    } else {
+        CONTROL_CLUSTER_W
+    };
+    // Full, the transport is centred on the window; compact, it sits against the volume, which
+    // leaves the title all the room to its left.
+    let (transport_x, transport_dy, transport_start) = if compact {
+        let x = rect.right() - cluster_w - 8.0 - row_w / 2.0;
+        (x, 0.0, x - row_w / 2.0)
+    } else {
+        let x = rect.center().x;
+        (x, TRANSPORT_DY, x - TRANSPORT_W / 2.0)
+    };
+    // Compact, the seek bar is a line along the bar's top from the cover's left edge to the
+    // volume's right, with no labels for the title to clear.
+    let bar = if compact {
+        Rect::from_min_size(
+            rect.left_top() + vec2(14.0, 4.0),
+            vec2(rect.width() - 28.0, 4.0),
+        )
+    } else {
+        let bar_w = seek_width(
+            rect.width(),
+            rect.right() - CONTROL_CLUSTER_W,
+            total_w,
+            rect.center().x,
+        );
+        Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.center().y + SEEK_DY),
+            vec2(bar_w, 4.0),
+        )
+    };
+    // How far right the title's field may reach before the elapsed label hanging left of the bar.
+    let label_left = if compact {
+        f32::INFINITY
+    } else {
+        bar.left() - 10.0 - total_w
+    };
     // The field hugs its own content — the wider of the title and the credits — so the
     // rating column rides next to the text instead of at a fixed 320pt from the title, which
     // on a short song left the thumbs drifting in space and is the whole reason this line is
@@ -143,12 +201,12 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     let text_w = (content_w + 8.0)
         .clamp(24.0, FIELD_MAX_W)
         .min((transport_start - thumbs_w - 8.0 - title_x).max(0.0))
-        .min((bar_min_x - 10.0 - total_w - 22.0 - thumbs_w - title_x).max(0.0))
+        .min((label_left - 22.0 - thumbs_w - title_x).max(0.0))
         .max(24.0);
     // The column, then the field the two lines share: title above, credits below.
     let thumbs_x = (title_x + text_w + 10.0)
         .min(transport_start - thumbs_w)
-        .min(bar_min_x - 10.0 - total_w - 4.0 - thumbs_w);
+        .min(label_left - 4.0 - thumbs_w);
     let field_w = (thumbs_x - 10.0 - title_x).max(24.0);
     // The title links to its album, and — with the cover — is the only place the song's
     // menu opens. `marquee_line` hands back its own click-sensing viewport when the title
@@ -304,12 +362,10 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
 
     // Transport, centred on the window so it does not shift with the track title: shuffle and
     // repeat flank previous/play/next, the way the reference lays them out. The box is exactly
-    // the row's own width — four 30 pt icon buttons, the 40 pt play button and the gaps between —
-    // because the row packs from the left: a wider box left its spare room on the right and
-    // pushed every button ~30 pt left of the seek bar under it.
-    let row_w = 4.0 * TRANSPORT_ICON_BOX + PLAY_DIAMETER + 4.0 * ui.spacing().item_spacing.x;
+    // the row's own width (`row_w`) because the row packs from the left: a wider box left its
+    // spare room on the right and pushed every button ~30 pt left of the seek bar under it.
     let controls = Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.center().y + TRANSPORT_DY),
+        egui::pos2(transport_x, rect.center().y + transport_dy),
         vec2(row_w, PLAY_DIAMETER),
     );
     let mut cui = ui.new_child(
@@ -318,7 +374,9 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
 
-    if widgets::icon_button(&mut cui, &p, Icon::Shuffle, 16.0, app.q.is_shuffled()).clicked() {
+    if !compact
+        && widgets::icon_button(&mut cui, &p, Icon::Shuffle, 16.0, app.q.is_shuffled()).clicked()
+    {
         app.toggle_shuffle();
     }
     let mut skip_delta = 0isize;
@@ -350,14 +408,15 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     } else {
         Icon::Repeat
     };
-    if widgets::icon_button(
-        &mut cui,
-        &p,
-        repeat_icon,
-        16.0,
-        app.repeat != RepeatMode::Off,
-    )
-    .clicked()
+    if !compact
+        && widgets::icon_button(
+            &mut cui,
+            &p,
+            repeat_icon,
+            16.0,
+            app.repeat != RepeatMode::Off,
+        )
+        .clicked()
     {
         app.cycle_repeat();
     }
@@ -365,26 +424,24 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         app.skip(skip_delta);
     }
 
-    // Seek bar, click or drag to scrub. `bar_w` is shared with the title cap above, so
+    // Seek bar, click or drag to scrub. `bar` is shared with the title cap above, so
     // the elapsed-time label the bar paints can never sit under the title.
-    let bar = Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.center().y + SEEK_DY),
-        vec2(bar_w, 4.0),
-    );
     let (position, duration) = clock(app);
     let fraction = if duration > 0.0 {
         (position / duration).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    if let Some(seek_to) = widgets::seek_bar(ui, &p, bar, fraction as f32, duration, position) {
+    if let Some(seek_to) =
+        widgets::seek_bar(ui, &p, bar, fraction as f32, duration, position, !compact)
+    {
         app.seek_to(seek_to);
     }
 
     // Volume. The child Ui spans the whole cluster, not just the slider: it packs from the
     // right, and a narrower rect would only hide the room the buttons already use.
     let vol_rect = Rect::from_min_max(
-        egui::pos2(rect.right() - CONTROL_CLUSTER_W, rect.top()),
+        egui::pos2(rect.right() - cluster_w, rect.top()),
         rect.right_bottom(),
     );
     let mut vui = ui.new_child(
@@ -401,16 +458,24 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     if let Some(v) = widgets::volume_slider(&mut vui, &p, volume, app.last_volume) {
         app.set_user_volume(v);
     }
-    vui.add_space(8.0);
-    if widgets::icon_button(&mut vui, &p, Icon::ListMusic, 16.0, app.upnext_open).clicked() {
-        app.upnext_open = !app.upnext_open;
-    }
-    vui.add_space(8.0);
-    if widgets::icon_button(&mut vui, &p, Icon::MicVocal, 16.0, app.lyrics_open).clicked() {
-        app.toggle_lyrics();
+    // Queue and Lyrics only where their panel can be shown: a narrower window hides the panel
+    // (`theme::right_panel_fits`), and a button that toggled nothing visible would read as
+    // broken. The fullscreen player carries both at any width.
+    let screen_w = ui
+        .ctx()
+        .input(|i| i.raw.screen_rect.map_or(0.0, |r| r.width()));
+    if !compact && theme::right_panel_fits(screen_w) {
+        vui.add_space(8.0);
+        if widgets::icon_button(&mut vui, &p, Icon::ListMusic, 16.0, app.upnext_open).clicked() {
+            app.upnext_open = !app.upnext_open;
+        }
+        vui.add_space(8.0);
+        if widgets::icon_button(&mut vui, &p, Icon::MicVocal, 16.0, app.lyrics_open).clicked() {
+            app.toggle_lyrics();
+        }
     }
     // The video view, further left still, and only when the track actually has one.
-    if app.now.track.as_ref().is_some_and(|t| t.wide) {
+    if !compact && app.now.track.as_ref().is_some_and(|t| t.wide) {
         vui.add_space(8.0);
         if widgets::icon_button(&mut vui, &p, Icon::Video, 16.0, app.video_open).clicked() {
             app.toggle_video();
@@ -470,5 +535,27 @@ mod tests {
             seek_width(400.0, 400.0 - 14.0 - CONTROL_CLUSTER_W, 30.0, 200.0),
             0.0
         );
+    }
+
+    /// The bar goes compact where the full layout would squeeze the song to a sliver — half a
+    /// portrait screen, and the old 760 floor — and stays full in an ordinary window.
+    #[test]
+    fn a_narrow_bar_goes_compact_and_a_roomy_one_stays_full() {
+        // The bar is the window less the gutter and its 6 pt inset on each side.
+        let bar = |window: f32| window - 2.0 * (theme::GUTTER + 6.0);
+        for window in [540.0, 760.0] {
+            assert!(
+                full_field_w(bar(window), 72.0, 30.0) < FULL_FIELD_MIN,
+                "{window}"
+            );
+        }
+        for window in [900.0, 1100.0, 1920.0] {
+            assert!(
+                full_field_w(bar(window), 72.0, 30.0) >= FULL_FIELD_MIN,
+                "{window}"
+            );
+        }
+        // Signed out, no thumbs: the title keeps their room and the bar stays full for longer.
+        assert!(full_field_w(bar(760.0), 0.0, 30.0) >= FULL_FIELD_MIN);
     }
 }

@@ -3765,12 +3765,15 @@ impl App {
         });
     }
 
-    /// Keep the window from being shrunk past what the shell can hold: its least width is the
-    /// old fixed floor, or more while the queue/lyrics panel is open, and a window already
-    /// narrower than that grows to it rather than leaving the page squeezed to a sliver. A
-    /// maximized or fullscreen window is left to the compositor.
-    fn fit_window_to_shell(&mut self, ctx: &egui::Context, right_open: bool) {
-        let min_w = theme::window_min_width(right_open);
+    /// Keep the window from being shrunk past what the shell can hold: its least width is
+    /// [`theme::WINDOW_MIN_W`], the rail beside the page card, and a window already narrower than
+    /// that grows to it rather than leaving the page squeezed to a sliver. Not more while the
+    /// queue/lyrics panel is open: that panel is hidden in a narrow window instead
+    /// ([`theme::right_panel_fits`]), since a floor above what the OS snaps a window to (half a
+    /// portrait screen is 540) left the window spilling off the screen. A maximized or fullscreen
+    /// window is left to the compositor.
+    fn fit_window_to_shell(&mut self, ctx: &egui::Context) {
+        let min_w = theme::WINDOW_MIN_W;
         if (self.min_window_w - min_w).abs() >= 0.5 {
             self.min_window_w = min_w;
             self.window_fit_tries = 0;
@@ -7300,9 +7303,12 @@ impl eframe::App for App {
             self.seed_panel_widths(&ctx);
             // How narrow the window is allowed to be, and how much of it the two panels may take:
             // they give way before the page card drops under its floor (`theme::panel_limits`).
-            let right_open = self.upnext_open || self.lyrics_open;
-            self.fit_window_to_shell(&ctx, right_open);
+            // Too narrow for the queue/lyrics panel, it is left open but not drawn, so it comes
+            // back by itself when the window widens again.
+            self.fit_window_to_shell(&ctx);
             let screen_w = ctx.input(|i| i.raw.screen_rect.map_or(0.0, |r| r.width()));
+            let right_open =
+                (self.upnext_open || self.lyrics_open) && theme::right_panel_fits(screen_w);
             let sidebar_pref = self.settings.sidebar_width.unwrap_or(theme::SIDEBAR_WIDTH);
             let right_cap = (screen_w * 0.40).clamp(theme::UPNEXT_MIN, theme::UPNEXT_MAX);
             let (sidebar_max, right_max) = theme::panel_limits(
@@ -7355,7 +7361,7 @@ impl eframe::App for App {
                 )
                 .show(ui, |ui| ui::topbar::top_bar(self, ui));
 
-            if self.upnext_open || self.lyrics_open {
+            if right_open {
                 // The queue is auxiliary, so it yields before the page does: a flat 300 is 40%
                 // of a 750pt window, and the card behind it became too narrow to read — every name in the
                 // artist and playlist headers ellipsising while a third of the window sat in an

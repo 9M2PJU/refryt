@@ -89,8 +89,10 @@ pub const TITLEBAR_HEIGHT: f32 = 56.0;
 /// points and the card pads each side by [`PANEL_RADIUS`]; below this a page reads as a sliver
 /// beside its panels, which is what a queue and lyrics open in a small window used to do to it.
 pub const PAGE_MIN_W: f32 = 400.0;
-/// The narrowest the window goes with no side panel open.
-pub const WINDOW_MIN_W: f32 = 760.0;
+/// The narrowest the window goes: the icon rail beside the page card at its floor, nothing to the
+/// right. Small enough for a window snapped to half of a portrait 1080 screen (540) or to a
+/// quarter of most screens, which Windows' snapping hands over whatever the app's floor.
+pub const WINDOW_MIN_W: f32 = SIDEBAR_RAIL + PAGE_MIN_W + 3.0 * GUTTER;
 /// How strong a card's edge is: the share of the text colour it is drawn in.
 pub const CARD_EDGE_STRENGTH: f32 = 0.09;
 /// The window's least height.
@@ -102,25 +104,40 @@ fn gutters_w(right_open: bool) -> f32 {
     GUTTER * if right_open { 4.0 } else { 3.0 }
 }
 
-/// The narrowest window the shell stays readable in. The panels give way to their own floors
-/// first ([`panel_limits`]); this is what is left once they have, and so what the window may be
-/// shrunk to: the old fixed floor, or more while the queue/lyrics panel is open.
-pub fn window_min_width(right_open: bool) -> f32 {
+/// The narrowest window that holds the whole shell with the page card at its floor: the sidebar
+/// with its names, and the queue/lyrics panel too when `right_open`. Narrower than this the
+/// window still shrinks, to [`WINDOW_MIN_W`], and the shell sheds what does not fit instead: the
+/// right panel first ([`right_panel_fits`]), then the sidebar's names ([`panel_limits`]).
+pub fn shell_width(right_open: bool) -> f32 {
     let right = if right_open { UPNEXT_MIN } else { 0.0 };
-    (SIDEBAR_MIN + right + PAGE_MIN_W + gutters_w(right_open)).max(WINDOW_MIN_W)
+    SIDEBAR_MIN + right + PAGE_MIN_W + gutters_w(right_open)
+}
+
+/// Whether the queue/lyrics panel is drawn in a window `screen_w` wide. Narrower, it stays open
+/// but is not shown, and comes back as soon as the window is wide enough again.
+pub fn right_panel_fits(screen_w: f32) -> bool {
+    screen_w >= shell_width(true)
 }
 
 /// The most the sidebar and the right panel may each take in a window `screen_w` wide, so the
 /// page card keeps [`PAGE_MIN_W`]. The right panel yields first, being auxiliary; the sidebar
-/// only once that is at its floor. `sidebar_w` is the sidebar's width as it stands.
+/// only once that is at its floor, and below that floor it is the icon rail. `sidebar_w` is the
+/// sidebar's width as it stands.
 /// Returns `(sidebar_max, right_max)`, each never under its own floor and never over its usual
 /// ceiling (`right_cap` is the panel's own, which also depends on the window).
 pub fn panel_limits(screen_w: f32, sidebar_w: f32, right_open: bool, right_cap: f32) -> (f32, f32) {
     let room = (screen_w - gutters_w(right_open) - PAGE_MIN_W).max(0.0);
     let right_floor = if right_open { UPNEXT_MIN } else { 0.0 };
-    let sidebar_max = SIDEBAR_MAX.min(room - right_floor).max(SIDEBAR_MIN);
+    let sidebar_room = room - right_floor;
+    // No room for the names: the rail, not a width between it and the minimum, where the names
+    // are cut to a few letters.
+    let sidebar_max = if sidebar_room < SIDEBAR_MIN {
+        SIDEBAR_RAIL
+    } else {
+        SIDEBAR_MAX.min(sidebar_room)
+    };
     let right_max = right_cap
-        .min(room - sidebar_w.clamp(SIDEBAR_MIN, sidebar_max))
+        .min(room - sidebar_w.clamp(SIDEBAR_RAIL, sidebar_max))
         .max(UPNEXT_MIN);
     (sidebar_max, right_max)
 }
@@ -711,22 +728,36 @@ mod tests {
         }
     }
 
-    /// The window may not be shrunk below what keeps the page card readable beside the panels the
-    /// shell shows, and the panels give way to their floors before the page does: at any width at
-    /// or above the minimum, the page keeps its floor whatever widths the panels were left at.
+    /// The panels give way before the page does: at any width the window can take, with the right
+    /// panel shown only where it fits, the page keeps its floor whatever widths the panels were
+    /// left at — and the sidebar is either the rail or wide enough for its names.
     #[test]
     fn the_page_keeps_its_floor_while_the_panels_yield() {
-        assert_eq!(window_min_width(false), WINDOW_MIN_W);
-        let with_panel = window_min_width(true);
-        assert!(with_panel > WINDOW_MIN_W, "a panel open needs more room");
-        for right_open in [false, true] {
-            let min_w = window_min_width(right_open);
-            for screen_w in [min_w, min_w + 1.0, 1000.0, 1100.0, 1600.0, 2560.0] {
-                for sidebar in [SIDEBAR_MIN, theme_sidebar(), SIDEBAR_MAX] {
+        assert!(
+            shell_width(true) > shell_width(false),
+            "a panel open needs more room"
+        );
+        assert!(WINDOW_MIN_W < shell_width(false));
+        for open in [false, true] {
+            for screen_w in [
+                WINDOW_MIN_W,
+                540.0,
+                shell_width(false) - 1.0,
+                shell_width(false),
+                shell_width(true) - 1.0,
+                shell_width(true),
+                1000.0,
+                1100.0,
+                1600.0,
+                2560.0,
+            ] {
+                let right_open = open && right_panel_fits(screen_w);
+                for sidebar in [SIDEBAR_RAIL, SIDEBAR_MIN, theme_sidebar(), SIDEBAR_MAX] {
                     let cap = (screen_w * 0.40).clamp(UPNEXT_MIN, UPNEXT_MAX);
                     let (sidebar_max, right_max) = panel_limits(screen_w, sidebar, right_open, cap);
-                    assert!(sidebar_max >= SIDEBAR_MIN && right_max >= UPNEXT_MIN);
-                    let sidebar_w = sidebar.clamp(SIDEBAR_MIN, sidebar_max);
+                    assert!(sidebar_max == SIDEBAR_RAIL || sidebar_max >= SIDEBAR_MIN);
+                    assert!(right_max >= UPNEXT_MIN);
+                    let sidebar_w = sidebar.clamp(SIDEBAR_RAIL, sidebar_max);
                     let right_w = if right_open { right_max } else { 0.0 };
                     let page = screen_w - gutters_w(right_open) - sidebar_w - right_w;
                     assert!(
@@ -740,10 +771,19 @@ mod tests {
         let (sidebar_max, right_max) = panel_limits(2560.0, 280.0, true, UPNEXT_MAX);
         assert_eq!((sidebar_max, right_max), (SIDEBAR_MAX, UPNEXT_MAX));
         // Tight: the right panel gives way first, to its floor, before the sidebar does.
-        let (sidebar_max, right_max) =
-            panel_limits(window_min_width(true), 280.0, true, UPNEXT_MAX);
+        let (sidebar_max, right_max) = panel_limits(shell_width(true), 280.0, true, UPNEXT_MAX);
         assert_eq!(right_max, UPNEXT_MIN);
         assert_eq!(sidebar_max, SIDEBAR_MIN);
+        // Narrower still: the right panel is not shown, then the sidebar folds to the rail.
+        assert!(!right_panel_fits(shell_width(true) - 1.0));
+        let (sidebar_max, _) = panel_limits(shell_width(false) - 1.0, 280.0, false, UPNEXT_MAX);
+        assert_eq!(sidebar_max, SIDEBAR_RAIL);
+    }
+
+    /// A window snapped to half of a portrait 1080 screen fits, which a 760 floor did not.
+    #[test]
+    fn the_window_fits_half_a_portrait_screen() {
+        const { assert!(WINDOW_MIN_W <= 540.0 && WINDOW_MIN_H <= 960.0) };
     }
 
     fn theme_sidebar() -> f32 {

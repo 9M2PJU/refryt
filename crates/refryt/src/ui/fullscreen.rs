@@ -964,7 +964,7 @@ fn controls(app: &mut App, ui: &mut egui::Ui, m: &Metrics, bottom: Rect, top: Re
         pos2(column.center().x, column.top() + 24.0 * s),
         vec2((column.width() - 120.0 * s).max(60.0), 4.0),
     );
-    if let Some(to) = widgets::seek_bar(ui, &p, bar, fraction as f32, duration, position) {
+    if let Some(to) = widgets::seek_bar(ui, &p, bar, fraction as f32, duration, position, true) {
         app.seek_to(to);
     }
 
