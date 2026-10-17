@@ -25,6 +25,21 @@
   <a href="assets/screenshots/macos-fullscreen-player.png"><img src="assets/screenshots/macos-fullscreen-player.png" width="49%" alt="The fullscreen player on macOS with synced lyrics, transparent with background blur"></a>
 </p>
 
+<p align="center">
+  <a href="assets/screenshots/album.png"><img src="assets/screenshots/album.png" width="49%" alt="An album page with its header tinted from the cover"></a>
+  <a href="assets/screenshots/artist.png"><img src="assets/screenshots/artist.png" width="49%" alt="An artist page with its banner and top songs"></a>
+</p>
+
+<p align="center">
+  <a href="assets/screenshots/fullscreen-lyrics.png"><img src="assets/screenshots/fullscreen-lyrics.png" width="49%" alt="The fullscreen player with synced lyrics"></a>
+  <a href="assets/screenshots/spotify-theme.png"><img src="assets/screenshots/spotify-theme.png" width="49%" alt="Search results and the queue in the Spotify theme"></a>
+</p>
+
+<p align="center">
+  <a href="assets/screenshots/icon-rail-and-queue.png"><img src="assets/screenshots/icon-rail-and-queue.png" width="49%" alt="Explore with the sidebar folded to the icon rail and the queue open"></a>
+  <a href="assets/screenshots/settings.png"><img src="assets/screenshots/settings.png" width="49%" alt="Settings, Appearance"></a>
+</p>
+
 </details>
 
 refryt is a desktop client for YouTube Music written in Rust. There is no browser engine behind it. Playback goes through mpv, and the app talks to YouTube through the same internal API the website uses.
