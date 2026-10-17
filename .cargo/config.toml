@@ -5,6 +5,13 @@
 linker = "x86_64-w64-mingw32-gcc"
 rustflags = ["-L", ".windows-tools/mpv-dev"]
 
+# Windows on ARM: llvm-mingw's clang and lld (GCC has no aarch64 Windows target), and the mpv
+# ARM64 dev package, kept apart from the x64 one. `crt-static` links llvm-mingw's libunwind into the
+# exe: without it the exe needs a libunwind.dll that Windows does not have. libmpv stays a DLL.
+[target.aarch64-pc-windows-gnullvm]
+linker = "aarch64-w64-mingw32-clang"
+rustflags = ["-L", ".windows-tools/mpv-dev-aarch64", "-C", "target-feature=+crt-static"]
+
 # macOS (Apple Silicon): Homebrew's libmpv lives outside the default linker search path.
 [target.aarch64-apple-darwin]
 rustflags = ["-L", "/opt/homebrew/lib"]

@@ -7,9 +7,16 @@
 #
 # The MSI and the setup .exe install to the same folder; use one or the other, not both.
 #
-#   ./scripts/build-windows.sh && ./scripts/build-msi.sh
+# `ARCH=aarch64` builds refryt-<version>-windows-arm64.msi from the ARM64 zip, the one installer
+# Windows on ARM gets. wixl has no ARM64 target, so the package is built as x64 and its summary
+# information's platform is then set to Arm64 with msibuild: that field is what Windows Installer
+# reads to decide which machines take the package, and nothing else in it differs (the 64-bit
+# Program Files folder and component flags are the same on both).
 #
-# Needs `wixl` (Arch: `pacman -S msitools`).
+#   ./scripts/build-windows.sh && ./scripts/build-msi.sh
+#   ARCH=aarch64 ./scripts/build-windows.sh && ARCH=aarch64 ./scripts/build-msi.sh
+#
+# Needs `wixl` and `msibuild` (Arch: `pacman -S msitools`).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,10 +29,17 @@ command -v wixl > /dev/null || {
 
 version="$(cargo metadata --no-deps --format-version 1 \
     | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "refryt"))')"
-zip="dist/refryt-$version-windows-x86_64.zip"
-out="dist/refryt-$version-windows-x86_64.msi"
+case "${ARCH:-x86_64}" in
+    x86_64) arch_name=x86_64 platform=x64 ;;
+    aarch64) arch_name=arm64 platform=Arm64 ;;
+    *)
+        echo "error: ARCH must be x86_64 or aarch64, not '$ARCH'" >&2
+        exit 1 ;;
+esac
+zip="dist/refryt-$version-windows-$arch_name.zip"
+out="dist/refryt-$version-windows-$arch_name.msi"
 [ -f "$zip" ] || {
-    echo "error: $zip is missing; run ./scripts/build-windows.sh first" >&2
+    echo "error: $zip is missing; run ${ARCH:+ARCH=$ARCH }./scripts/build-windows.sh first" >&2
     exit 1
 }
 
@@ -42,7 +56,9 @@ done
 
 # The GUIDs are fixed for good. The upgrade code is what makes a newer MSI replace an older one
 # rather than install beside it; each component's is what Windows tracks the file by across
-# versions. Never reuse one for something else, and never change them.
+# versions. Never reuse one for something else, and never change them. The ARM64 MSI shares
+# them: it installs the same files to the same place, so on an ARM machine it replaces an x64
+# install instead of sitting beside it.
 cat > "$work/refryt.wxs" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
@@ -102,4 +118,9 @@ EOF
 
 mkdir -p dist
 wixl -a x64 -o "$out" "$work/refryt.wxs"
+if [ "$platform" != x64 ]; then
+    # Rewrites the whole summary stream: title, subject (the name argument), author, platform
+    # and a fresh package code. The schema version (500) and the rest carry over.
+    msibuild "$out" -s "refryt $version" refryt "$platform;1033" "{$(python3 -c 'import uuid; print(str(uuid.uuid4()).upper())')}"
+fi
 echo "built $out ($(du -h "$out" | cut -f1))"

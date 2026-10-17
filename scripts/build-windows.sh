@@ -3,9 +3,16 @@
 # non-system DLL it needs (libmpv-2.dll) and yt-dlp.exe, zipped up as a portable, unzip-and-run
 # folder — no installer, matching the AppImage's own "no system changes" philosophy.
 #
+# `ARCH=aarch64` builds the Windows on ARM zip instead, refryt-<version>-windows-arm64.zip, and no
+# setup .exe: ARM's installer is the MSI that build-msi.sh makes from this zip. It is native ARM64
+# code end to end: mpv-player-windows and yt-dlp both publish
+# ARM64 builds, and WebView2's loader ships one in the same crate as the x64 copy.
+#
 # Needs, on this machine (once):
-#   - mingw-w64-gcc (and the crt/headers/winpthreads/binutils that come with it)
-#   - a Rust toolchain with the x86_64-pc-windows-gnu target added — the system-package `rust`
+#   - mingw-w64-gcc (and the crt/headers/winpthreads/binutils that come with it); for ARM64,
+#     llvm-mingw instead, since GCC has no aarch64 Windows target
+#   - a Rust toolchain with the x86_64-pc-windows-gnu target added (aarch64-pc-windows-gnullvm
+#     for ARM64) — the system-package `rust`
 #     on Arch/CachyOS does not carry cross targets, so this expects one managed by `rustup`,
 #     installed separately from (and not shadowing) that system toolchain: see the project's own
 #     notes on why `rustup`'s shims must not land in ~/.cargo/bin ahead of the system `cargo`.
@@ -18,10 +25,30 @@ cd "$root"
 
 version="$(cargo metadata --no-deps --format-version 1 \
     | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "refryt"))')"
-out="dist/refryt-$version-windows-x86_64.zip"
-target=x86_64-pc-windows-gnu
 tools=".windows-tools"
-mpv_dev="$tools/mpv-dev"
+# Everything that differs between the two architectures. The ARM64 target is the `gnullvm` one:
+# it links with llvm-mingw's clang and lld, and the mpv ARM64 package is built with the same
+# toolchain, so its import library matches.
+case "${ARCH:-x86_64}" in
+    x86_64)
+        target=x86_64-pc-windows-gnu cc=x86_64-w64-mingw32-gcc toolchain=mingw-w64-gcc
+        mpv_arch=x86_64 mpv_dev="$tools/mpv-dev" loader_dir=x64 ytdlp=yt-dlp.exe
+        arch_name=x86_64 ;;
+    aarch64)
+        target=aarch64-pc-windows-gnullvm cc=aarch64-w64-mingw32-clang toolchain=llvm-mingw
+        mpv_arch=aarch64 mpv_dev="$tools/mpv-dev-aarch64" loader_dir=arm64 ytdlp=yt-dlp_arm64.exe
+        arch_name=arm64
+        # The C parts of the dependency tree (ring, aws-lc-sys) are built by `cc`, which would
+        # otherwise look for a compiler named after the target triple and not find one.
+        export CC_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-clang
+        export AR_aarch64_pc_windows_gnullvm=aarch64-w64-mingw32-ar ;;
+    *)
+        echo "error: ARCH must be x86_64 or aarch64, not '$ARCH'" >&2
+        exit 1 ;;
+esac
+base="refryt-$version-windows-$arch_name"
+setup="$base-setup"
+out="dist/$base.zip"
 
 # The rustup-managed toolchain, if one is set up separately from the system `cargo` — see the
 # header comment above for why this cannot just be plain `cargo` on this machine. `RUSTC` is
@@ -36,8 +63,10 @@ if [ -x "$HOME/.cargo/bin/rustup" ]; then
     export RUSTC="$("$rustup_bin" which rustc)"
 fi
 
-if ! command -v x86_64-w64-mingw32-gcc > /dev/null; then
-    echo "error: x86_64-w64-mingw32-gcc not found — install mingw-w64-gcc first" >&2
+# Arch's llvm-mingw package installs to /opt/llvm-mingw and puts it on PATH only from the next login.
+[ -d /opt/llvm-mingw/bin ] && PATH="$PATH:/opt/llvm-mingw/bin"
+if ! command -v "$cc" > /dev/null; then
+    echo "error: $cc not found — install $toolchain first" >&2
     exit 1
 fi
 if [ -n "$rustup_bin" ] && ! "$rustup_bin" target list --installed | grep -q "^$target$"; then
@@ -52,11 +81,11 @@ fi
 # own release feed instead of a hardcoded version.
 if [ ! -f "$mpv_dev/libmpv-2.dll" ]; then
     mkdir -p "$mpv_dev"
-    echo "finding the latest mpv Windows dev package"
+    echo "finding the latest mpv Windows dev package ($mpv_arch)"
     file="$(curl -fsSL "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv" \
-        | grep -o 'mpv-dev-x86_64-[0-9a-z-]*\.7z' | grep -v -- '-v3-' | head -1)"
+        | grep -o "mpv-dev-$mpv_arch-[0-9a-z-]*\.7z" | grep -v -- '-v3-' | head -1)"
     if [ -z "$file" ]; then
-        echo "error: could not find a mpv-dev-x86_64 build in the release feed" >&2
+        echo "error: could not find a mpv-dev-$mpv_arch build in the release feed" >&2
         exit 1
     fi
     echo "fetching $file"
@@ -85,10 +114,10 @@ cp "$mpv_dev/libmpv-2.dll" "$pkg/"
 # are COLRv1-only, which is the same thing Segoe UI Emoji could not be read for.
 cp assets/fonts/NotoColorEmoji.ttf "$pkg/"
 
-# WebView2's loader: the x86_64-pc-windows-gnu target links it dynamically (only MSVC targets
+# WebView2's loader: the GNU targets link it dynamically (only MSVC targets
 # link the static library), so the sign-in window's one file has to travel next to the exe. It
 # lives in the webview2-com-sys crate's own source tree, fetched with everything else.
-loader="$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -path '*webview2-com-sys-*/x64/WebView2Loader.dll' 2>/dev/null | head -1)"
+loader="$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -path "*webview2-com-sys-*/$loader_dir/WebView2Loader.dll" 2>/dev/null | head -1)"
 if [ -z "$loader" ]; then
     echo "error: WebView2Loader.dll not found under ${CARGO_HOME:-$HOME/.cargo}/registry — run 'cargo fetch' first" >&2
     exit 1
@@ -101,7 +130,7 @@ cp "$loader" "$pkg/"
 # above: an old pinned copy would defeat the whole point of using it.
 echo "fetching yt-dlp"
 curl -fsSL -o "$pkg/yt-dlp.exe" \
-    https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/$ytdlp"
 
 mkdir -p dist
 echo "packing $out"
@@ -113,12 +142,14 @@ echo "built $out ($(du -h "$out" | cut -f1))"
 # Wine — see docs/BUILDING.md for the one-time setup. Skipped, not fatal, when that isn't set
 # up: the portable zip above already built either way.
 iscc="$HOME/.wine/drive_c/Program Files (x86)/Inno Setup 6/ISCC.exe"
-if command -v wine > /dev/null && [ -f "$iscc" ]; then
+if [ "$arch_name" != x86_64 ]; then
+    echo "note: no setup .exe for $arch_name; its installer is the MSI (ARCH=$ARCH ./scripts/build-msi.sh)"
+elif command -v wine > /dev/null && [ -f "$iscc" ]; then
     echo "building the installer"
     stage_win="$(WINEDEBUG=-all winepath -w "$pkg")"
     WINEDEBUG=-all wine "$iscc" /Q "/DAppVersion=$version" "/DStageDir=$stage_win" \
-        scripts/windows-installer.iss
-    installer="dist/refryt-$version-windows-x86_64-setup.exe"
+        "/DOutputName=$setup" scripts/windows-installer.iss
+    installer="dist/$setup.exe"
     echo "built $installer ($(du -h "$installer" | cut -f1))"
 else
     echo "note: Wine + Inno Setup not set up (see docs/BUILDING.md) — skipping the installer"

@@ -11,6 +11,10 @@
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
+; The file name to write; build-windows.sh passes it.
+#ifndef OutputName
+  #define OutputName "refryt-" + AppVersion + "-windows-x86_64-setup"
+#endif
 #ifndef StageDir
   #define StageDir "stage"
 #endif
@@ -25,7 +29,7 @@ DefaultDirName={autopf}\refryt
 DefaultGroupName=refryt
 UninstallDisplayIcon={app}\refryt.exe
 OutputDir=..\dist
-OutputBaseFilename=refryt-{#AppVersion}-windows-x86_64-setup
+OutputBaseFilename={#OutputName}
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible

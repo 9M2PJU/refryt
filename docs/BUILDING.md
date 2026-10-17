@@ -109,6 +109,20 @@ coexist as long as `rustup`'s shims don't end up ahead of the system toolchain o
 build script finds `rustup`'s `cargo`/`rustc` explicitly either way, so it does not depend on
 which one your shell resolves to by default.)
 
+`ARCH=aarch64 ./scripts/build-windows.sh` builds the Windows on ARM zip instead,
+`refryt-<version>-windows-arm64.zip`, and `ARCH=aarch64 ./scripts/build-msi.sh` turns it into
+`refryt-<version>-windows-arm64.msi`, ARM's only installer. GCC has no aarch64 Windows target, so
+the build links with llvm-mingw's clang and uses the `aarch64-pc-windows-gnullvm` Rust target:
+
+```sh
+sudo pacman -S llvm-mingw
+rustup target add aarch64-pc-windows-gnullvm
+```
+
+The mpv ARM64 dev package, `yt-dlp_arm64.exe` and the ARM64 `WebView2Loader.dll` are picked up the
+same way as their x64 versions. `wixl` has no ARM64 target, so the MSI is built as x64 and its
+platform is then set to Arm64 with `msibuild`; an x64 machine refuses it, as it should.
+
 The installer needs [Inno Setup](https://jrsoftware.org/isinfo.php) too — there's no Linux
 build of it, so it runs for real under Wine:
 
@@ -157,7 +171,7 @@ Windows' SmartScreen will warn on first run. That's expected, not a bug in the b
 ## Releasing
 
 The version lives in one place, `[workspace.package]` in the root `Cargo.toml`. Every build
-script reads it from there, so the AppImage, the Windows zip and installer, the macOS bundle and
+script reads it from there, so the AppImage, the Windows zips, installers and MSI, the macOS bundle and
 the Flatpak all name themselves after it. The one other place is the Flatpak's metainfo, which
 lists each release by hand. `scripts/release.sh` does the bumping and checks the rest:
 
@@ -165,6 +179,7 @@ lists each release by hand. `scripts/release.sh` does the bumping and checks the
 just release-prep 0.1.7      # version, Cargo.lock, metainfo, the gate, and a "Release 0.1.7" commit
 just appimage                # then build what ships, on the machine that can:
 ./scripts/build-windows.sh   #   Linux and Windows build here,
+ARCH=aarch64 ./scripts/build-windows.sh && ARCH=aarch64 ./scripts/build-msi.sh   # Windows on ARM,
 ./scripts/build-msi.sh       #   the Windows MSI from that build (needs msitools' wixl),
 just flatpak                 #   the Flatpak here too,
 ./scripts/build-macos.sh     #   and the macOS image on a Mac, copied into dist/

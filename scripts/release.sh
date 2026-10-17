@@ -23,8 +23,9 @@
 #       them; with --yes it is attached to the release, replacing an older one. Run it again after
 #       adding the macOS image, so the sums cover it too. Works on the Mac as well.
 #
-# Nothing here builds: run `just appimage`, `./scripts/build-windows.sh`, `./scripts/build-msi.sh`,
-# `just flatpak` (and `./scripts/build-macos.sh` on the Mac) after `prep` and before `verify`.
+# Nothing here builds: run `just appimage`, `./scripts/build-windows.sh`,
+# `./scripts/build-msi.sh`, the same two with `ARCH=aarch64`, `just flatpak` (and
+# `./scripts/build-macos.sh` on the Mac) after `prep` and before `verify`.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -77,12 +78,29 @@ need_branch_main() {
     [ "$b" = "main" ] || die "releases are cut from main, not '$b'"
 }
 
+# The CPU each .exe and .dll in a Windows zip is built for, as "<file> <machine>" lines, read from
+# the PE header: 8664 is x64, aa64 is ARM64. A zip with one wrong file in it (an x64 libmpv in the
+# ARM build, say) installs fine and then fails to load on the machine it was meant for.
+pe_machines() { # pe_machines <zip>
+    python3 -I - "$1" <<'PY'
+import struct, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    for name in z.namelist():
+        if name.lower().endswith((".exe", ".dll")):
+            data = z.read(name)
+            pe = struct.unpack_from("<I", data, 0x3C)[0]
+            print(name.rsplit("/", 1)[-1], format(struct.unpack_from("<H", data, pe + 4)[0], "x"))
+PY
+}
+
 artifacts() { # artifacts <version>: "<kind> <path>" lines
     local v="$1"
     echo "appimage dist/refryt-$v-x86_64.AppImage"
     echo "windows-zip dist/refryt-$v-windows-x86_64.zip"
     echo "windows-setup dist/refryt-$v-windows-x86_64-setup.exe"
     echo "windows-msi dist/refryt-$v-windows-x86_64.msi"
+    echo "windows-arm64-zip dist/refryt-$v-windows-arm64.zip"
+    echo "windows-arm64-msi dist/refryt-$v-windows-arm64.msi"
     echo "flatpak dist/refryt-$v-x86_64.flatpak"
     echo "macos dist/refryt-$v-macos-arm64.dmg"
 }
@@ -158,7 +176,9 @@ EOF
     echo "committed: $(git log -1 --oneline)"
     echo
     echo "next: build the artifacts, then scripts/release.sh verify $v"
-    echo "      just appimage && ./scripts/build-windows.sh && just flatpak   (and the macOS image on a Mac)"
+    echo "      just appimage && ./scripts/build-windows.sh && ./scripts/build-msi.sh"
+    echo "      ARCH=aarch64 ./scripts/build-windows.sh && ARCH=aarch64 ./scripts/build-msi.sh"
+    echo "      just flatpak   (and the macOS image on a Mac)"
 }
 
 cmd_verify() {
@@ -212,22 +232,36 @@ cmd_verify() {
             continue
         fi
         case "$kind" in
-            windows-zip)
-                local list
+            windows-zip | windows-arm64-zip)
+                local list want machines wrong
                 list="$(unzip -l "$path" 2>/dev/null)" || { bad "$path is not a readable zip"; continue; }
-                grep -q "refryt.exe" <<<"$list" && grep -q "libmpv-2.dll" <<<"$list" \
-                    && ok "$path ($size): refryt.exe and libmpv-2.dll inside" \
-                    || bad "$path ($size) is missing refryt.exe or libmpv-2.dll" ;;
-            windows-msi)
+                if ! grep -q "refryt.exe" <<<"$list" || ! grep -q "libmpv-2.dll" <<<"$list"; then
+                    bad "$path ($size) is missing refryt.exe or libmpv-2.dll"
+                    continue
+                fi
+                [ "$kind" = windows-zip ] && want=8664 || want=aa64
+                machines="$(pe_machines "$path")" || { bad "$path: could not read its executables"; continue; }
+                wrong="$(awk -v want="$want" '$2 != want {print $1}' <<<"$machines" | paste -sd ' ')"
+                [ -z "$wrong" ] \
+                    && ok "$path ($size): refryt.exe and libmpv-2.dll inside, all $([ "$want" = 8664 ] && echo x64 || echo ARM64)" \
+                    || bad "$path ($size): built for the wrong CPU: $wrong" ;;
+            windows-msi | windows-arm64-msi)
                 # The version inside has to be this one: an MSI built from an older zip upgrades
-                # nothing and installs the wrong release.
+                # nothing and installs the wrong release. The platform is what Windows checks
+                # before installing: the ARM64 one is stamped after wixl builds it as x64.
                 if command -v msiinfo > /dev/null; then
-                    local msiver
+                    local msiver platform want
                     msiver="$(msiinfo export "$path" Property 2>/dev/null \
                         | awk -F'\t' '$1 == "ProductVersion" {print $2}' | tr -d '\r')"
-                    [ "$msiver" = "$v" ] \
-                        && ok "$path ($size): ProductVersion $msiver" \
-                        || bad "$path ($size) says ProductVersion '$msiver', not $v"
+                    platform="$(msiinfo suminfo "$path" 2>/dev/null | sed -n 's/^Template: \([^;]*\);.*/\1/p')"
+                    [ "$kind" = windows-msi ] && want=x64 || want=Arm64
+                    if [ "$msiver" != "$v" ]; then
+                        bad "$path ($size) says ProductVersion '$msiver', not $v"
+                    elif [ "$platform" != "$want" ]; then
+                        bad "$path ($size) is for platform '$platform', not $want"
+                    else
+                        ok "$path ($size): ProductVersion $msiver, $platform"
+                    fi
                 else
                     meh "$path ($size): msiinfo not installed, version inside not checked"
                 fi ;;
@@ -331,5 +365,5 @@ case "${1:-}" in
     verify) shift; cmd_verify "$@" ;;
     publish) shift; cmd_publish "$@" ;;
     checksums) shift; cmd_checksums "$@" ;;
-    *) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

@@ -47,7 +47,7 @@ refryt is a desktop client for YouTube Music written in Rust. There is no browse
 - Home, Explore, search, a library, synced lyrics, an editable queue and music videos.
 - 23 themes, with optional window transparency and background blur.
 - Memory use is typically between 100 and 300 MB, depending on the session.
-- Packages for Linux (AppImage and Flatpak), Windows (installer and zip) and macOS (Apple Silicon DMG).
+- Packages for Linux (AppImage and Flatpak), Windows (installer, MSI and zip, plus an ARM64 build) and macOS (Apple Silicon DMG).
 
 > [!NOTE]
 > Only the Linux builds have had daily use. The Windows and macOS builds have had much less testing.
@@ -84,6 +84,7 @@ mpv and yt-dlp are included. Inside the sandbox the browser import and the Launc
 1. Download `refryt-<version>-windows-x86_64-setup.exe` and run it. It installs to Program Files, adds a Start menu entry and registers an uninstaller. The installer is unsigned, so SmartScreen warns on the first run.
 2. Alternatively, download `refryt-<version>-windows-x86_64.zip`, extract the whole folder and run `refryt.exe`. The executable needs the DLLs next to it.
 3. For managed or silent installs, `refryt-<version>-windows-x86_64.msi` installs the same files with no setup screens, for example with `msiexec /i refryt-<version>-windows-x86_64.msi /qn`. It uses the same folder as the setup, so install one or the other.
+4. For Windows on ARM, use `refryt-<version>-windows-arm64.msi` or `refryt-<version>-windows-arm64.zip`. This is a native ARM64 build and has not been tested on ARM hardware. The x64 build also runs there through Windows' emulation.
 
 To build any of these from source, see [Build from source](#build-from-source).
 
@@ -163,7 +164,7 @@ The project is before 1.0 and changes quickly.
 | Platform | Package | State |
 |---|---|---|
 | Linux | AppImage, Flatpak | Used and tested regularly |
-| Windows | Installer, zip | Cross-compiled from the Linux sources; limited testing on real hardware |
+| Windows | Installer, MSI, zip; ARM64 MSI and zip | Cross-compiled from the Linux sources; limited testing on real hardware |
 | macOS | DMG, Apple Silicon only | Home, playback, the tray, the sign-in window, transparency and blur tested by hand; media keys, Now Playing and the browser cookie import untested |
 
 Podcasts are not supported. YouTube changes its internal API without notice, and a change can break playback or a page until a fix is released, usually within a few days.
