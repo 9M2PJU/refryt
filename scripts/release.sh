@@ -304,7 +304,7 @@ cmd_checksums() {
     command -v gh > /dev/null || die "gh is needed to read the release"
     local sums="refryt-$v-SHA256SUMS.txt" tmp
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' RETURN
+    trap "rm -rf '$tmp'; trap - RETURN" RETURN
     # The files in one folder, the sums in another: written beside them, the sums file would be
     # created before the list is read and end up hashing itself.
     mkdir "$tmp/files" "$tmp/out"

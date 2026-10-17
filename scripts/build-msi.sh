@@ -48,7 +48,7 @@ cat > "$work/refryt.wxs" <<EOF
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="refryt" Language="1033" Version="$version" Manufacturer="refryt"
            UpgradeCode="3BC13FF4-48B0-4B15-82F1-B2AF7FD35E35">
-    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64"
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
              Description="refryt $version" Comments="A native YouTube Music client" />
     <Media Id="1" Cabinet="refryt.cab" EmbedCab="yes" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of refryt is already installed." />
