@@ -83,6 +83,7 @@ mpv and yt-dlp are included. Inside the sandbox the browser import and the Launc
 
 1. Download `refryt-<version>-windows-x86_64-setup.exe` and run it. It installs to Program Files, adds a Start menu entry and registers an uninstaller. The installer is unsigned, so SmartScreen warns on the first run.
 2. Alternatively, download `refryt-<version>-windows-x86_64.zip`, extract the whole folder and run `refryt.exe`. The executable needs the DLLs next to it.
+3. For managed or silent installs, `refryt-<version>-windows-x86_64.msi` installs the same files with no setup screens, for example with `msiexec /i refryt-<version>-windows-x86_64.msi /qn`. It uses the same folder as the setup, so install one or the other.
 
 To build any of these from source, see [Build from source](#build-from-source).
 

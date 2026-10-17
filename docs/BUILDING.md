@@ -165,6 +165,7 @@ lists each release by hand. `scripts/release.sh` does the bumping and checks the
 just release-prep 0.1.7      # version, Cargo.lock, metainfo, the gate, and a "Release 0.1.7" commit
 just appimage                # then build what ships, on the machine that can:
 ./scripts/build-windows.sh   #   Linux and Windows build here,
+./scripts/build-msi.sh       #   the Windows MSI from that build (needs msitools' wixl),
 just flatpak                 #   the Flatpak here too,
 ./scripts/build-macos.sh     #   and the macOS image on a Mac, copied into dist/
 just release-verify 0.1.7    # checks the repo and dist/ agree

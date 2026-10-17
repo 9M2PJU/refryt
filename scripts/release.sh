@@ -23,8 +23,8 @@
 #       them; with --yes it is attached to the release, replacing an older one. Run it again after
 #       adding the macOS image, so the sums cover it too. Works on the Mac as well.
 #
-# Nothing here builds: run `just appimage`, `./scripts/build-windows.sh`, `just flatpak` (and
-# `./scripts/build-macos.sh` on the Mac) after `prep` and before `verify`.
+# Nothing here builds: run `just appimage`, `./scripts/build-windows.sh`, `./scripts/build-msi.sh`,
+# `just flatpak` (and `./scripts/build-macos.sh` on the Mac) after `prep` and before `verify`.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -82,6 +82,7 @@ artifacts() { # artifacts <version>: "<kind> <path>" lines
     echo "appimage dist/refryt-$v-x86_64.AppImage"
     echo "windows-zip dist/refryt-$v-windows-x86_64.zip"
     echo "windows-setup dist/refryt-$v-windows-x86_64-setup.exe"
+    echo "windows-msi dist/refryt-$v-windows-x86_64.msi"
     echo "flatpak dist/refryt-$v-x86_64.flatpak"
     echo "macos dist/refryt-$v-macos-arm64.dmg"
 }
@@ -217,6 +218,19 @@ cmd_verify() {
                 grep -q "refryt.exe" <<<"$list" && grep -q "libmpv-2.dll" <<<"$list" \
                     && ok "$path ($size): refryt.exe and libmpv-2.dll inside" \
                     || bad "$path ($size) is missing refryt.exe or libmpv-2.dll" ;;
+            windows-msi)
+                # The version inside has to be this one: an MSI built from an older zip upgrades
+                # nothing and installs the wrong release.
+                if command -v msiinfo > /dev/null; then
+                    local msiver
+                    msiver="$(msiinfo export "$path" Property 2>/dev/null \
+                        | awk -F'\t' '$1 == "ProductVersion" {print $2}' | tr -d '\r')"
+                    [ "$msiver" = "$v" ] \
+                        && ok "$path ($size): ProductVersion $msiver" \
+                        || bad "$path ($size) says ProductVersion '$msiver', not $v"
+                else
+                    meh "$path ($size): msiinfo not installed, version inside not checked"
+                fi ;;
             *) ok "$path ($size)" ;;
         esac
     done < <(artifacts "$v")
@@ -317,5 +331,5 @@ case "${1:-}" in
     verify) shift; cmd_verify "$@" ;;
     publish) shift; cmd_publish "$@" ;;
     checksums) shift; cmd_checksums "$@" ;;
-    *) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
