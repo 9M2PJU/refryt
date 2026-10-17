@@ -4899,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "refryt"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4947,7 +4947,7 @@ dependencies = [
 
 [[package]]
 name = "refryt-resolve"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "async-trait",
