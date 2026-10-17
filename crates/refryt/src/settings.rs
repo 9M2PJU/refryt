@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(zero.opacity, Opacity::OFF);
     }
 
-    /// Strict Home Order is opt-in: off for a new install and for a file from before it existed,
+    /// Strict Home order is opt-in: off for a new install and for a file from before it existed,
     /// and a choice to turn it on survives a save.
     #[test]
     fn strict_home_order_is_off_until_chosen() {

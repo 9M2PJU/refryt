@@ -347,6 +347,7 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
                 track.like == pressed,
                 true,
             )
+            .on_hover_text(crate::ui::tips::rate(up, track.like == pressed))
             .clicked()
             {
                 rate = Some(RowAction::Rate {
@@ -375,19 +376,25 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     );
 
     if !compact
-        && widgets::icon_button(&mut cui, &p, Icon::Shuffle, 16.0, app.q.is_shuffled()).clicked()
+        && widgets::icon_button(&mut cui, &p, Icon::Shuffle, 16.0, app.q.is_shuffled())
+            .on_hover_text(crate::ui::tips::shuffle(app.q.is_shuffled()))
+            .clicked()
     {
         app.toggle_shuffle();
     }
     let mut skip_delta = 0isize;
-    if widgets::icon_button(&mut cui, &p, Icon::SkipBackFilled, 16.0, false).clicked() {
+    if widgets::icon_button(&mut cui, &p, Icon::SkipBackFilled, 16.0, false)
+        .on_hover_text(crate::ui::tips::PREVIOUS)
+        .clicked()
+    {
         skip_delta = -1;
     }
     let playing = app.playback_started && !state.paused;
     // While the song is still loading the button already shows pause — you asked it to play —
     // with the loading ring turning around its rim.
     let loading = widgets::track_loading(cui.ctx());
-    let play = widgets::play_button(&mut cui, &p, playing || loading, PLAY_DIAMETER);
+    let play = widgets::play_button(&mut cui, &p, playing || loading, PLAY_DIAMETER)
+        .on_hover_text(crate::ui::tips::play(playing || loading));
     if loading {
         widgets::paint_spinner(
             &cui,
@@ -400,7 +407,10 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     if play.clicked() {
         app.toggle_playback();
     }
-    if widgets::icon_button(&mut cui, &p, Icon::SkipForwardFilled, 16.0, false).clicked() {
+    if widgets::icon_button(&mut cui, &p, Icon::SkipForwardFilled, 16.0, false)
+        .on_hover_text(crate::ui::tips::NEXT)
+        .clicked()
+    {
         skip_delta = 1;
     }
     let repeat_icon = if app.repeat == RepeatMode::One {
@@ -416,6 +426,7 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
             16.0,
             app.repeat != RepeatMode::Off,
         )
+        .on_hover_text(crate::ui::tips::repeat(app.repeat))
         .clicked()
     {
         app.cycle_repeat();
@@ -452,7 +463,7 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
     // `vui` packs right-to-left, so whatever is added first ends up closest to the window's
     // edge: the volume slider goes first to sit rightmost, with Queue and Lyrics to its left.
     vui.add_space(14.0);
-    // The user's volume, not `player.volume()`: the Audio Normaliser folds the track's gain into
+    // The user's volume, not `player.volume()`: the Audio normaliser folds the track's gain into
     // the live value.
     let volume = if app.muted { 0.0 } else { app.last_volume };
     if let Some(v) = widgets::volume_slider(&mut vui, &p, volume, app.last_volume) {
@@ -466,18 +477,27 @@ pub fn player_bar(app: &mut App, ui: &mut egui::Ui) {
         .input(|i| i.raw.screen_rect.map_or(0.0, |r| r.width()));
     if !compact && theme::right_panel_fits(screen_w) {
         vui.add_space(8.0);
-        if widgets::icon_button(&mut vui, &p, Icon::ListMusic, 16.0, app.upnext_open).clicked() {
+        if widgets::icon_button(&mut vui, &p, Icon::ListMusic, 16.0, app.upnext_open)
+            .on_hover_text(crate::ui::tips::QUEUE)
+            .clicked()
+        {
             app.upnext_open = !app.upnext_open;
         }
         vui.add_space(8.0);
-        if widgets::icon_button(&mut vui, &p, Icon::MicVocal, 16.0, app.lyrics_open).clicked() {
+        if widgets::icon_button(&mut vui, &p, Icon::MicVocal, 16.0, app.lyrics_open)
+            .on_hover_text(crate::ui::tips::LYRICS)
+            .clicked()
+        {
             app.toggle_lyrics();
         }
     }
     // The video view, further left still, and only when the track actually has one.
     if !compact && app.now.track.as_ref().is_some_and(|t| t.wide) {
         vui.add_space(8.0);
-        if widgets::icon_button(&mut vui, &p, Icon::Video, 16.0, app.video_open).clicked() {
+        if widgets::icon_button(&mut vui, &p, Icon::Video, 16.0, app.video_open)
+            .on_hover_text(crate::ui::tips::video(app.video_open))
+            .clicked()
+        {
             app.toggle_video();
         }
     }

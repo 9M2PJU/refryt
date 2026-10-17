@@ -21,7 +21,8 @@
 //!
 //! The themes that ship with the app ([`BUILTIN`]) are written into the folder the first time
 //! there is no folder, and are ordinary files from then on: deleting one deletes it, editing one
-//! edits it. Only when nothing usable is left does the compiled-in [`fallback`] paint.
+//! edits it. A built-in added in a later release is written once into an existing folder (see
+//! [`seed`]). Only when nothing usable is left does the compiled-in [`fallback`] paint.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -208,27 +209,62 @@ pub const BUILTIN: &[(&str, &str)] = &[
         "Tokyo Night Storm",
         include_str!("../../themes/Tokyo Night Storm.css"),
     ),
+    ("Spotify", include_str!("../../themes/Spotify.css")),
 ];
 
-/// Create the themes folder with the built-in themes in it, when there is no folder yet. An
-/// existing folder is never touched — even an empty one, which is how someone who deleted every
-/// theme keeps it that way.
+/// Built-in themes added after the first release that shipped themes. A folder made before the
+/// app kept its [`OFFERED`] record was given every other built-in, so these are the ones it still
+/// needs offering.
+const ADDED_LATER: &[&str] = &["Spotify"];
+
+/// The file in the themes folder that names every built-in theme already written there once. A
+/// newer release writes only the built-ins missing from it, so a new theme reaches an existing
+/// install and a theme someone deleted stays deleted. Not a `.css` file, so never a theme itself.
+const OFFERED: &str = ".offered";
+
+/// Write the built-in themes into the themes folder: all of them the first time there is no
+/// folder, and afterwards only a built-in this folder has never been given (a theme added in a
+/// newer release), as [`OFFERED`] records. A theme someone deleted is never written back, and an
+/// empty folder stays empty unless a new theme arrives.
 pub fn seed() {
     let Some(dir) = dir() else { return };
-    if dir.exists() {
-        return;
-    }
     if let Err(e) = seed_into(&dir) {
         tracing::warn!(%e, "could not write the built-in themes");
     }
 }
 
 fn seed_into(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    for (name, css) in BUILTIN {
-        std::fs::write(dir.join(format!("{name}.css")), css)?;
+    let record = dir.join(OFFERED);
+    let mut offered: Vec<String> = if !dir.exists() {
+        Vec::new()
+    } else if let Ok(text) = std::fs::read_to_string(&record) {
+        text.lines().map(str::to_owned).collect()
+    } else {
+        // A folder from before the record: it was given every built-in of its day.
+        BUILTIN
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !ADDED_LATER.contains(name))
+            .map(str::to_owned)
+            .collect()
+    };
+    let fresh: Vec<_> = BUILTIN
+        .iter()
+        .filter(|(name, _)| !offered.iter().any(|o| o == name))
+        .collect();
+    if fresh.is_empty() && record.exists() {
+        return Ok(());
     }
-    Ok(())
+    std::fs::create_dir_all(dir)?;
+    for (name, css) in fresh {
+        let path = dir.join(format!("{name}.css"));
+        // A file of that name already there is the user's own: left alone.
+        if !path.exists() {
+            std::fs::write(&path, css)?;
+        }
+        offered.push((*name).to_owned());
+    }
+    std::fs::write(&record, offered.join("\n") + "\n")
 }
 
 /// The palette to paint when the folder holds no usable theme of the polarity on screen:
@@ -651,8 +687,34 @@ mod tests {
             check("text on the card", p.text, p.panel, 4.5);
             check("text on the gutter", p.text, p.window, 4.5);
             check("text on a surface", p.text, p.surface, 4.5);
-            // Second-rank text is smaller but still prose; the large-text bar is 3:1.
-            check("secondary on the card", p.secondary, p.panel, 3.0);
+            // Second-rank text is small prose: AA, with room for the tone under it.
+            check(
+                "secondary on the card",
+                p.secondary,
+                p.panel,
+                super::super::ramp::SECONDARY_MIN_CONTRAST.min(contrast(p.text, p.panel)),
+            );
+            // The player bar's song line and times sit on the gutter.
+            check(
+                "secondary on the gutter",
+                p.secondary,
+                p.window,
+                super::super::ramp::SECONDARY_MIN_CONTRAST.min(contrast(p.text, p.window)) - 0.01,
+            );
+            check(
+                "dim on the gutter",
+                p.dim,
+                p.window,
+                super::super::ramp::DIM_MIN_CONTRAST.min(contrast(p.secondary, p.window) - 0.3)
+                    - 0.01,
+            );
+            // Accent-coloured text (the playing title) reads at AA, whatever the accent.
+            check(
+                "accent text on the card",
+                p.accent_text(),
+                p.panel,
+                super::super::ramp::ACCENT_TEXT_MIN_CONTRAST.min(contrast(p.text, p.panel)),
+            );
             // The faintest tone still has to be read: track counts, help lines.
             check(
                 "dim on the card",
@@ -761,6 +823,29 @@ mod tests {
         assert_eq!(loaded.themes.len(), BUILTIN.len());
         assert!(loaded.get("Catppuccin Frappé").is_some_and(|t| t.dark));
         assert!(loaded.get("Nord Snow Storm").is_some_and(|t| !t.dark));
+    }
+
+    /// A folder made before the record gets the themes added since, once; a deleted one stays
+    /// deleted; and a later run writes nothing.
+    #[test]
+    fn a_new_builtin_reaches_an_existing_folder_once() {
+        let dir = std::env::temp_dir().join(format!("refryt-offer-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Classic Dark.css"), BUILTIN[4].1).unwrap();
+        seed_into(&dir).unwrap();
+        assert!(dir.join("Spotify.css").exists(), "the new theme arrives");
+        assert!(
+            !dir.join("Nord Polar Night.css").exists(),
+            "an old one deleted stays deleted"
+        );
+        std::fs::remove_file(dir.join("Spotify.css")).unwrap();
+        seed_into(&dir).unwrap();
+        assert!(
+            !dir.join("Spotify.css").exists(),
+            "and so does the new one, once deleted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

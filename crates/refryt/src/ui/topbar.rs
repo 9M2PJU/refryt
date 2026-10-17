@@ -64,7 +64,10 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) {
     // Listening history beside the chip, as a clock — it is a page, not a setting.
     // Settings itself lives only under the chip, which carries it in every state. One door,
     // one keyhole — a second gear beside the chip was two doors to the same room.
-    if widgets::icon_button(&mut right, &p, Icon::History, 18.0, false).clicked() {
+    if widgets::icon_button(&mut right, &p, Icon::History, 18.0, false)
+        .on_hover_text(crate::ui::tips::HISTORY)
+        .clicked()
+    {
         app.navigate(Route::History);
     }
     // Whatever the right group took, plus a gap so the search never touches it.

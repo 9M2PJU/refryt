@@ -30,7 +30,7 @@
 refryt is a desktop client for YouTube Music written in Rust. There is no browser engine behind it. Playback goes through mpv, and the app talks to YouTube through the same internal API the website uses.
 
 - Home, Explore, search, a library, synced lyrics, an editable queue and music videos.
-- 22 themes, with optional window transparency and background blur.
+- 23 themes, with optional window transparency and background blur.
 - Memory use is typically between 100 and 300 MB, depending on the session.
 - Packages for Linux (AppImage and Flatpak), Windows (installer and zip) and macOS (Apple Silicon DMG).
 
@@ -62,7 +62,7 @@ From a source checkout, `./scripts/appimage-install.sh install` copies the AppIm
 2. Run `flatpak install --user refryt-<version>-x86_64.flatpak`. Flatpak offers to fetch the GNOME 49 runtime the first time.
 3. Start it with `flatpak run io.github.gridoe.refryt`.
 
-mpv and yt-dlp are included. Inside the sandbox the browser import and the Launch on Startup setting are hidden, because neither can work there.
+mpv and yt-dlp are included. Inside the sandbox the browser import and the Launch on startup setting are hidden, because neither can work there.
 
 ### Windows
 
@@ -87,7 +87,7 @@ Affiliation: refryt is an unofficial client. It is not affiliated with, endorsed
 - Search by type. Choosing Songs, Albums or Artists asks YouTube for that category directly, instead of filtering one mixed list.
 - Playlists. They can be created, renamed and reordered by dragging. Adding a song that is already in a playlist asks first. Playlists the user owns show YouTube's suggestions, each with a + button.
 - Liked songs. A liked song shows its thumb in search, on Home and in every list. Each artist page has a tile with the songs liked by that artist.
-- Home order. Settings lets the user put Home's sections in any order. YouTube decides which sections exist and sends them in batches, so a section that arrives late is added below what is already on screen. The Strict Home Order switch, off by default, waits a few seconds longer for the top seven sections before Home is shown.
+- Home order. Settings lets the user put Home's sections in any order. YouTube decides which sections exist and sends them in batches, so a section that arrives late is added below what is already on screen. The Strict Home order switch, off by default, waits a few seconds longer for the top seven sections before Home is shown.
 - Fullscreen player. It shows the cover, the song information and synced lyrics, with a queue drawer. F opens it and Esc closes it.
 - Local files. A folder added in Settings can be browsed like a file tree, and any folder can become a playlist.
 - Downloads, with Premium. Songs and whole pages can be saved to `~/Music/refryt` for offline listening, with tags and cover art embedded. A downloaded song plays from disk even when the connection is up.
@@ -118,13 +118,13 @@ The shortcuts follow Spotify's desktop app.
 
 On macOS the Ctrl shortcuts use Cmd.
 
-A song is selected with one click and played with two, as in Spotify. The "Double-Click to Play" setting changes that so one click plays. The mouse's back and forward buttons move through the page history.
+A song is selected with one click and played with two, as in Spotify. The "Double-click to play" setting changes that so one click plays. The mouse's back and forward buttons move through the page history.
 
 ### Themes and transparency
 
-The 22 bundled themes are plain CSS files in the `themes` folder of the config folder, and [docs/THEMES.md](docs/THEMES.md) describes the format. A theme file can be edited, added or deleted. The app reads the folder when its window regains focus and when Settings is opened. Album and playlist headers can take their colour from the cover art, which is on by default.
+The 23 bundled themes are plain CSS files in the `themes` folder of the config folder, and [docs/THEMES.md](docs/THEMES.md) describes the format. A theme file can be edited, added or deleted. The app reads the folder when its window regains focus and when Settings is opened. Album and playlist headers can take their colour from the cover art, which is on by default.
 
-Settings has a transparency slider and a background blur switch. Blur depends on the compositor: it works on KDE Plasma under Wayland, in compositors that implement the ext-background-effect protocol (niri, GNOME 51 and newer), and on macOS. It has been tested on KDE Plasma. Windows has neither transparency nor blur, because the window shows a flat grey there instead of the desktop. A Card Outlines switch adds a thin edge around each panel, and it is on by default.
+Settings has a transparency slider and a background blur switch. Blur depends on the compositor: it works on KDE Plasma under Wayland, in compositors that implement the ext-background-effect protocol (niri, GNOME 51 and newer), and on macOS. It has been tested on KDE Plasma. Windows has neither transparency nor blur, because the window shows a flat grey there instead of the desktop. A Card outlines switch adds a thin edge around each panel, and it is on by default.
 
 ### Signing in
 
@@ -188,9 +188,9 @@ The app is built with:
   [Gruvbox](https://github.com/morhetz/gruvbox),
   [Tokyo Night](https://github.com/folke/tokyonight.nvim),
   [Dracula](https://spec.draculatheme.com), [Rosé Pine](https://github.com/rose-pine/palette),
-  [Everforest](https://github.com/sainnhe/everforest) and
-  [Solarized](https://ethanschoonover.com/solarized). Each file in `crates/refryt/themes`
-  names its source.
+  [Everforest](https://github.com/sainnhe/everforest),
+  [Solarized](https://ethanschoonover.com/solarized) and Spotify's own colours. Each file in
+  `crates/refryt/themes` names its source.
 
 ## Licence
 

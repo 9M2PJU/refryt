@@ -129,12 +129,17 @@ fn window_button(ui: &mut Ui, palette: &Palette, icon: Icon, danger: bool) -> eg
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(theme::RADIUS_SMALL), bg);
         }
+        // At rest they follow the window's focus, as a native title bar's do: full strength on
+        // the window you're using, quieter on one in the background.
+        let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
         let fg = if hovered && danger {
             Color32::WHITE
-        } else if hovered {
+        } else if hovered || focused {
             palette.text
         } else {
-            palette.secondary
+            // The faintest text tone, not the second: in several themes that one sits so close to
+            // the text colour that a background window's buttons looked no different.
+            palette.dim
         };
         icon.image(fg, 14.0)
             .paint_at(ui, Rect::from_center_size(rect.center(), vec2(14.0, 14.0)));

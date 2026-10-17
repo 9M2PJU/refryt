@@ -970,16 +970,23 @@ fn controls(app: &mut App, ui: &mut egui::Ui, m: &Metrics, bottom: Rect, top: Re
             .max_rect(row)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    if widgets::icon_button(&mut cui, &p, Icon::Shuffle, m.icon, app.q.is_shuffled()).clicked() {
+    if widgets::icon_button(&mut cui, &p, Icon::Shuffle, m.icon, app.q.is_shuffled())
+        .on_hover_text(crate::ui::tips::shuffle(app.q.is_shuffled()))
+        .clicked()
+    {
         app.toggle_shuffle();
     }
     let mut skip = 0isize;
-    if widgets::icon_button(&mut cui, &p, Icon::SkipBackFilled, m.icon, false).clicked() {
+    if widgets::icon_button(&mut cui, &p, Icon::SkipBackFilled, m.icon, false)
+        .on_hover_text(crate::ui::tips::PREVIOUS)
+        .clicked()
+    {
         skip = -1;
     }
     let playing = app.playback_started && !app.player_state.paused;
     let loading = widgets::track_loading(cui.ctx());
-    let play = widgets::play_button(&mut cui, &p, playing || loading, m.play);
+    let play = widgets::play_button(&mut cui, &p, playing || loading, m.play)
+        .on_hover_text(crate::ui::tips::play(playing || loading));
     if loading {
         widgets::paint_spinner(
             &cui,
@@ -992,7 +999,10 @@ fn controls(app: &mut App, ui: &mut egui::Ui, m: &Metrics, bottom: Rect, top: Re
     if play.clicked() {
         app.toggle_playback();
     }
-    if widgets::icon_button(&mut cui, &p, Icon::SkipForwardFilled, m.icon, false).clicked() {
+    if widgets::icon_button(&mut cui, &p, Icon::SkipForwardFilled, m.icon, false)
+        .on_hover_text(crate::ui::tips::NEXT)
+        .clicked()
+    {
         skip = 1;
     }
     let repeat = if app.repeat == RepeatMode::One {
@@ -1000,7 +1010,10 @@ fn controls(app: &mut App, ui: &mut egui::Ui, m: &Metrics, bottom: Rect, top: Re
     } else {
         Icon::Repeat
     };
-    if widgets::icon_button(&mut cui, &p, repeat, m.icon, app.repeat != RepeatMode::Off).clicked() {
+    if widgets::icon_button(&mut cui, &p, repeat, m.icon, app.repeat != RepeatMode::Off)
+        .on_hover_text(crate::ui::tips::repeat(app.repeat))
+        .clicked()
+    {
         app.cycle_repeat();
     }
     if skip != 0 {
@@ -1033,6 +1046,7 @@ fn controls(app: &mut App, ui: &mut egui::Ui, m: &Metrics, bottom: Rect, top: Re
                 track.like == pressed,
                 true,
             )
+            .on_hover_text(crate::ui::tips::rate(up, track.like == pressed))
             .clicked()
             {
                 rate = Some(RowAction::Rate {
@@ -1078,15 +1092,22 @@ fn controls(app: &mut App, ui: &mut egui::Ui, m: &Metrics, bottom: Rect, top: Re
             .max_rect(toggles)
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
-    if widgets::icon_button(&mut tui, &p, Icon::Minimize2, m.icon, false).clicked() {
+    if widgets::icon_button(&mut tui, &p, Icon::Minimize2, m.icon, false)
+        .on_hover_text(crate::ui::tips::EXIT_FULLSCREEN)
+        .clicked()
+    {
         app.fs_exit(ui.ctx());
     }
-    if widgets::icon_button(&mut tui, &p, Icon::ListMusic, m.icon, app.fs.queue).clicked() {
+    if widgets::icon_button(&mut tui, &p, Icon::ListMusic, m.icon, app.fs.queue)
+        .on_hover_text(crate::ui::tips::QUEUE)
+        .clicked()
+    {
         app.fs.queue = !app.fs.queue;
     }
     // A song with no lyrics greys the button out and says so; the saved choice is untouched.
     let lyrics_button = tui.add_enabled_ui(!missing, |ui| {
         widgets::icon_button(ui, &p, Icon::MicVocal, m.icon, app.fs.lyrics && !missing)
+            .on_hover_text(crate::ui::tips::LYRICS)
     });
     if lyrics_button.inner.clicked() {
         app.fs.lyrics = !app.fs.lyrics;

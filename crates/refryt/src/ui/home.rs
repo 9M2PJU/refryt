@@ -4,7 +4,7 @@
 //! of YouTube's ranking reached the page. It is now `FEmusic_home` verbatim — Listen again, Mixed
 //! for you and Quick picks when signed in — with Explore's shelves appended while the anonymous
 //! feed is thin. Its shelves are YouTube's own, but their order is the listener's: the sections
-//! named in Settings' "Order of Homepage" go where it puts them (see `model::order_home`), and
+//! named in Settings' "Order of homepage" go where it puts them (see `model::order_home`), and
 //! everything else follows in the order YouTube sent.
 
 use crate::app::{App, Route};

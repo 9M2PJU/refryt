@@ -2662,6 +2662,18 @@ pub(crate) fn playable_index(items: &[Entry], index: usize) -> Option<usize> {
     )
 }
 
+/// A non-song row's subtitle, led by what it is, the way YouTube Music writes it: "Artist • 200M
+/// monthly audience", "Album • Radiohead". The type sits here rather than in the duration column,
+/// which then holds only durations. An empty detail leaves just the type.
+fn typed_subtitle<'a>(kind: &'a str, detail: &'a str) -> widgets::Subtitle<'a> {
+    let mut out = widgets::no_subtitle();
+    out[0] = Some(widgets::Part::plain(kind));
+    if !detail.trim().is_empty() {
+        out[1] = Some(widgets::Part::plain(detail));
+    }
+    out
+}
+
 /// One entry's row, whatever kind it is — every field a song/video needs, plus the plainer
 /// shape every other kind falls back to. Shared by Search's per-category tier and History's
 /// dated shelves, so a mixed Song/Album/Playlist/Artist list reads and behaves identically
@@ -2683,20 +2695,26 @@ pub(crate) fn entry_row_spec<'a>(
             is_active(now, &t.video_id),
         ),
         Entry::Artist(a) => (
-            widgets::plain_subtitle(a.subscribers.as_deref().unwrap_or("")),
+            typed_subtitle(item.kind(), a.subscribers.as_deref().unwrap_or("")),
             None,
             None,
             false,
             false,
         ),
         Entry::Album(a) => (
-            widgets::plain_subtitle(&a.artist),
+            typed_subtitle(item.kind(), &a.artist),
             None,
             a.year.as_deref(),
             false,
             false,
         ),
-        Entry::Playlist(p) => (widgets::plain_subtitle(&p.author), None, None, false, false),
+        Entry::Playlist(p) => (
+            typed_subtitle(item.kind(), &p.author),
+            None,
+            None,
+            false,
+            false,
+        ),
         // Neither Search nor History ever returns mood chips; this arm keeps the match total.
         Entry::Mood(_) => (widgets::plain_subtitle(""), None, None, false, false),
     };
@@ -2721,7 +2739,8 @@ pub(crate) fn entry_row_spec<'a>(
         explicit,
         active,
         playing: active && !now.paused,
-        badge: Some(item.kind()),
+        // The type leads the subtitle instead (`typed_subtitle`): the right column is durations.
+        badge: None,
         // Artists are round so a mixed list is scannable at a glance; a video still is 16:9
         // and gets the wide slot.
         shape: match item {
@@ -3174,6 +3193,72 @@ pub(crate) fn offline_banner(app: &mut crate::app::App, ui: &mut egui::Ui) {
     }
 }
 
+/// What the transport's and panels' icon buttons say on hover: shared by the player bar and the
+/// fullscreen player so both read the same, with the shortcut where there is one (as `help` lists
+/// them).
+pub(crate) mod tips {
+    use crate::app::RepeatMode;
+
+    /// The modifier the Ctrl shortcuts use: Cmd on macOS.
+    fn ctrl() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        }
+    }
+
+    pub(crate) fn shuffle(on: bool) -> String {
+        format!("Shuffle: {} ({}+S)", if on { "on" } else { "off" }, ctrl())
+    }
+
+    pub(crate) fn repeat(mode: RepeatMode) -> String {
+        let mode = match mode {
+            RepeatMode::Off => "off",
+            RepeatMode::All => "all",
+            RepeatMode::One => "one",
+        };
+        format!("Repeat: {mode} ({}+R)", ctrl())
+    }
+
+    pub(crate) fn play(playing: bool) -> &'static str {
+        if playing {
+            "Pause (Space)"
+        } else {
+            "Play (Space)"
+        }
+    }
+
+    /// A rating thumb: what pressing it does, given whether that rating is set.
+    pub(crate) fn rate(up: bool, set: bool) -> &'static str {
+        match (up, set) {
+            (true, false) => "Like",
+            (true, true) => "Remove like",
+            (false, false) => "Dislike",
+            (false, true) => "Remove dislike",
+        }
+    }
+
+    pub(crate) fn video(open: bool) -> &'static str {
+        if open {
+            "Show the song"
+        } else {
+            "Show the video"
+        }
+    }
+
+    pub(crate) fn mute(muted: bool) -> &'static str {
+        if muted { "Unmute (M)" } else { "Mute (M)" }
+    }
+
+    pub(crate) const PREVIOUS: &str = "Previous (Up)";
+    pub(crate) const NEXT: &str = "Next (Down)";
+    pub(crate) const QUEUE: &str = "Queue";
+    pub(crate) const LYRICS: &str = "Lyrics";
+    pub(crate) const HISTORY: &str = "History";
+    pub(crate) const EXIT_FULLSCREEN: &str = "Exit fullscreen (Esc)";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3443,5 +3528,28 @@ mod tests {
         assert_eq!(grid_index(0, 2, 4, ROWS_PER_PAGE), 14);
         // The next page continues where the last column ended.
         assert_eq!(grid_index(15, 0, 0, ROWS_PER_PAGE), 15);
+    }
+
+    /// A non-song row leads its subtitle with its type, and keeps the detail after it.
+    #[test]
+    fn a_mixed_row_names_its_type_in_the_subtitle() {
+        let texts = |sub: &widgets::Subtitle| -> Vec<String> {
+            sub.iter().flatten().map(|p| p.text.to_owned()).collect()
+        };
+        assert_eq!(
+            texts(&typed_subtitle("Artist", "200M monthly audience")),
+            ["Artist", "200M monthly audience"]
+        );
+        assert_eq!(
+            texts(&typed_subtitle("Album", "Radiohead")),
+            ["Album", "Radiohead"]
+        );
+        assert_eq!(
+            texts(&typed_subtitle("Artist", "  ")),
+            ["Artist"],
+            "no detail"
+        );
+        let sub = typed_subtitle("Playlist", "Arafinwe");
+        assert_eq!(sub[1].map(|p| p.sep), Some(widgets::FIELD_SEP));
     }
 }

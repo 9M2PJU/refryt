@@ -550,12 +550,12 @@ pub fn default_order_keys() -> Vec<String> {
         .collect()
 }
 
-/// How many of the listener's top-ranked sections Strict Home Order waits to see.
+/// How many of the listener's top-ranked sections Strict Home order waits to see.
 pub const STRICT_HOME_SECTIONS: usize = 7;
-/// The longest Strict Home Order spends fetching, counted from when the request starts. Past it
+/// The longest Strict Home order spends fetching, counted from when the request starts. Past it
 /// the shelves in hand are sorted and shown, and the rest of the feed loads on scroll.
 pub const STRICT_HOME_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
-/// The most extra pages Strict Home Order follows, whatever the clock says.
+/// The most extra pages Strict Home order follows, whatever the clock says.
 pub const STRICT_HOME_PAGES: usize = 12;
 /// The extra pages the ordinary load follows. The feed does not end; this is the point at which
 /// more costs a request and buys nothing anyone will scroll to.

@@ -952,6 +952,8 @@ fn landed(added: usize, next: Option<String>) -> River {
 
 /// How long a confirmation bubble stays up.
 const TOAST_DURATION: Duration = Duration::from_secs(3);
+/// How long an error toast stays: see [`App::toast_error`].
+const ERROR_TOAST_DURATION: Duration = Duration::from_secs(5);
 
 /// A bubble above the player bar: "Song will play next", "Saved to library", or the reason
 /// something did not happen. Fire-and-forget — it clears itself, and only a live one asks for
@@ -1076,6 +1078,53 @@ pub(crate) struct DuplicatePrompt {
     pub video_id: String,
     /// YouTube's own sentence for it, in the account's language.
     pub message: String,
+}
+
+/// Why a request to YouTube failed, in words a listener can act on, when the error text tells:
+/// offline, a session YouTube no longer accepts, or YouTube asking to slow down. `None` when it
+/// does not say, and the toast keeps its plain wording; the raw text only ever goes to the log.
+fn failure_reason(error: &str) -> Option<&'static str> {
+    if crate::api::looks_offline(error) {
+        return Some("you're offline");
+    }
+    let e = error.to_ascii_lowercase();
+    let any = |signs: &[&str]| signs.iter().any(|s| e.contains(s));
+    if any(&["429", "too many requests", "rate limit", "ratelimit"]) {
+        return Some("YouTube is busy, try again in a minute");
+    }
+    if any(&[
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "sign in",
+        "signed out",
+        "login required",
+    ]) {
+        return Some("sign in again");
+    }
+    None
+}
+
+/// A failure toast: `what` failed, and why when [`failure_reason`] can tell.
+fn failure_text(what: &str, error: &str) -> String {
+    match failure_reason(error) {
+        Some(reason) => format!("{what}: {reason}"),
+        None => what.to_owned(),
+    }
+}
+
+/// YouTube's own sentence for refusing a playlist edit, when the error is one ("This playlist
+/// can't be edited") rather than a request failure: short, and nothing technical in it.
+fn youtube_sentence(error: &str) -> Option<&str> {
+    let s = error.trim();
+    let e = s.to_ascii_lowercase();
+    let technical = [
+        "error", "http", "://", "status", "{", "request", "json", "failed",
+    ]
+    .iter()
+    .any(|t| e.contains(t));
+    (!s.is_empty() && s.len() <= 120 && !technical).then_some(s)
 }
 
 /// A playlist's count line ("52 tracks", "4,782 songs") moved by `delta`, keeping YouTube's own
@@ -4431,7 +4480,7 @@ impl App {
                 Event::DownloadFailed { video_id, error } => {
                     self.download_progress.remove(&video_id);
                     tracing::warn!(%video_id, %error, "download failed");
-                    self.toast_error("Could not download that track");
+                    self.toast_error(&failure_text("Could not download that track", &error));
                 }
 
                 Event::LocalScanDone { tracks } => {
@@ -4787,7 +4836,7 @@ impl App {
                 } => {
                     tracing::warn!(%channel_id, %error, "subscription refused; reverting");
                     self.set_subscribed_state(&channel_id, previous);
-                    self.toast_error("Could not update that subscription");
+                    self.toast_error(&failure_text("Could not update that subscription", &error));
                 }
                 Event::ExploreLoaded { shelves, links } => {
                     self.explore_loading = false;
@@ -4845,7 +4894,7 @@ impl App {
                     if self.history_shelves.is_some() {
                         tracing::warn!(%error, "history refresh failed; keeping the last list");
                         self.history_loaded_epoch = epoch;
-                        self.toast_error("Could not refresh your history");
+                        self.toast_error(&failure_text("Could not refresh your history", &error));
                     } else {
                         self.history_error = Some(error);
                     }
@@ -4864,7 +4913,7 @@ impl App {
                 }
                 Event::PlaylistCreateFailed { error } => {
                     tracing::warn!(%error, "could not create the playlist");
-                    self.toast_error("Could not create that playlist");
+                    self.toast_error(&failure_text("Could not create that playlist", &error));
                 }
                 Event::HomeLoaded {
                     filter,
@@ -5164,7 +5213,7 @@ impl App {
                 }
                 Event::MixFailed { seed, error } => {
                     tracing::warn!(%seed, %error, "start mix failed");
-                    self.toast_error("Could not start a mix");
+                    self.toast_error(&failure_text("Could not start a mix", &error));
                 }
                 Event::MixSeeded { seed, queue } => {
                     self.radio_loading = false;
@@ -5270,7 +5319,7 @@ impl App {
                     if self.like_of(&video_id) == attempted {
                         tracing::warn!(%video_id, %error, "rating refused; reverting");
                         self.set_like(&video_id, previous);
-                        self.toast_error("YouTube refused that rating");
+                        self.toast_error(&failure_text("YouTube refused that rating", &error));
                     }
                 }
                 Event::LibraryToggled {
@@ -5293,7 +5342,7 @@ impl App {
                 } => {
                     tracing::warn!(%video_id, %error, "library toggle refused; reverting");
                     self.set_library_state(&video_id, previous);
-                    self.toast_error("Could not update your library");
+                    self.toast_error(&failure_text("Could not update your library", &error));
                 }
                 Event::PageLibraryToggled { in_library, .. } => {
                     tracing::debug!(in_library, "page library toggle confirmed");
@@ -5319,7 +5368,7 @@ impl App {
                     {
                         self.set_playlist_title(&id, old);
                     }
-                    self.toast_error("Could not update the playlist");
+                    self.toast_error(&failure_text("Could not update the playlist", &error));
                 }
                 Event::PlaylistDeleted { id } => {
                     tracing::debug!(%id, "playlist deleted");
@@ -5332,7 +5381,7 @@ impl App {
                 }
                 Event::PlaylistDeleteFailed { id, error } => {
                     tracing::warn!(%id, %error, "playlist delete refused");
-                    self.toast_error("Could not delete the playlist");
+                    self.toast_error(&failure_text("Could not delete the playlist", &error));
                 }
                 Event::PlaylistLibraryChanged { id, saved } => {
                     tracing::debug!(%id, saved, "playlist library membership changed");
@@ -5343,7 +5392,7 @@ impl App {
                 }
                 Event::PlaylistLibraryFailed { id, error } => {
                     tracing::warn!(%id, %error, "playlist library write refused");
-                    self.toast_error("Could not update your library");
+                    self.toast_error(&failure_text("Could not update your library", &error));
                 }
                 Event::PageLibraryFailed {
                     album,
@@ -5352,7 +5401,7 @@ impl App {
                 } => {
                     tracing::warn!(album, %error, "page library toggle refused; reverting");
                     self.set_page_library(album, previous);
-                    self.toast_error("Could not update your library");
+                    self.toast_error(&failure_text("Could not update your library", &error));
                 }
                 Event::PlaylistBulkSaved {
                     playlist_id,
@@ -5409,7 +5458,15 @@ impl App {
                 } => {
                     tracing::warn!(%playlist_id, %video_id, %error, "save to playlist refused");
                     self.bump_playlist_counts(&playlist_id, -1);
-                    self.toast_error("Could not save to that playlist");
+                    // YouTube says why it refused an edit, in the account's language; a request
+                    // that failed outright gets the reason the error text gives, if any.
+                    let text = match youtube_sentence(&error) {
+                        Some(said) if failure_reason(&error).is_none() => {
+                            format!("Could not save to that playlist: {said}")
+                        }
+                        _ => failure_text("Could not save to that playlist", &error),
+                    };
+                    self.toast_error(&text);
                 }
                 Event::PlaylistRemoved {
                     playlist_id,
@@ -5428,7 +5485,7 @@ impl App {
                     // `playlist_for` is cleared first: `load_playlist` treats a matching id
                     // as already loading and would no-op.
                     tracing::warn!(%playlist_id, %video_id, %error, "remove refused; reloading");
-                    self.toast_error("Could not remove that song");
+                    self.toast_error(&failure_text("Could not remove that song", &error));
                     // The open page reloads below with YouTube's own count; the library list
                     // has no reload of its own, so the removal is taken back there.
                     self.bump_playlist_counts(&playlist_id, 1);
@@ -5447,7 +5504,7 @@ impl App {
                     // uses. `playlist_for` is cleared first: `load_playlist` treats a matching
                     // id as already loading and would no-op.
                     tracing::warn!(%playlist_id, %error, "reorder refused; reloading");
-                    self.toast_error("Could not reorder that playlist");
+                    self.toast_error(&failure_text("Could not reorder that playlist", &error));
                     if self.playlist.as_ref().is_some_and(|p| p.id == playlist_id) {
                         self.playlist = None;
                         self.playlist_for = None;
@@ -5580,7 +5637,7 @@ impl App {
             return;
         };
         let handle = player.handle();
-        // The user's volume, not `player.volume()`: the Audio Normaliser folds each track's gain
+        // The user's volume, not `player.volume()`: the Audio normaliser folds each track's gain
         // into the live value, and the next track must not inherit this one's.
         let volume = if self.muted { 0.0 } else { self.last_volume };
         let init_error = player.init_error().map(str::to_owned);
@@ -6677,7 +6734,9 @@ impl App {
     fn toast_error(&mut self, text: &str) {
         self.toast = Some(Toast {
             text: text.to_owned(),
-            until: Instant::now() + TOAST_DURATION,
+            // Longer than a confirmation: an error is the one toast worth reading to the end,
+            // and it often says why now.
+            until: Instant::now() + ERROR_TOAST_DURATION,
             error: true,
         });
     }
@@ -8640,5 +8699,52 @@ mod tests {
         ));
         assert!(!same_queue(&[track("x")], &[track("x"), track("y")]));
         assert!(!same_queue(&[], &playing));
+    }
+
+    /// A failure toast says why when the error tells, and nothing technical ever reaches it.
+    #[test]
+    fn a_failure_toast_says_why_when_it_can() {
+        assert_eq!(
+            failure_text(
+                "Could not remove that song",
+                "error sending request for url"
+            ),
+            "Could not remove that song: you're offline"
+        );
+        assert_eq!(
+            failure_text(
+                "Could not update your library",
+                "HTTP status client error (401 Unauthorized)"
+            ),
+            "Could not update your library: sign in again"
+        );
+        assert_eq!(
+            failure_text(
+                "Could not start a mix",
+                "HTTP status client error (429 Too Many Requests)"
+            ),
+            "Could not start a mix: YouTube is busy, try again in a minute"
+        );
+        assert_eq!(
+            failure_text(
+                "Could not start a mix",
+                "YouTube returned an empty watch queue"
+            ),
+            "Could not start a mix",
+            "an unknown cause keeps the plain wording"
+        );
+    }
+
+    /// Only a plain sentence counts as YouTube's own reason; request failures do not.
+    #[test]
+    fn youtube_s_own_sentence_is_told_from_a_request_failure() {
+        assert_eq!(
+            youtube_sentence("This playlist can't be edited."),
+            Some("This playlist can't be edited.")
+        );
+        assert_eq!(youtube_sentence(""), None);
+        assert_eq!(youtube_sentence("HTTP status server error (500)"), None);
+        assert_eq!(youtube_sentence("error decoding response body"), None);
+        assert_eq!(youtube_sentence(&"x".repeat(200)), None);
     }
 }

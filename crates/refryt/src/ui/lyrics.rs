@@ -109,7 +109,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             let color = if is_active {
-                p.accent
+                p.accent_text()
             } else if hovered {
                 p.text
             } else {

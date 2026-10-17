@@ -1,11 +1,13 @@
 # Themes
 
 Every colour theme in refryt is a `.css` file in the themes folder, including the ones the app
-ships with. The first time refryt starts, it writes its 22 themes there (Classic, Catppuccin,
+ships with. The first time refryt starts, it writes its 23 themes there (Classic, Catppuccin,
 Nord, Gruvbox, Tokyo Night, Dracula, Rosé Pine, Everforest and Solarized, each light and dark
-flavour as its own file). From then on the folder is all there is:
+flavour as its own file, and Spotify). From then on the folder is all there is:
 
 - **Delete a file** and that theme is gone. Nothing puts it back.
+- **A theme added in a newer release** is written into the folder once. A hidden `.offered` file
+  in the folder records which built-in themes it has been given, so a deleted one stays deleted.
 - **Edit a file** and that theme changes. Save it while refryt is open, then come back to the
   window (or open Settings) and the app repaints. It looks at the folder at those moments, not on
   a timer, so an idle refryt does nothing in the background.

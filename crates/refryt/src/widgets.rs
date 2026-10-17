@@ -497,12 +497,41 @@ pub(crate) fn inner_radius(slot_radius: CornerRadius, slot: Rect, fitted: Rect) 
 /// `playing` is this row/card's own track, actually playing right now (not paused) — paints
 /// Pause rather than Play, the same convention the player bar's own big button follows, so
 /// hovering the track that's already going shows you can press it to pause, not restart it.
-pub fn play_overlay(ui: &Ui, palette: &Palette, art: Rect, t: f32, corner: bool, playing: bool) {
+///
+/// `target` is where a press on it lands (the card's corner button, the row's cover): under the
+/// pointer the button lightens and grows a touch, and held it sinks, as the player bar's play
+/// button does, so it reads as a control and not only a sign.
+pub fn play_overlay(
+    ui: &Ui,
+    palette: &Palette,
+    art: Rect,
+    t: f32,
+    corner: bool,
+    playing: bool,
+    target: Rect,
+) {
     if t <= 0.01 {
         return;
     }
+    let pointed = t > 0.5 && ui.rect_contains_pointer(target);
+    let held = pointed && ui.input(|i| i.pointer.primary_down());
     let full = if corner { 34.0 } else { art.width() * 0.55 };
-    let d = full * (0.7 + 0.3 * t);
+    let press = if held {
+        0.94
+    } else if pointed {
+        1.06
+    } else {
+        1.0
+    };
+    let d = full * (0.7 + 0.3 * t) * press;
+    let fill = if pointed {
+        palette.accent_hover
+    } else {
+        palette.accent
+    };
+    if pointed {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     let centre = if corner {
         // Rises 8pt as it fades in.
         art.right_bottom() - vec2(full * 0.5 + 8.0, full * 0.5 + 8.0 - 8.0 * (1.0 - t))
@@ -516,7 +545,7 @@ pub fn play_overlay(ui: &Ui, palette: &Palette, art: Rect, t: f32, corner: bool,
         art.center()
     };
     ui.painter()
-        .circle_filled(centre, d / 2.0, palette.accent.gamma_multiply(t));
+        .circle_filled(centre, d / 2.0, fill.gamma_multiply(t));
     let glyph = d * 0.44;
     let icon = if playing {
         Icon::PauseFilled
@@ -856,7 +885,7 @@ fn fade_slices(ui: &mut Ui, band: Rect, cut_at_start: bool, mut paint: impl FnMu
 pub(crate) const SCROLL_FADE: f32 = 48.0;
 
 /// How far a card's scrolled lists fade with these settings: [`SCROLL_FADE`], or not at all
-/// when Scroll Fades is off.
+/// when Scroll fades is off.
 pub(crate) fn scroll_fade(settings: &crate::settings::Settings) -> f32 {
     if settings.scroll_fades {
         SCROLL_FADE
@@ -2460,7 +2489,7 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
                 );
             } else if shape == ArtShape::Square {
                 // A cover you can press is a control; one you cannot is a picture.
-                play_overlay(ui, palette, art_rect, t, false, playing);
+                play_overlay(ui, palette, art_rect, t, false, playing, art_rect);
             }
         }
 
@@ -2562,7 +2591,11 @@ pub fn track_row<'a>(ui: &mut Ui, palette: &Palette, row: TrackRow<'a>) -> RowCl
         }
         let text_w = (rect.right() - right_pad - duration_w - thumb_w - title_x).max(0.0);
 
-        let title_color = if active { palette.accent } else { palette.text };
+        let title_color = if active {
+            palette.accent_text()
+        } else {
+            palette.text
+        };
         // A long title scrolls on hover instead of hard-truncating; a title that fits is painted
         // plainly. Hover-only sense, so the row's own click is never stolen. Its cut-off fades
         // the text's own alpha, so no background colour is needed — the row's hover highlight
@@ -3424,6 +3457,10 @@ pub fn art_card(
             // Loading, the corner button stays up whether hovered or not, ringed like the
             // player bar's — the card you pressed says it heard you.
             let loading = playing && track_loading(ui.ctx());
+            let button = Rect::from_center_size(
+                art.right_bottom() - vec2(17.0 + 8.0, 17.0 + 8.0),
+                vec2(34.0, 34.0),
+            );
             play_overlay(
                 ui,
                 palette,
@@ -3431,6 +3468,7 @@ pub fn art_card(
                 if loading { 1.0 } else { t },
                 true,
                 playing,
+                button,
             );
             if loading {
                 let centre = art.right_bottom() - vec2(17.0 + 8.0, 17.0 + 8.0);
@@ -4767,6 +4805,10 @@ fn menu_row(
     response
 }
 
+/// How tall the seek bar's hit area is: WCAG's 24-point minimum for a target, around a line a few
+/// points thick.
+const SEEK_HIT_HEIGHT: f32 = 24.0;
+
 /// A seek bar. Returns the position to seek to, in seconds, when the user scrubs.
 ///
 /// Drawn rather than composed from egui widgets so the hit area can be taller than the visible
@@ -4782,7 +4824,8 @@ pub fn seek_bar(
     position: f64,
     labels: bool,
 ) -> Option<f64> {
-    let hit = bar.expand2(vec2(0.0, 8.0));
+    // At least `SEEK_HIT_HEIGHT` tall, centred on the line, whatever the line's own thickness.
+    let hit = bar.expand2(vec2(0.0, ((SEEK_HIT_HEIGHT - bar.height()) / 2.0).max(0.0)));
     let response = ui.interact(hit, egui::Id::new("ytm-seek"), Sense::click_and_drag());
     let active = response.hovered() || response.dragged();
 
@@ -4932,7 +4975,10 @@ pub fn volume_slider(ui: &mut Ui, palette: &Palette, volume: f64, unmute_to: f64
 
     // Mute toggle on the icon itself.
     let mut new_volume = None;
-    if icon_button(ui, palette, icon, 16.0, false).clicked() {
+    if icon_button(ui, palette, icon, 16.0, false)
+        .on_hover_text(crate::ui::tips::mute(volume <= 0.5))
+        .clicked()
+    {
         new_volume = Some(if volume > 0.5 { 0.0 } else { unmute_to });
     }
 

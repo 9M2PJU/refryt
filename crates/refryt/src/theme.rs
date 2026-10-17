@@ -261,6 +261,19 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// The accent, for text: the playing song's title, the active lyric line. A theme whose
+    /// accent is too light (or dark) to read as text on its cards gets it pulled toward its own
+    /// text colour until it clears AA; one that already reads keeps its accent exactly. Buttons,
+    /// fills and icons keep [`Self::accent`].
+    pub fn accent_text(&self) -> Color32 {
+        ramp::lift_to(
+            self.accent,
+            self.text,
+            self.panel,
+            ramp::ACCENT_TEXT_MIN_CONTRAST,
+        )
+    }
+
     /// The default theme's dark palette. Kept as a name because half the app's tests and the
     /// `--decorated` fallback path reach for it directly.
     pub fn dark() -> Self {
@@ -924,8 +937,8 @@ mod tests {
     #[test]
     fn emoji_arrows_sit_side_by_side() {
         let ctx = fonts_ready();
-        let font = medium(13.5);
-        let one = crate::emoji::emoji_side(13.5) + 1.0;
+        let font = medium(13.0);
+        let one = crate::emoji::emoji_side(13.0) + 1.0;
         let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
             let w = |s: &str| crate::widgets::text_width(ui, s, &font);
             assert!((w("↖\u{FE0F}") - one).abs() < 0.01, "{}", w("↖\u{FE0F}"));

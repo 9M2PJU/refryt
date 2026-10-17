@@ -48,9 +48,9 @@ because the GNOME runtime has none of them. The refryt module also needs the net
 crates.
 
 The Flatpak differs from the AppImage in three ways. The sandbox cannot read a browser's profile
-folder, so Settings leaves out "Import from a Browser" and the sign-in window is the only way in.
+folder, so Settings leaves out "Import from a browser" and the sign-in window is the only way in.
 Its autostart entry would land in the sandbox's own config folder, where nothing reads it, so
-"Launch on Startup" is left out too. And `yt-dlp` is bundled at build time, the same as the
+"Launch on startup" is left out too. And `yt-dlp` is bundled at build time, the same as the
 AppImage's, so it is as old as the build.
 
 ## macOS: the app bundle

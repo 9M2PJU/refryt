@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // How long Strict Home Order takes against the live feed, for choosing its time limit:
+    // How long Strict Home order takes against the live feed, for choosing its time limit:
     // `REFRYT_HOME_MEASURE=<runs>` runs the ordinary load and then strict loads for a few orders,
     // `<runs>` times each, and prints only timings and section names. Nothing else is checked.
     if let Some(runs) = std::env::var("REFRYT_HOME_MEASURE")

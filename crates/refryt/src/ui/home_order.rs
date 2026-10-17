@@ -26,7 +26,7 @@ const EDGE_SPEED: f32 = 9.0;
 pub(crate) const DISCLAIMER: &str = "Home may not always follow this exactly. YouTube chooses \
 which sections you get and sends them in batches. A section that arrives late is added below \
 what is already on screen, so the page does not jump around while you read, and shelves we do \
-not recognise go under Everything else. Strict Home Order, in Settings, waits longer so fewer \
+not recognise go under Everything else. Strict Home order, in Settings, waits longer so fewer \
 arrive late.";
 
 fn row_height(section: HomeSection) -> f32 {
@@ -63,7 +63,7 @@ pub(crate) fn modal(app: &mut App, ui: &mut egui::Ui) {
     // The note's height at this width, so the card can be sized before anything is drawn.
     let note = ui.painter().layout(
         DISCLAIMER.to_owned(),
-        theme::regular(11.5),
+        theme::regular(11.0),
         p.dim,
         inner_w - 24.0,
     );
@@ -268,7 +268,7 @@ fn paint_label(ui: &egui::Ui, p: &theme::Palette, row: egui::Rect, section: Home
                 egui::pos2(x, row.center().y - 8.0),
                 egui::Align2::LEFT_CENTER,
                 section.label(),
-                theme::medium(13.5),
+                theme::medium(13.0),
                 p.text,
             );
             painter.text(
@@ -284,7 +284,7 @@ fn paint_label(ui: &egui::Ui, p: &theme::Palette, row: egui::Rect, section: Home
                 egui::pos2(x, row.center().y),
                 egui::Align2::LEFT_CENTER,
                 section.label(),
-                theme::medium(13.5),
+                theme::medium(13.0),
                 p.text,
             );
         }

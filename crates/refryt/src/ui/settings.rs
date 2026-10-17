@@ -89,7 +89,7 @@ fn about(app: &mut App, ui: &mut egui::Ui) {
     widgets::setting_group(ui, &p, Some("Help"), |ui, g| {
         g.row(
             ui,
-            "Keyboard Shortcuts",
+            "Keyboard shortcuts",
             "Every key refryt answers to.",
             |ui| open_help = widgets::outline_button(ui, &p, "Show").clicked(),
         );
@@ -273,10 +273,10 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
         });
         g.row(
             ui,
-            "Your Own Themes",
+            "Your own themes",
             "Drop a theme file in the folder and it appears above.",
             |ui| {
-                if widgets::outline_button(ui, &p, "Open Folder").clicked() {
+                if widgets::outline_button(ui, &p, "Open folder").clicked() {
                     match crate::theme::custom::dir() {
                         Some(dir) => {
                             if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -349,7 +349,7 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
             let blur_useful = sheer > 0.0;
             g.row(
                 ui,
-                "Background Blur",
+                "Background blur",
                 if !blur_available {
                     "Your compositor doesn't support it."
                 } else if !blur_useful {
@@ -377,7 +377,7 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &p,
             "setting-card-outline",
-            "Card Outlines",
+            "Card outlines",
             "A thin edge around each panel.",
             &mut card_outline,
         );
@@ -386,7 +386,7 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &p,
             "setting-scroll-fades",
-            "Scroll Fades",
+            "Scroll fades",
             "Fades lists out at their edges. Recommended with transparency.",
             &mut scroll_fades,
         );
@@ -395,7 +395,7 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &p,
             "setting-adaptive-art-color",
-            "Adaptive Header Colour",
+            "Adaptive header colour",
             "Tints album and playlist headers to match the cover.",
             &mut adaptive_art_color,
         );
@@ -425,7 +425,7 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
     let mut scrobble = app.settings.scrobble;
 
     widgets::setting_group(ui, &p, Some("Sound"), |ui, g| {
-        g.row(ui, "Audio Quality", quality.detail(), |ui| {
+        g.row(ui, "Audio quality", quality.detail(), |ui| {
             for option in Quality::ALL.into_iter().rev() {
                 if widgets::chip(ui, &p, option.label(), quality == option).clicked() {
                     quality = option;
@@ -437,7 +437,7 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &p,
             "setting-normalise",
-            "Audio Normaliser",
+            "Audio normaliser",
             "Keeps the volume consistent between tracks.",
             &mut normalise,
         );
@@ -458,7 +458,7 @@ fn playback(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &p,
             "setting-scrobble",
-            "Save Listening History",
+            "Save listening history",
             "Adds what you play to your YouTube history.",
             &mut scrobble,
         );
@@ -486,13 +486,13 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &p,
             "setting-double-click",
-            "Double-Click to Play",
+            "Double-click to play",
             "One click selects, two clicks play.",
             &mut double_click,
         );
         g.wide_row(
             ui,
-            "Playlist Order",
+            "Playlist order",
             "How playlists are ordered when you open them. The sort button on a playlist still changes it for that visit.",
             |ui| {
                 for option in crate::app::PlaylistSort::ALL {
@@ -516,7 +516,7 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
     widgets::setting_group(ui, &p, Some("Home"), |ui, g| {
         g.row(
             ui,
-            "Order of Homepage",
+            "Order of homepage",
             "Choose which sections come first on Home.",
             |ui| {
                 open_order = widgets::outline_button(ui, &p, "Change…").clicked();
@@ -527,7 +527,7 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &p,
             "setting-home-strict",
-            "Strict Home Order",
+            "Strict Home order",
             "Waits longer for Home so your top sections come first. Gives up after a few seconds.",
             &mut strict,
         );
@@ -564,10 +564,10 @@ fn local_music(app: &mut App, ui: &mut egui::Ui) {
         }
         g.row(
             ui,
-            "Add a Folder",
+            "Add a folder",
             "Folders to scan for music. They show up in Library → Local.",
             |ui| {
-                add = widgets::outline_button(ui, &p, "Add Folder").clicked();
+                add = widgets::outline_button(ui, &p, "Add folder").clicked();
             },
         );
     });
@@ -615,7 +615,7 @@ fn system(app: &mut App, ui: &mut egui::Ui) {
                 ui,
                 &p,
                 "setting-start-on-boot",
-                "Launch on Startup",
+                "Launch on startup",
                 "Opens refryt when you log in.",
                 &mut start_on_boot,
             );
@@ -625,7 +625,7 @@ fn system(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &p,
             "setting-hide-tray",
-            "Close to Tray",
+            "Close to tray",
             hide_tray_detail,
             &mut hide_tray,
         );
@@ -715,9 +715,9 @@ fn window_sign_in(app: &mut App, ui: &mut egui::Ui, g: &mut widgets::Group) {
     let mut clicked = false;
     g.row(
         ui,
-        "Sign-In Window",
+        "Sign-in window",
         "Signs in through Google in a small window of its own.",
-        |ui| clicked = widgets::pill_button(ui, &p, "Sign In").clicked(),
+        |ui| clicked = widgets::pill_button(ui, &p, "Sign in").clicked(),
     );
     if clicked {
         // Deliberately not `auth = Checking`: that state means "verifying a stored session at
@@ -736,9 +736,9 @@ fn browser_import(app: &mut App, ui: &mut egui::Ui, g: &mut widgets::Group) {
         target_os = "windows",
         target_os = "macos"
     )) {
-        "Or Import from a Browser"
+        "Or import from a browser"
     } else {
-        "Import from a Browser"
+        "Import from a browser"
     };
     let browsers = app
         .detected_browsers
@@ -800,7 +800,7 @@ fn signed_in(app: &mut App, ui: &mut egui::Ui) {
                 format!("Signed in as {account}")
             },
             "Your library and Home feed are synced.",
-            |ui| sign_out = widgets::outline_button(ui, &p, "Sign Out").clicked(),
+            |ui| sign_out = widgets::outline_button(ui, &p, "Sign out").clicked(),
         );
         // The Premium badge rides its own row: downloads follow it, so it should be seen.
         g.row(

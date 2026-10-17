@@ -85,10 +85,17 @@ impl Ramp {
             // it on the gutter, where the now-playing title is painted.
             base.lerp_to_gamma(Color32::BLACK, if dark { 0.35 } else { 0.03 })
         });
-        let secondary = self
-            .subtext
-            .map(rgb)
-            .unwrap_or_else(|| text.lerp_to_gamma(base, 0.22));
+        // Both tones are read on the cards and on the gutter (the player bar's song line and
+        // times), so each has to clear its floor on whichever of the two is the weaker ground.
+        let grounds = [base, crust];
+        let secondary = lift_to_all(
+            self.subtext
+                .map(rgb)
+                .unwrap_or_else(|| text.lerp_to_gamma(base, 0.22)),
+            text,
+            &grounds,
+            SECONDARY_MIN_CONTRAST,
+        );
         Palette {
             dark,
             window: crust,
@@ -114,7 +121,7 @@ impl Ramp {
                     .unwrap_or_else(|| text.lerp_to_gamma(base, 0.48)),
                 text,
                 secondary,
-                base,
+                &grounds,
             ),
             accent,
             accent_hover: self.accent_hi.map(rgb).unwrap_or_else(|| {
@@ -142,7 +149,7 @@ impl Ramp {
 }
 
 /// Relative luminance per WCAG, on straight (non-premultiplied) sRGB.
-pub(super) fn luminance(c: Color32) -> f32 {
+pub(crate) fn luminance(c: Color32) -> f32 {
     let ch = |v: u8| {
         let v = v as f32 / 255.0;
         if v <= 0.03928 {
@@ -154,7 +161,7 @@ pub(super) fn luminance(c: Color32) -> f32 {
     0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
 }
 
-pub(super) fn contrast(a: Color32, b: Color32) -> f32 {
+pub(crate) fn contrast(a: Color32, b: Color32) -> f32 {
     let (x, y) = (luminance(a), luminance(b));
     let (hi, lo) = if x > y { (x, y) } else { (y, x) };
     (hi + 0.05) / (lo + 0.05)
@@ -163,17 +170,59 @@ pub(super) fn contrast(a: Color32, b: Color32) -> f32 {
 /// The least contrast the faintest text tone keeps against the card: counts, help lines, the
 /// "Radio" tag. Several published families set theirs near 2:1 — a hint on their own
 /// backgrounds, close to invisible under an acrylic shell — so this lifts it toward the text
-/// colour until it reads, and leaves a family that already clears it alone.
-pub(super) const DIM_MIN_CONTRAST: f32 = 3.5;
+/// colour until it reads, and leaves a family that already clears it alone. WCAG AA's 4.5:1 for
+/// normal text: these are 11 pt, well under its large-text size.
+pub(super) const DIM_MIN_CONTRAST: f32 = 4.5;
+
+/// The least contrast second-rank text (subtitles, artist lines) keeps against the card: AA, with
+/// room above [`DIM_MIN_CONTRAST`] so the faintest tone can clear AA and still sit under it.
+pub(super) const SECONDARY_MIN_CONTRAST: f32 = 4.8;
+
+/// The least contrast text painted in the accent (the playing song's title, the active lyric
+/// line) keeps against the card: see [`Palette::accent_text`](crate::theme::Palette::accent_text).
+pub(crate) const ACCENT_TEXT_MIN_CONTRAST: f32 = 4.5;
+
+/// `colour`, pulled toward `toward` (the theme's own text colour, so the hue family holds) in small
+/// steps until it clears `goal` on `panel`. A theme that already clears it is left alone, and the
+/// pull stops at `toward` itself, which is the most the theme's own text can give.
+pub(crate) fn lift_to(colour: Color32, toward: Color32, panel: Color32, goal: f32) -> Color32 {
+    lift_to_all(colour, toward, &[panel], goal)
+}
+
+/// [`lift_to`], clearing `goal` on every one of `grounds`, each capped at what `toward` itself
+/// reaches there.
+pub(crate) fn lift_to_all(
+    colour: Color32,
+    toward: Color32,
+    grounds: &[Color32],
+    goal: f32,
+) -> Color32 {
+    let short = |c: Color32| {
+        grounds
+            .iter()
+            .any(|&g| contrast(c, g) < goal.min(contrast(toward, g)))
+    };
+    let mut out = colour;
+    let mut t = 0.0;
+    while short(out) && t < 1.0 {
+        t += 0.05;
+        out = colour.lerp_to_gamma(toward, t);
+    }
+    out
+}
 
 /// `dim`, pulled toward `text` in small steps until it clears [`DIM_MIN_CONTRAST`] on `panel` —
 /// or until it would crowd `secondary`, the tone above it, in a family whose own secondary
 /// sits under that bar. The hierarchy outranks the number.
-fn readable_dim(dim: Color32, text: Color32, secondary: Color32, panel: Color32) -> Color32 {
-    let goal = DIM_MIN_CONTRAST.min(contrast(secondary, panel) - 0.3);
+fn readable_dim(dim: Color32, text: Color32, secondary: Color32, grounds: &[Color32]) -> Color32 {
+    let short = |c: Color32| {
+        grounds
+            .iter()
+            .any(|&g| contrast(c, g) < DIM_MIN_CONTRAST.min(contrast(secondary, g) - 0.3))
+    };
     let mut out = dim;
     let mut t = 0.0;
-    while contrast(out, panel) < goal && t < 1.0 {
+    while short(out) && t < 1.0 {
         t += 0.05;
         out = dim.lerp_to_gamma(text, t);
     }
