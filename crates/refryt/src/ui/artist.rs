@@ -372,6 +372,14 @@ fn add_rows(
     rows: &[(f32, f32, f32)],
     vertex: &mut dyn FnMut(egui::Pos2) -> (egui::Pos2, egui::Color32),
 ) {
+    // One row is a line, not a band: it would add vertices and no triangles, and the wgpu
+    // renderer panics on a mesh like that ("buffer slice can not be empty") — it binds the
+    // index buffer slice of every mesh that has vertices. `hero_rows` hands back a single row
+    // for the last half point of a banner scrolling out of the card, where there is nothing to
+    // see anyway.
+    if rows.len() < 2 {
+        return;
+    }
     let base = mesh.vertices.len() as u32;
     for &(y, left, right) in rows {
         for x in [left, right] {
@@ -910,6 +918,33 @@ mod tests {
         assert!((last_r - hero.right()).abs() < 0.01);
         // The arc, then the straight bottom edge.
         assert_eq!(rows.len(), HERO_ARC_STEPS + 2);
+    }
+
+    /// The last sliver of a banner scrolling out — under half a point of image, or of scrim —
+    /// comes back from `hero_rows` as a single row. A mesh built from it must be empty, not
+    /// vertices without triangles: wgpu panics on that ("buffer slice can not be empty"), which
+    /// is how 0.1.10 crashed on Windows.
+    #[test]
+    fn the_last_sliver_of_a_banner_paints_no_half_built_mesh() {
+        let hero = rect(50.0, 450.0);
+        for (slice, start) in [
+            (rect(449.7, 450.0), 449.7), // the image's last 0.3 pt
+            (rect(50.0, 450.0), 449.8),  // a scrim starting at the very bottom
+        ] {
+            let rows = hero_rows(hero, slice, start);
+            let mut mesh = egui::Mesh::default();
+            add_rows(&mut mesh, &rows, &mut |_| {
+                (egui::epaint::WHITE_UV, egui::Color32::WHITE)
+            });
+            assert_eq!(
+                mesh.vertices.is_empty(),
+                mesh.indices.is_empty(),
+                "{} rows gave {} vertices and {} indices",
+                rows.len(),
+                mesh.vertices.len(),
+                mesh.indices.len()
+            );
+        }
     }
 
     #[test]
