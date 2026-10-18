@@ -35,7 +35,7 @@ libmpv2.workspace = true
 # OpenGL render params, so the video view drives mpv's `sw` render context directly through these
 # bindings instead: one code path under any egui renderer, at the cost of a copy per frame.
 libmpv2-sys = "=4.0.1"
-# `blur.rs`'s backends (KDE, macOS, and the do-nothing stub for everything else, Windows included)
+# `blur.rs`'s backends (KDE, macOS, Windows, and the do-nothing stub for everything else)
 # read the raw window/display handles eframe exposes, so this is unconditional rather than behind any
 # one target's `cfg`.
 raw-window-handle = "0.6"
@@ -105,18 +105,23 @@ wry = { version = "0.57", default-features = false, features = ["os-webview"] }
 wry = "0.57"
 tao = "0.37"
 # `-System_Registry`/`-Security` are `autostart`'s per-user `Run` key; `-UI_Shell` /
-# `-UI_WindowsAndMessaging` are `open_url`'s `ShellExecuteW`. There is no `-Graphics_Dwm`: the
-# backdrop call it used to carry is gone with the transparency option (see `blur.rs`).
+# `-UI_WindowsAndMessaging` are `open_url`'s `ShellExecuteW`. `-Graphics_Dwm`, `-Graphics_Gdi` and
+# `-UI_Controls` are `blur.rs`: the acrylic backdrop, the rounded corners, and the black
+# redirection surface that lets the transparent shell show the desktop.
 windows-sys = { version = "=0.52.0", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Controls",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Windows renders through wgpu. Not for transparency — the shell is opaque there now (`blur.rs`
-# has no Windows backend) — but for stability: the glow/WGL path presents whole-window black
+# Windows renders through wgpu, for two reasons. Transparency: DX12's DirectComposition swapchain
+# (set up in `main.rs`) is the one presentation path there with per-pixel alpha. And stability:
+# the glow/WGL path presents whole-window black
 # frames under load on Windows (reproduced: scrolling an artist page while covers upload gives
 # uniform black frames every so often, while the same build on wgpu does not). eframe's
 # `Renderer::default()` picks wgpu automatically the moment both backends are compiled in, so no

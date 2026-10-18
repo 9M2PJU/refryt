@@ -12,7 +12,6 @@ use egui::RichText;
 use crate::app::App;
 use crate::auth::AuthState;
 use crate::browser_cookies;
-#[cfg(not(target_os = "windows"))]
 use crate::settings::Opacity;
 use crate::settings::{Quality, Theme};
 use crate::theme;
@@ -293,85 +292,78 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
     theme_notes(app, ui, dark);
 
     let mut adaptive_art_color = app.settings.adaptive_art_color;
-    // Windows gets no transparency and no blur row at all. Its per-pixel-alpha route composites
-    // the shell over a flat DWM material — a washed-out white, not the desktop — so the slider
-    // promised see-through that could never look right, and the blur behind that material was
-    // invisible. Absent beats a switch that lies; the window is opaque there (`app::App::new`
-    // forces the stored values off, in case a settings file came from Linux).
-    #[cfg(not(target_os = "windows"))]
     let mut sheer = app.settings.opacity.sheer();
-    #[cfg(not(target_os = "windows"))]
     let mut blur = app.settings.blur;
     let mut card_outline = app.settings.card_outline;
     let mut scroll_fades = app.settings.scroll_fades;
     widgets::setting_group(ui, &p, Some("Window"), |ui, g| {
-        #[cfg(not(target_os = "windows"))]
-        {
-            // A slider, not chips: transparency is a continuum, and four names only ever made
-            // the setting look like a choice of four windows.
-            let decorated = app.decorated;
-            let percent = format!("{:.0}%", sheer / Opacity::MAX * 100.0);
-            g.row(
-                ui,
-                "Transparency",
-                if decorated {
-                    "Not available with `--decorated`."
-                } else {
-                    "How much of the desktop shows through."
-                },
-                |ui| {
-                    // `--decorated` gives the window back to the OS, which paints its own opaque
-                    // background — the slider would do nothing, so it is dimmed and inert rather
-                    // than silently pretending.
-                    ui.add_enabled_ui(!decorated, |ui| {
-                        // The number the slider only implies, in a fixed slot at the row's right
-                        // edge so the changing digits move nothing: a percentage of the
-                        // slider's whole range, which reaches past the old maximum — not of the
-                        // composite alpha.
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(34.0, 20.0),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(&percent)
-                                        .font(theme::regular(12.0))
-                                        .color(p.text),
-                                );
-                            },
-                        );
-                        ui.add_space(4.0);
-                        widgets::slider(ui, &p, &mut sheer, 0.0..=Opacity::MAX, 150.0);
-                    });
-                },
-            );
-
-            let blur_available = app.blur.available();
-            let blur_useful = sheer > 0.0;
-            g.row(
-                ui,
-                "Background blur",
-                if !blur_available {
-                    "Your compositor doesn't support it."
-                } else if !blur_useful {
-                    "Turn up transparency to use it."
-                } else {
-                    "Blurs the desktop behind the window."
-                },
-                |ui| {
-                    // Dimmed and inert rather than clickable-but-pointless when there is
-                    // nothing to turn on — no compositor support, or nothing set to show
-                    // through it yet.
-                    widgets::toggle_enabled(
-                        ui,
-                        &p,
-                        ui.id().with("setting-blur"),
-                        &mut blur,
-                        blur_available && blur_useful,
+        // A slider, not chips: transparency is a continuum, and four names only ever made
+        // the setting look like a choice of four windows.
+        let decorated = app.decorated;
+        let percent = format!("{:.0}%", sheer / Opacity::MAX * 100.0);
+        g.row(
+            ui,
+            "Transparency",
+            if decorated {
+                "Not available with `--decorated`."
+            } else {
+                "How much of the desktop shows through."
+            },
+            |ui| {
+                // `--decorated` gives the window back to the OS, which paints its own opaque
+                // background — the slider would do nothing, so it is dimmed and inert rather
+                // than silently pretending.
+                ui.add_enabled_ui(!decorated, |ui| {
+                    // The number the slider only implies, in a fixed slot at the row's right
+                    // edge so the changing digits move nothing: a percentage of the
+                    // slider's whole range, which reaches past the old maximum — not of the
+                    // composite alpha.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(34.0, 20.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                RichText::new(&percent)
+                                    .font(theme::regular(12.0))
+                                    .color(p.text),
+                            );
+                        },
                     );
-                },
-            );
-        }
-        // Outside the block above: a solid window takes the edge too, and Windows has one.
+                    ui.add_space(4.0);
+                    widgets::slider(ui, &p, &mut sheer, 0.0..=Opacity::MAX, 150.0);
+                });
+            },
+        );
+
+        let blur_available = app.blur.available();
+        let blur_useful = sheer > 0.0;
+        g.row(
+            ui,
+            "Background blur",
+            if !blur_available {
+                if cfg!(target_os = "windows") {
+                    "Needs Windows 11 22H2 or later."
+                } else {
+                    "Your compositor doesn't support it."
+                }
+            } else if !blur_useful {
+                "Turn up transparency to use it."
+            } else {
+                "Blurs the desktop behind the window."
+            },
+            |ui| {
+                // Dimmed and inert rather than clickable-but-pointless when there is
+                // nothing to turn on — no compositor support, or nothing set to show
+                // through it yet.
+                widgets::toggle_enabled(
+                    ui,
+                    &p,
+                    ui.id().with("setting-blur"),
+                    &mut blur,
+                    blur_available && blur_useful,
+                );
+            },
+        );
         toggle_row(
             g,
             ui,
@@ -403,11 +395,8 @@ fn appearance(app: &mut App, ui: &mut egui::Ui) {
 
     let ctx = ui.ctx().clone();
     app.update_settings(&ctx, |s| {
-        #[cfg(not(target_os = "windows"))]
-        {
-            s.opacity = Opacity::new(sheer);
-            s.blur = blur;
-        }
+        s.opacity = Opacity::new(sheer);
+        s.blur = blur;
         s.theme = theme_choice;
         s.dark_theme = dark_choice;
         s.light_theme = light_choice;

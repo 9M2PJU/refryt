@@ -14,19 +14,17 @@
 //!   carries a `capabilities` event, so the Settings toggle follows the Blur desktop effect
 //!   switch live instead of offering blur the compositor has been told not to do.
 //!
-//! Windows has no backend and wants none: the shell is opaque there (`app::App::new`), so a
-//! backdrop would have nothing to show through — and the DWM material that used to be applied
-//! read as flat white rather than as blur.
+//! - **Windows**: DWM's own acrylic, `DWMWA_SYSTEMBACKDROP_TYPE` (Windows 11 22H2 and later),
+//!   see [`windows`]. No region either: DWM follows the window's shape.
 //!
 //! macOS asks the window server directly (`CGSSetWindowBackgroundBlurRadius`), see [`macos`].
 //! The blur follows the window's shape, which is why the macOS window is a native one that the
 //! system rounds (`main.rs`) rather than a borderless rectangle: with a borderless window the
 //! blur would show as a square behind the app's rounded corners.
 //!
-//! Silent by design. GNOME before 51, wlroots, X11, Windows: all take the same
+//! Silent by design. GNOME before 51, wlroots, X11, Windows 10: all take the same
 //! unavailable path — the window stays merely translucent, and Settings explains that rather
-//! than offering a switch that would do nothing (on Windows, where the shell is opaque, the
-//! switch does not exist at all).
+//! than offering a switch that would do nothing.
 
 /// The blur region for a rounded window, as rectangles.
 ///
@@ -71,7 +69,10 @@ pub use wayland::Blur;
 #[cfg(target_os = "macos")]
 pub use macos::Blur;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+pub use windows::Blur;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub use stub::Blur;
 
 /// macOS: the window server's own background blur, `CGSSetWindowBackgroundBlurRadius` — what
@@ -149,13 +150,15 @@ mod macos {
             }
             self.applied = Some(on);
         }
+
+        /// The window server's blur takes no tint from the window: nothing to tell it.
+        pub fn set_dark(&mut self, _dark: bool) {}
     }
 }
 
-/// Everywhere that is not Linux or macOS — Windows included, where the transparency feature
-/// itself is absent rather than merely blurless — and whatever else this ever compiles for: the
+/// Everywhere that is not Linux, macOS or Windows — whatever else this ever compiles for: the
 /// same shape, doing nothing.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod stub {
     #[derive(Default)]
     pub struct Blur;
@@ -172,6 +175,219 @@ mod stub {
         }
 
         pub fn set(&mut self, _on: bool, _size: (u32, u32), _radius: u32) {}
+
+        pub fn set_dark(&mut self, _dark: bool) {}
+    }
+}
+
+/// Windows: DWM's acrylic, and the groundwork that lets the transparent shell show through at
+/// all.
+///
+/// The shell is presented through a DirectComposition swapchain (`main.rs`), which DWM blends
+/// with real per-pixel alpha, but it sits on top of the window's GDI redirection surface. Nothing
+/// ever paints that surface, and unpainted it is opaque white, which is what made the
+/// see-through shell read as a flat grey. So it is painted black — once now, and on every erase
+/// and resize after — inside a frame extended over the client area: there black is "glass",
+/// which shows the desktop, or the backdrop below when one is asked for. (The window cannot
+/// simply be created without the surface: winit can ask for that, but eframe offers no way
+/// through to it, and a CBT hook's style changes are ignored.)
+///
+/// The frame is extended from the bottom edge only. Extended from the top as well, DWM draws its
+/// own caption buttons in it, under the app's.
+///
+/// DWM turns the backdrop flat grey whenever the window is inactive. While blur is on, every
+/// deactivation is followed by a second, "active" `WM_NCACTIVATE` sent straight to the default
+/// window procedure: winit has already seen the real one (it tracks focus by it), so only DWM's
+/// idea of the window's state is touched.
+#[cfg(target_os = "windows")]
+mod windows {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, S_OK, WPARAM};
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+    };
+    use windows_sys::Win32::Graphics::Gdi::{
+        BLACK_BRUSH, FillRect, GetDC, GetStockObject, HDC, ReleaseDC,
+    };
+    use windows_sys::Win32::UI::Controls::MARGINS;
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, GetClientRect, IsWindowVisible, WM_ERASEBKGND, WM_NCACTIVATE, WM_SIZE,
+    };
+
+    /// Whether the backdrop is on, for the subclass procedure, which has no other state.
+    static BACKDROP_ON: AtomicBool = AtomicBool::new(false);
+
+    pub struct Blur {
+        /// The window, once the groundwork above is laid. `None` without a Win32 handle.
+        hwnd: Option<HWND>,
+        /// Whether DWM accepted the backdrop when probed. What greys out the settings toggle.
+        backdrop: bool,
+        last: Option<bool>,
+        last_dark: Option<bool>,
+        /// Whether DWM has been told the window is active since the backdrop went on.
+        activated: bool,
+    }
+
+    impl Blur {
+        pub fn new(handles: &(impl HasWindowHandle + HasDisplayHandle)) -> Self {
+            let hwnd = handles.window_handle().ok().and_then(|h| match h.as_raw() {
+                RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
+                _ => None,
+            });
+            let Some(h) = hwnd else {
+                return Self {
+                    hwnd: None,
+                    backdrop: false,
+                    last: None,
+                    last_dark: None,
+                    activated: false,
+                };
+            };
+            // SAFETY: eframe's own live window, on the thread that owns it. The subclass lives
+            // as long as the window and holds no data.
+            let backdrop = unsafe {
+                // Bottom only, but taller than any window: the glass still covers it all.
+                let glass = MARGINS {
+                    cxLeftWidth: 0,
+                    cxRightWidth: 0,
+                    cyTopHeight: 0,
+                    cyBottomHeight: i16::MAX as i32,
+                };
+                DwmExtendFrameIntoClientArea(h, &glass);
+                SetWindowSubclass(h, Some(subclass), 1, 0);
+                paint_black(h);
+                // The system's own rounded corners and shadow. DWM squares them again itself
+                // when the window is maximized or snapped edge to edge.
+                set_attribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND);
+                // There is no query for "does this Windows offer the backdrop" short of asking
+                // for it: probe with the real one and turn it straight back off. A refusal is a
+                // Windows older than 11 22H2, where the attribute is unknown.
+                let accepted = set_attribute(h, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW);
+                if accepted {
+                    set_attribute(h, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_NONE);
+                }
+                accepted
+            };
+            Self {
+                hwnd,
+                backdrop,
+                last: None,
+                last_dark: None,
+                activated: false,
+            }
+        }
+
+        pub fn available(&self) -> bool {
+            self.backdrop
+        }
+
+        /// Cheap to call every frame: DWM is only asked when `on` changed. No region: DWM
+        /// follows the window's own shape, so `size` and `radius` go unused here.
+        pub fn set(&mut self, on: bool, _size: (u32, u32), _radius: u32) {
+            if !self.backdrop {
+                return;
+            }
+            let Some(h) = self.hwnd else { return };
+            if self.last != Some(on) {
+                let kind = if on {
+                    DWMSBT_TRANSIENTWINDOW
+                } else {
+                    DWMSBT_NONE
+                };
+                BACKDROP_ON.store(on, Ordering::Relaxed);
+                // SAFETY: the live window, on its own thread.
+                unsafe { set_attribute(h, DWMWA_SYSTEMBACKDROP_TYPE, kind) };
+                self.last = Some(on);
+                self.activated = false;
+            }
+            // Turned on while the window is inactive — or before it is even shown, as on the
+            // first frame — DWM keeps the backdrop flat until the next activation, so tell it
+            // the window is active once there is a visible window to tell.
+            // SAFETY: the live window, on its own thread.
+            if on && !self.activated && unsafe { IsWindowVisible(h) } != 0 {
+                unsafe { DefWindowProcW(h, WM_NCACTIVATE, 1, 0) };
+                self.activated = true;
+            }
+        }
+
+        /// Acrylic is tinted light unless the window says it is dark. Follows the palette, not
+        /// the system theme, because a dark theme can be picked on a light desktop.
+        pub fn set_dark(&mut self, dark: bool) {
+            if self.last_dark == Some(dark) {
+                return;
+            }
+            let Some(h) = self.hwnd else { return };
+            // SAFETY: the live window, on its own thread.
+            unsafe { set_attribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, i32::from(dark)) };
+            self.last_dark = Some(dark);
+        }
+    }
+
+    /// `true` when DWM took the value.
+    unsafe fn set_attribute(h: HWND, attribute: i32, value: i32) -> bool {
+        let hr = unsafe {
+            DwmSetWindowAttribute(
+                h,
+                attribute as u32,
+                (&raw const value).cast(),
+                size_of::<i32>() as u32,
+            )
+        };
+        hr == S_OK
+    }
+
+    unsafe fn fill_black(h: HWND, dc: HDC) {
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe {
+            GetClientRect(h, &mut rect);
+            FillRect(dc, &rect, GetStockObject(BLACK_BRUSH));
+        }
+    }
+
+    unsafe fn paint_black(h: HWND) {
+        unsafe {
+            let dc = GetDC(h);
+            if dc != 0 {
+                fill_black(h, dc);
+                ReleaseDC(h, dc);
+            }
+        }
+    }
+
+    /// Keeps the redirection surface black — erased black instead of left to the (absent)
+    /// class brush, and repainted after a resize grows it — and the backdrop live while the
+    /// window is inactive.
+    unsafe extern "system" fn subclass(
+        h: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        _data: usize,
+    ) -> LRESULT {
+        if msg == WM_ERASEBKGND {
+            unsafe { fill_black(h, wparam as HDC) };
+            return 1;
+        }
+        let result = unsafe { DefSubclassProc(h, msg, wparam, lparam) };
+        match msg {
+            WM_SIZE => unsafe { paint_black(h) },
+            WM_NCACTIVATE if wparam == 0 && BACKDROP_ON.load(Ordering::Relaxed) => unsafe {
+                DefWindowProcW(h, WM_NCACTIVATE, 1, lparam);
+            },
+            _ => {}
+        }
+        result
     }
 }
 
@@ -315,6 +531,9 @@ mod wayland {
             inner.apply(on, size, radius);
             self.last = Some(want);
         }
+
+        /// The compositor's blur takes no tint from the window: nothing to tell it.
+        pub fn set_dark(&mut self, _dark: bool) {}
     }
 
     impl Inner {

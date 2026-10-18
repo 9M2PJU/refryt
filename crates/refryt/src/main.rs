@@ -223,13 +223,10 @@ fn main() -> eframe::Result {
         {
             viewport = viewport.with_decorations(false);
         }
-        // Windows does not get asked at all: the shell is opaque there (see `app::App::new`),
-        // and a transparent request there only ever put the window in front of DWM's flat
-        // material. Every other compositor is asked for the see-through shell it can blend.
-        #[cfg(not(target_os = "windows"))]
-        {
-            viewport = viewport.with_transparent(true);
-        }
+        // Every compositor is asked for the see-through shell it can blend. On Windows that
+        // takes the DirectComposition swapchain set up below as well — without it, the request
+        // alone composites the shell over a flat grey.
+        viewport = viewport.with_transparent(true);
     }
 
     // On macOS the transparent request above only gives a see-through window. The blur is applied
@@ -239,6 +236,27 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
+    // Windows: DX12 with a DirectComposition swapchain, the one presentation path there that
+    // carries per-pixel alpha. An HWND swapchain — DX12's default, and Vulkan's only one — is
+    // opaque to DWM. Always on, not only when the slider is up, so moving it needs no restart;
+    // an opaque shell looks the same through either. What sits under the shell is `blur.rs`'s
+    // business: the window's redirection surface, painted black so it reads as glass.
+    // `WGPU_BACKEND` and `WGPU_DX12_PRESENTATION_SYSTEM` still override both, for A/B-ing a driver
+    // problem.
+    #[cfg(target_os = "windows")]
+    {
+        use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew, wgpu};
+        let mut setup = WgpuSetupCreateNew::without_display_handle();
+        setup.instance_descriptor.backends =
+            wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12);
+        setup
+            .instance_descriptor
+            .backend_options
+            .dx12
+            .presentation_system =
+            wgpu::Dx12SwapchainKind::from_env().unwrap_or(wgpu::Dx12SwapchainKind::DxgiFromVisual);
+        native_options.wgpu_options.wgpu_setup = WgpuSetup::CreateNew(setup);
+    }
     // A test aid for debug builds: `REFRYT_NO_VSYNC=1` stops the swap from waiting for the screen,
     // to tell a window that is blocked in the swap from one that is not being asked for frames.
     #[cfg(debug_assertions)]

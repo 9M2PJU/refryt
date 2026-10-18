@@ -1860,17 +1860,6 @@ impl App {
         if no_autoplay {
             settings.autoplay = false;
         }
-        // Windows never shows the desktop through the shell — its per-pixel-alpha route
-        // composites over a flat DWM material, which read as washed-out white — so the whole
-        // feature is absent there: no transparent request in `main`, no blur backend in
-        // `blur.rs`, no Appearance rows in `ui::settings`. Force the loaded values off rather
-        // than only hiding the controls: a settings file written on Linux must not put the
-        // Windows window behind that material.
-        #[cfg(target_os = "windows")]
-        {
-            settings.opacity = crate::settings::Opacity::OFF;
-            settings.blur = false;
-        }
         let theme_watch = theme::custom::Watcher::new();
         let palette = settings.palette(&cc.egui_ctx, &custom_themes);
         theme::apply(&cc.egui_ctx, &palette);
@@ -7302,15 +7291,11 @@ impl eframe::App for App {
         // shows, and there is nothing to resize.
         let fullscreen = crate::window_fullscreen::is(&ctx);
         let maximized = Self::is_maximized(&ctx) || fullscreen || self.fs.open;
-        // Square on Windows, where the shell is opaque: the outer corner pixels of a rounded
-        // rect are never painted, and with transparency off that shows the window's own
-        // backdrop as small light marks in the four corners. Linux keeps the rounded shell — and its real
-        // transparency — exactly as before.
-        //
-        // macOS never paints its own corners: the window is a native one with a hidden title bar
-        // (see `main`), so the system rounds it, windowed and zoomed alike, and clips the blur
-        // and shadow to that shape. Painting a second, app-drawn radius on top would only
-        // disagree with it.
+        // Windows and macOS never paint their own corners: the system rounds the window and
+        // clips the shadow (and the blur) to that shape, so a second, app-drawn radius on top
+        // would only disagree with it. On Windows that is DWM's corner preference, asked for in
+        // `blur.rs` — squared off again by DWM itself when maximized. On macOS the window is a
+        // native one with a hidden title bar (see `main`), rounded windowed and zoomed alike.
         let rounded = !self.decorated
             && !maximized
             && !cfg!(target_os = "windows")
@@ -7325,6 +7310,8 @@ impl eframe::App for App {
         // rect `chrome::paint_background` just filled — is already in the window's own
         // logical-pixel space, which is what a Wayland surface's local coordinates are.
         let size = ctx.content_rect().size();
+        // Windows tints its acrylic light unless the window says it is dark; a no-op elsewhere.
+        self.blur.set_dark(p.dark);
         self.blur.set(
             self.settings.blur && p.translucent(),
             (
